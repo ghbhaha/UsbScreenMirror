@@ -10,11 +10,19 @@ package com.uav.protocol
  * "平均 40ms、但 p95 是 150ms"的链路，用户会明显感到偶尔卡一下；
  * 反过来 "平均 80ms、p95 也是 90ms" 反而更顺。所以 4.10 的验收应看 p95/p99。
  *
- * 线程安全：不加锁。调用方保证只在解码输出线程写、在统计线程读；
- * [snapshot] 里 `sorted()` 会先复制，读到并发写入的中间态最多是某几帧偏差，
- * 对统计结论无影响（这是刻意的取舍：加锁会给每帧解码路径引入竞争）。
+ * ## 线程安全（这里踩过一次崩溃，务必保持）
+ *
+ * 写发生在**解码输出线程**（每帧一次），读发生在**UI 线程**（每秒一次）。
+ *
+ * ⚠️ 最初这里刻意不加锁，注释还写着"最坏只是读到几帧偏差" —— **这是错的**。
+ * [java.util.ArrayDeque] 并发读不是"读到旧值"，而是可能读到**未初始化的 null 槽位**，
+ * 于是 `sorted()` 在 `Long.compareTo(null)` 上直接 NPE，把宿主 App 打崩。
+ * 所以现在**所有**对内部状态的访问都在 [lock] 内；排序这种 O(n log n) 的操作
+ * 则先复制出来、在锁外做，把持锁时间压到最短。
  */
 class LatencyStats(private val capacity: Int = DEFAULT_CAPACITY) {
+
+    private val lock = Any()
 
     private val samples = ArrayDeque<Long>(capacity)
 
@@ -28,13 +36,13 @@ class LatencyStats(private val capacity: Int = DEFAULT_CAPACITY) {
     private var sumNanos: Long = 0
 
     /** 累计样本数（含异常）。 */
-    val count: Long get() = total
+    val count: Long get() = synchronized(lock) { total }
 
     /** 异常样本数。 */
-    val anomalyCount: Long get() = anomalous
+    val anomalyCount: Long get() = synchronized(lock) { anomalous }
 
     /** 当前窗口内的样本数。 */
-    val windowSize: Int get() = samples.size
+    val windowSize: Int get() = synchronized(lock) { samples.size }
 
     /**
      * 记一个延迟样本。
@@ -49,22 +57,24 @@ class LatencyStats(private val capacity: Int = DEFAULT_CAPACITY) {
      *
      * @return 该样本是否被接受（未接受即计为异常）
      */
-    fun add(latencyNanos: Long): Boolean {
+    fun add(latencyNanos: Long): Boolean = synchronized(lock) {
         total++
         if (latencyNanos < MIN_PLAUSIBLE_NANOS || latencyNanos > MAX_PLAUSIBLE_NANOS) {
             anomalous++
-            return false
+            return@synchronized false
         }
         if (samples.size >= capacity) {
             sumNanos -= samples.removeFirst()
         }
         samples.addLast(latencyNanos)
         sumNanos += latencyNanos
-        return true
+        true
     }
 
     /** 平均值（纳秒）。空窗口返回 0。 */
-    fun averageNanos(): Long = if (samples.isEmpty()) 0L else sumNanos / samples.size
+    fun averageNanos(): Long = synchronized(lock) {
+        if (samples.isEmpty()) 0L else sumNanos / samples.size
+    }
 
     /**
      * 分位数（纳秒）。
@@ -72,20 +82,18 @@ class LatencyStats(private val capacity: Int = DEFAULT_CAPACITY) {
      * @param p 0.0 ~ 1.0，例如 0.95 表示 p95
      */
     fun percentileNanos(p: Double): Long {
-        if (samples.isEmpty()) return 0L
-        val sorted = samples.sorted()
-        val idx = Math.round((sorted.size - 1) * p.coerceIn(0.0, 1.0)).toInt()
-            .coerceIn(0, sorted.size - 1)
-        return sorted[idx]
+        val arr = copySorted()
+        if (arr.isEmpty()) return 0L
+        return arr[indexOf(arr.size, p)]
     }
 
     /** 当前窗口内的最大值（纳秒）。 */
-    fun maxNanos(): Long = samples.maxOrNull() ?: 0L
+    fun maxNanos(): Long = synchronized(lock) { samples.maxOrNull() ?: 0L }
 
     /** 当前窗口内的最小值（纳秒）。 */
-    fun minNanos(): Long = samples.minOrNull() ?: 0L
+    fun minNanos(): Long = synchronized(lock) { samples.minOrNull() ?: 0L }
 
-    fun reset() {
+    fun reset() = synchronized(lock) {
         samples.clear()
         total = 0
         anomalous = 0
@@ -100,26 +108,35 @@ class LatencyStats(private val capacity: Int = DEFAULT_CAPACITY) {
      * 形如：`delay avg=12.3 p50=11.8 p95=24.1 p99=31.0 max=48.2ms n=300 bad=0`
      */
     fun snapshot(label: String = "delay"): String {
-        if (samples.isEmpty()) {
-            return "$label n=0 bad=$anomalous"
+        // 一次加锁取走「样本 + 求和 + 异常计数」，保证三者出自同一时刻 ——
+        // 分三次读会出现"样本数变了但 sum 没变"这类内部不一致
+        val snap = synchronized(lock) {
+            Snapshot(samples.toLongArray(), sumNanos, anomalous)
         }
-        // 排一次序，所有分位数共用，避免 snapshot 内部重复排序
-        val sorted = samples.sorted()
-        fun at(p: Double): Long {
-            val idx = Math.round((sorted.size - 1) * p).toInt().coerceIn(0, sorted.size - 1)
-            return sorted[idx]
+        if (snap.values.isEmpty()) {
+            return "$label n=0 bad=${snap.anomalous}"
         }
-        val avg = sumNanos / sorted.size
+        // 排序在锁外做：样本已复制，怎么排都不影响别的线程
+        val sorted = snap.values.sortedArray()
+        val avg = snap.sumNanos / sorted.size
         return buildString {
             append(label).append(" avg=").append(ms(avg))
-            append(" p50=").append(ms(at(0.50)))
-            append(" p95=").append(ms(at(0.95)))
-            append(" p99=").append(ms(at(0.99)))
-            append(" max=").append(ms(sorted.last()))
+            append(" p50=").append(ms(sorted[indexOf(sorted.size, 0.50)]))
+            append(" p95=").append(ms(sorted[indexOf(sorted.size, 0.95)]))
+            append(" p99=").append(ms(sorted[indexOf(sorted.size, 0.99)]))
+            append(" max=").append(ms(sorted[sorted.size - 1]))
             append("ms n=").append(sorted.size)
-            append(" bad=").append(anomalous)
+            append(" bad=").append(snap.anomalous)
         }
     }
+
+    /** 锁内复制并排序（供单值分位数查询使用）。 */
+    private fun copySorted(): LongArray =
+        synchronized(lock) { samples.toLongArray() }.also { it.sort() }
+
+    /** 与 `snapshot` 里 `at(p)` 同一套下标规则，保证两条路径给出同样的分位数。 */
+    private fun indexOf(size: Int, p: Double): Int =
+        Math.round((size - 1) * p.coerceIn(0.0, 1.0)).toInt().coerceIn(0, size - 1)
 
     private fun ms(nanos: Long): String =
         // 用整数运算拼一位小数，避免 String.format 在解码热路径上的区域设置开销
@@ -129,6 +146,9 @@ class LatencyStats(private val capacity: Int = DEFAULT_CAPACITY) {
             val v = -nanos
             "-${v / 1_000_000}.${(v % 1_000_000) / 100_000}"
         }
+
+    /** 同一时刻的内部状态副本（一次加锁取齐，避免分次读取自相矛盾）。 */
+    private class Snapshot(val values: LongArray, val sumNanos: Long, val anomalous: Long)
 
     companion object {
         /** 默认窗口：约 10~30 秒的帧量（30fps 时约 10s，10fps 时约 30s）。 */

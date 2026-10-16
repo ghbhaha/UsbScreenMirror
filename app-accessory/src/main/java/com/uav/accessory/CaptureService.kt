@@ -8,12 +8,14 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.view.Display
 import com.uav.accessory.session.AccessorySession
 import com.uav.accessory.usb.FdByteChannel
 import com.uav.accessory.video.VirtualDisplayEncoder
@@ -68,6 +70,25 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     private var dumpChannel: com.uav.accessory.debug.DumpByteChannel? = null
     private var encoder: VirtualDisplayEncoder? = null
     private var projection: MediaProjection? = null
+
+    /**
+     * 屏幕旋转监听（P0「旋转三件套」）。
+     *
+     * ★ 回调里**只置标志**，重建由编码器自己的线程在安全点执行 ——
+     *   这里是主线程，不能停线程、换 Surface。
+     */
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+
+        override fun onDisplayRemoved(displayId: Int) = Unit
+
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY) return
+            encoder?.onDisplayChanged()
+        }
+    }
+
+    private var rotationWatcherRegistered = false
 
     /** 收到 OPEN 但录屏授权还没到时的挂起参数。 */
     @Volatile
@@ -324,12 +345,40 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
             return
         }
         encoder = enc
+        registerRotationWatcher()
         AccessoryStatus.set("编码中：${screen.x}x${screen.y} -> ${scaled[0]}x${scaled[1]}")
     }
 
     private fun stopCapture() {
+        unregisterRotationWatcher()
         encoder?.stop()
         encoder = null
+    }
+
+    // ------------------------------------------------------------------ 旋转监听（P0）
+
+    /**
+     * 注册屏幕旋转监听。
+     *
+     * ★ 回调里**只置标志**（[VirtualDisplayEncoder.onDisplayChanged]），
+     *   真正的重建由编码器自己的线程在安全点执行 ——
+     *   这里跑在主线程，不能停线程、换 Surface。
+     */
+    private fun registerRotationWatcher() {
+        if (rotationWatcherRegistered) return
+        val dm = getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: return
+        dm.registerDisplayListener(displayListener, null)
+        rotationWatcherRegistered = true
+        AndroidLogger.i(TAG, "已注册屏幕旋转监听")
+    }
+
+    private fun unregisterRotationWatcher() {
+        if (!rotationWatcherRegistered) return
+        runCatching {
+            (getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+                ?.unregisterDisplayListener(displayListener)
+        }
+        rotationWatcherRegistered = false
     }
 
     // ------------------------------------------------------------------ 编码器回调

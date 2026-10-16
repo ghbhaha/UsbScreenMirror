@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  默认界面文案 = 简体中文（与 app-host 同构，理由见那边的说明）。
+
+  运行时状态文本本来就是中文（见 CaptureService 的 AccessoryStatus.set），
+  这里统一的是布局与通知栏里的静态文案。
+  英文用户由 values-en/ 覆盖。产品名 app_name 不翻译。
+-->
 <resources>
     <string name="app_name">UAV Accessory</string>
-    <string name="acc_status_idle">Stage 3 - not attached. Plug this phone into the host.</string>
-    <string name="acc_btn_grant">Grant screen capture</string>
-    <string name="acc_btn_stop">Stop</string>
-    <string name="acc_hint">Note: Android 14+ asks for screen-capture consent every session. Lock orientation before mirroring.</string>
-    <string name="notif_channel">Screen capture</string>
+    <string name="acc_status_idle">未连接 —— 请把本机插到宿主上</string>
+    <string name="acc_btn_grant">授予录屏权限</string>
+    <string name="acc_btn_stop">停止投屏</string>
+    <string name="acc_hint">提示：Android 14+ 每次投屏都要授权一次。已支持旋转 —— 请开启自动旋转。</string>
+    <string name="notif_channel">屏幕采集</string>
     <string name="notif_title">UAV Accessory</string>
-    <string name="notif_text">Mirroring screen to the USB host</string>
+    <string name="notif_text">正在把屏幕镜像到 USB 宿主</string>
 </resources>

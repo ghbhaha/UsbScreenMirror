@@ -1,10 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  默认界面文案 = 简体中文。
+
+  为什么默认用中文而不是英文：本项目从文档到**运行时状态文本**（HostActivity 里
+  onStatus 传的那些字符串）本来就是中文，只有布局里的静态文案曾是英文，
+  结果界面上是「中文状态 + 英文按钮」的混搭。默认统一成中文即可消除这种不一致，
+  也让中文设备无需任何额外配置。
+
+  英文用户由 values-en/ 覆盖（系统按语言自动选择），两边键名必须一一对应。
+
+  产品名 app_name 不翻译。
+-->
 <resources>
     <string name="app_name">UAV Host</string>
-    <string name="host_status_idle">Stage 2 - idle, plug in the accessory phone</string>
-    <string name="host_btn_scan">Scan / Retry</string>
-    <string name="host_btn_force">Force rehandshake</string>
-    <string name="host_btn_replay">Replay .uav dump</string>
-    <!-- 计划 0.1：首期不支持旋转，必须让用户看得见，避免把"方向不对"误判成 bug -->
-    <string name="host_rotation_notice">Note: rotation is not supported in MVP. Lock the phone orientation before mirroring.</string>
+    <string name="host_status_idle">空闲中 —— 请把配件手机插上来</string>
+    <string name="host_btn_scan">扫描 / 重试</string>
+    <string name="host_btn_force">强制重握手</string>
+    <string name="host_btn_replay">回放 .uav 抓流</string>
+    <!-- 旋转已支持（见 docs/实施计划.md 10.7）；这里提示的是前提条件，避免"转不动"被误判成 bug -->
+    <string name="host_rotation_notice">已支持旋转 —— 请在手机上开启自动旋转。</string>
 </resources>

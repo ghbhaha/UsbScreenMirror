@@ -263,6 +263,39 @@ class Connection(
             return
         }
 
+        // ★ 尺寸变更（手机旋转）：发送端**重发 12B 流头**来表达新尺寸。
+        //
+        //   为什么这样识别是可靠的：帧的 payload 长度是 `12 + size`（size ≥ 1），
+        //   所以**载荷恰为 12 字节只可能是流头**，不存在歧义 —— 不需要去猜"内容像不像流头"。
+        //
+        //   为什么不让 CONFIG 帧顺便带尺寸：CONFIG 的 payload 要**整体作为 csd-0**
+        //   注入解码器（见 HostSession），在它前面垫字节会破坏这个前提。
+        if (message.payload.size == StreamHeader.SIZE) {
+            val updated = try {
+                StreamHeader.decode(
+                    message.payload, 0, message.payload.size,
+                    expectVideoDims = streamId == StreamId.VIDEO,
+                )
+            } catch (pe: ProtocolException) {
+                logger.w(tag, "12B payload 但不是合法流头，忽略: ${pe.message}")
+                null
+            }
+            if (updated != null && updated != headers[streamId]) {
+                val old = headers[streamId]
+                headers[streamId] = updated
+                stats.headerAt(streamId, updated)
+                stats.sizeChanges.incrementAndGet()
+                logger.i(
+                    tag,
+                    "stream[${StreamId.name(streamId)}] 流头更新（尺寸变更）: " +
+                        "${old?.width}x${old?.height} -> ${updated.width}x${updated.height}"
+                )
+                sink.onHeader(updated)
+            }
+            // 无论是否真的变了，12B 都不可能是帧，直接结束
+            return
+        }
+
         val frame = FrameCodec.decodeFrame(message.payload, 0, message.payload.size)
         stats.frameAt(streamId, frame)
         sink.onFrame(frame)
@@ -352,6 +385,14 @@ class Connection(
         /** 被当作"非法流头"丢弃的杂散 payload 数（正常应为 0；非 0 说明链路残留了旧会话数据）。 */
         val strayPayloads = AtomicLong()
 
+        /**
+         * 流头更新次数（= 尺寸变更 / 旋转次数）。
+         *
+         * 建链后正常恒为 0；手机旋转时发送端会重发流头，这里每次 +1。
+         * 排查"画面方向不对"时先看这个数：不动它就说明手机端根本没上报旋转。
+         */
+        val sizeChanges = AtomicLong()
+
         val framesPerStream = ConcurrentHashMap<Int, AtomicLong>()
         val configFramesPerStream = ConcurrentHashMap<Int, AtomicLong>()
         val bytesPerStream = ConcurrentHashMap<Int, AtomicLong>()
@@ -378,6 +419,9 @@ class Connection(
 
         fun snapshot(): String = buildString {
             append("msgs(r/w)=").append(messagesRead.get()).append('/').append(messagesWritten.get())
+            // 这两个只在非 0 时显示，避免正常运行时刷屏；但排查旋转 / 残留字节时是首要线索
+            if (sizeChanges.get() > 0L) append(" sizeChanges=").append(sizeChanges.get())
+            if (strayPayloads.get() > 0L) append(" stray=").append(strayPayloads.get())
             if (strayPayloads.get() > 0) append(" stray=").append(strayPayloads.get())
             for ((id, h) in headersSeen) {
                 append(" | ").append(StreamId.name(id)).append('=')

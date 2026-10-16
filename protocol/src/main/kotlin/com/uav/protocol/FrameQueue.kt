@@ -60,8 +60,21 @@ class FrameQueue(
     val isClosed: Boolean get() = closed
 
     override fun onHeader(header: StreamHeader) {
+        val previous = this.header
         this.header = header
         logger.i(tag, "stream[${StreamId.name(streamId)}] header: $header")
+
+        // ★ 尺寸变更（手机旋转）：队列里还积压着**旧尺寸**的帧。它们会被新解码器
+        //   按新 SPS 解码 —— 解错（花屏）或直接报错。所以整队丢弃。
+        //   不会因此丢掉关键帧：编码器重建后的第一帧必是 IDR。
+        if (previous != null && previous != header) {
+            val n = clear()
+            logger.i(
+                tag,
+                "尺寸变更 ${previous.width}x${previous.height} -> " +
+                    "${header.width}x${header.height}，丢弃队列中 $n 帧（旧尺寸帧不能喂给新解码器）"
+            )
+        }
     }
 
     /** 投递一帧（读线程调用，**必须非阻塞** —— 读线程绝不能被消费端拖住，计划 4.8）。 */
@@ -153,10 +166,16 @@ class FrameQueue(
         out
     }
 
-    /** 清空但不关闭（例如收到新 CONFIG 后要丢弃旧 GOP）。 */
-    fun clear() = lock.withLock {
+    /**
+     * 清空但不关闭（例如尺寸变更后要丢弃旧 GOP）。
+     *
+     * @return 被丢弃的帧数（用于日志诊断）
+     */
+    fun clear(): Int = lock.withLock {
+        val n = queue.size
         queue.clear()
         notEmpty.signalAll()
+        n
     }
 
     /** 关闭并唤醒所有等待者（计划 1.5：`CLSE`/异常时必须唤醒）。 */

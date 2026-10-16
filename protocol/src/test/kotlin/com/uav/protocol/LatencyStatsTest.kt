@@ -144,4 +144,60 @@ class LatencyStatsTest {
         assertEquals(0, s.windowSize)
         assertEquals(0L, s.averageNanos())
     }
+
+    @Test
+    fun `读写并发时不会崩（曾经在 ArrayDeque 上 NPE）`() {
+        // 真实场景：解码线程每帧 add，UI 线程每秒 snapshot。
+        // 修复前 snapshot 里的 sorted() 会读到 ArrayDeque 未初始化的 null 槽位，
+        // 在 Long.compareTo(null) 上直接 NPE，把宿主 App 打崩。
+        val s = LatencyStats(capacity = 64)
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val writer = Thread {
+            var i = 0L
+            while (!stop.get()) {
+                s.add((10 + (i % 20)) * ms)
+                i++
+            }
+        }
+        writer.isDaemon = true
+        writer.start()
+        try {
+            repeat(3_000) {
+                s.snapshot()
+                s.percentileNanos(0.95)
+                s.averageNanos()
+                s.maxNanos()
+            }
+        } finally {
+            stop.set(true)
+            writer.join(2_000)
+        }
+    }
+
+    @Test
+    fun `并发下统计不出现自相矛盾的内部状态`() {
+        // snapshot 必须一次加锁取齐「样本 + 求和」；分次读取会出现
+        // "样本数变了但 sum 没变" -> avg 算出离谱值
+        val s = LatencyStats(capacity = 128)
+        // 先垫一个样本：空窗口返回 0（"没有数据"与"测得 0"是两回事），
+        // 不留这一步的话首轮断言必然失败
+        s.add(50 * ms)
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val writer = Thread {
+            while (!stop.get()) s.add(50 * ms)
+        }
+        writer.isDaemon = true
+        writer.start()
+        try {
+            repeat(2_000) {
+                val avg = s.averageNanos()
+                // 所有样本都是 50ms，平均只能是 50ms（窗口内也全是 50ms）
+                assertEquals("avg 应为 50ms，实际 $avg", 50 * ms, avg)
+            }
+        } finally {
+            stop.set(true)
+            writer.join(2_000)
+        }
+    }
 }
