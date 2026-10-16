@@ -20,6 +20,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    buildFeatures {
+        // 计划 5.2：调试入口（回放 / adb extra / 周期统计日志）靠 BuildConfig.DEBUG 门控，
+        // AGP 8.x 起 buildConfig 默认关闭，必须显式打开。
+        buildConfig = true
+    }
 }
 
 kotlin {

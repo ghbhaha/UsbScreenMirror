@@ -17,6 +17,7 @@ import android.os.IBinder
 import com.uav.accessory.session.AccessorySession
 import com.uav.accessory.usb.FdByteChannel
 import com.uav.accessory.video.VirtualDisplayEncoder
+import com.uav.protocol.ByteChannel
 import com.uav.protocol.ParsedOpen
 import com.uav.protocol.StreamHeader
 import com.uav.protocol.Transport
@@ -250,12 +251,21 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         val raw = FdByteChannel(pfd, AndroidLogger)
         fdChannel = raw
 
-        // 抓流落盘（计划 3.12）：给宿主离线回放用；失败不影响实时链路
-        val dumpFile = java.io.File(getExternalFilesDir(null) ?: filesDir, DUMP_FILE_NAME)
-        val dump = com.uav.accessory.debug.DumpByteChannel(raw, dumpFile, AndroidLogger)
-        dumpChannel = dump
+        // 抓流落盘（计划 3.12）：给宿主离线回放用；失败不影响实时链路。
+        // ★ release 下必须关掉（计划 5.2）—— 抓流是**全量**写出的（实测 110 秒 ≈ 28 MB），
+        //   发布包里持续写盘既耗电又占空间，而且用户完全不知情。
+        val transportChannel: ByteChannel = if (DebugTools.DUMP_ENABLED) {
+            val dumpFile = java.io.File(getExternalFilesDir(null) ?: filesDir, DUMP_FILE_NAME)
+            com.uav.accessory.debug.DumpByteChannel(raw, dumpFile, AndroidLogger).also {
+                dumpChannel = it
+            }
+        } else {
+            // 留一条日志让"门控生效"在运行时**可自证**（否则只能靠文件没出现来反推）
+            AndroidLogger.i(TAG, "release 构建：抓流落盘已关闭，只转发不落盘")
+            raw
+        }
 
-        val transport = Transport(dump, AndroidLogger, AccessorySession.TAG)
+        val transport = Transport(transportChannel, AndroidLogger, AccessorySession.TAG)
         val screen = DisplaySize.of(this)
 
         val s = AccessorySession(

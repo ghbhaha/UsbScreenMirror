@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.SurfaceHolder
 import android.view.Surface
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import androidx.core.content.IntentCompat
@@ -77,9 +78,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             }
             statsText.text = text
             // 每 5 秒把统计打进日志：5 分钟压测（计划 4.10）要靠它读首末对比，
-            // 也避免依赖 UI 取值（画面持续刷新时 uiautomator dump 会拿不到稳定帧）
+            // 也避免依赖 UI 取值（画面持续刷新时 uiautomator dump 会拿不到稳定帧）。
+            // release 下关掉：发布包每 5 秒刷一条 logcat 没有意义（计划 5.2）。
             tickCount++
-            if (tickCount % STATS_LOG_EVERY_TICKS == 0L) {
+            if (DebugTools.ENABLED && tickCount % STATS_LOG_EVERY_TICKS == 0L) {
                 logger.i(TAG, "STATS $text")
             }
             mainHandler.postDelayed(this, STATS_INTERVAL_MS)
@@ -140,13 +142,23 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         val screen = DisplaySize.of(this)
         logger.i(TAG, "host screen ${screen.x}x${screen.y}, protocol v${Protocol.VERSION}")
 
+        // Scan / Retry 与 Force handshake 是**功能**而非调试入口
+        // （手机被别的宿主 App 切成配件模式时，用户需要它们自救），release 保留。
         findViewById<Button>(R.id.btn_scan).setOnClickListener { router?.scanAndAttach() }
-        findViewById<Button>(R.id.btn_replay).setOnClickListener { pickReplayFile() }
         findViewById<Button>(R.id.btn_force).setOnClickListener {
             stopSession()
             forceRetried = true
             fastPathUnverified = false
             router?.scanAndAttach(forceHandshake = true)
+        }
+
+        // `.uav` 回放是**纯调试入口**（计划 5.2）：release 包连按钮都不显示。
+        findViewById<Button>(R.id.btn_replay).apply {
+            if (DebugTools.ENABLED) {
+                setOnClickListener { pickReplayFile() }
+            } else {
+                visibility = View.GONE
+            }
         }
 
         router = UsbAttachRouter(this, logger, this).also { it.start() }
@@ -166,39 +178,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     private fun handleIntent(intent: Intent?) {
-        // ★ 供 adb 驱动的调试入口：am start -n com.uav.host/.HostActivity --es replay_path /data/data/com.uav.host/files/replay.uav
-        //   从指定文件回放抓流（计划 4.0），跳过整个 USB 与握手。
-        intent?.getStringExtra(EXTRA_REPLAY_PATH)?.takeIf { it.isNotEmpty() }?.let { path ->
-            logger.i(TAG, "收到回放指令: $path")
-            val file = File(path)
-            if (!file.exists()) {
-                onError("回放文件不存在: $path（可先用 run-as 放进 filesDir）", null)
-                return
-            }
-            startReplay(file)
-            return
-        }
-
-        // ★ 供 adb 驱动的调试入口：am start -n com.uav.host/.HostActivity --ez scan true
-        //   走普通扫描（已是配件则复用直连），等价于点界面上的 Scan / Retry 按钮。
-        if (intent?.getBooleanExtra(EXTRA_SCAN, false) == true) {
-            logger.i(TAG, "收到扫描指令")
-            stopSession()
-            forceRetried = false
-            router?.scanAndAttach(forceHandshake = false)
-            return
-        }
-
-        // ★ 供 adb 驱动的调试入口：am start -n com.uav.host/.HostActivity --ez force_handshake true
-        //   强制走完整 AOA 握手，用于"手机已被别的宿主 App 切成配件模式"的场景。
-        if (intent?.getBooleanExtra(EXTRA_FORCE_HANDSHAKE, false) == true) {
-            logger.i(TAG, "收到强制重握手指令")
-            stopSession()
-            forceRetried = true
-            fastPathUnverified = false
-            router?.scanAndAttach(forceHandshake = true)
-            return
-        }
+        // 先消化调试入口 extra（release 构建下整块被跳过，计划 5.2）
+        if (handleDebugIntent(intent)) return
 
         val action = intent?.action ?: return
         logger.i(TAG, "intent action=$action")
@@ -215,6 +196,67 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         stopSession()
         forceRetried = false
         router?.onDeviceAttached(device)
+    }
+
+    /**
+     * 处理 adb 驱动的调试 extra（计划 5.2）。
+     *
+     * 这三条都是为「不碰屏幕就能驱动联调」而加的，**release 包必须全部失效** ——
+     * 否则发布版仍可被 `--es replay_path` 读任意本地文件、被 `--ez force_handshake`
+     * 强制打断正常链路。
+     *
+     * @return `true` 表示 extra 命中并已接管本次 intent，调用方不应再按 action 分发。
+     */
+    private fun handleDebugIntent(intent: Intent?): Boolean {
+        if (!DebugTools.ENABLED) {
+            // release 下若仍传了调试 extra，明确说一句"被门控忽略"。
+            // 否则调用方只会看到"extra 毫无反应"，无从判断是漏实现还是被门控（计划 5.2）。
+            if (intent != null && (
+                    intent.hasExtra(EXTRA_REPLAY_PATH) ||
+                        intent.hasExtra(EXTRA_SCAN) ||
+                        intent.hasExtra(EXTRA_FORCE_HANDSHAKE)
+                    )
+            ) {
+                logger.w(TAG, "release 构建：调试入口已关闭，忽略 intent extra")
+            }
+            return false
+        }
+
+        // am start -n com.uav.host/.HostActivity --es replay_path /data/data/com.uav.host/files/replay.uav
+        //   从指定文件回放抓流（计划 4.0），跳过整个 USB 与握手。
+        intent?.getStringExtra(EXTRA_REPLAY_PATH)?.takeIf { it.isNotEmpty() }?.let { path ->
+            logger.i(TAG, "收到回放指令: $path")
+            val file = File(path)
+            if (!file.exists()) {
+                onError("回放文件不存在: $path（可先用 run-as 放进 filesDir）", null)
+                return true
+            }
+            startReplay(file)
+            return true
+        }
+
+        // am start -n com.uav.host/.HostActivity --ez scan true
+        //   走普通扫描（已是配件则复用直连），等价于点界面上的 Scan / Retry 按钮。
+        if (intent?.getBooleanExtra(EXTRA_SCAN, false) == true) {
+            logger.i(TAG, "收到扫描指令")
+            stopSession()
+            forceRetried = false
+            router?.scanAndAttach(forceHandshake = false)
+            return true
+        }
+
+        // am start -n com.uav.host/.HostActivity --ez force_handshake true
+        //   强制走完整 AOA 握手，用于"手机已被别的宿主 App 切成配件模式"的场景。
+        if (intent?.getBooleanExtra(EXTRA_FORCE_HANDSHAKE, false) == true) {
+            logger.i(TAG, "收到强制重握手指令")
+            stopSession()
+            forceRetried = true
+            fastPathUnverified = false
+            router?.scanAndAttach(forceHandshake = true)
+            return true
+        }
+
+        return false
     }
 
     // ------------------------------------------------------------------ router 回调
@@ -302,6 +344,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     // ------------------------------------------------------------------ 回放
 
     private fun pickReplayFile() {
+        if (!DebugTools.ENABLED) return
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
@@ -327,6 +370,11 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     private fun startReplay(file: File) {
+        // 最后一道闸：即使调用方漏了门控，release 下也不会走进回放通道（计划 5.2）
+        if (!DebugTools.ENABLED) {
+            logger.w(TAG, "release 构建不支持 .uav 回放（请用 debug 包）: ${file.name}")
+            return
+        }
         stopSession()
         // 不回环：抓流里的"流头"只在该流首条 WRTE 有效，循环第二遍时这 12B 会被当成
         // 一帧解析而报错。要看第二遍就再触发一次回放。

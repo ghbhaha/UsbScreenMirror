@@ -21,6 +21,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    buildFeatures {
+        // 计划 5.2：抓流落盘（DumpByteChannel）靠 BuildConfig.DEBUG 门控，
+        // 否则 release 包会在用户手机上持续写 28MB+ 的 .uav 文件。
+        buildConfig = true
+    }
 }
 
 kotlin {
