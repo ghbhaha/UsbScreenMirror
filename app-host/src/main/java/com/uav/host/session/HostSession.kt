@@ -96,6 +96,16 @@ class HostSession(
     @Volatile
     private var phoneHeight = 0
 
+    /**
+     * 手机在 `CNXN` 里上报的**屏幕尺寸**。
+     *
+     * ★ 这是**触摸坐标**该用的空间：HID 触摸屏的逻辑上限（[com.uav.protocol.HidTouchPanel]）
+     *   要按它来声明，而不是按编码后的视频尺寸（`max_size` 那个是缩放过的）。
+     */
+    val peerWidth: Int get() = phoneWidth
+
+    val peerHeight: Int get() = phoneHeight
+
     private val framesSkippedBeforeConfig = AtomicLong()
     private var warnedMissingConfig = false
     private var reportedFirstFrame = false

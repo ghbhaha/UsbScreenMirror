@@ -18,8 +18,11 @@ import java.nio.ByteOrder
  *  1. **timeout 严禁传 0** —— 0 在 USB 语义里是**无限等待**，会挂死线程。
  *  2. 控制请求在 `openDevice()` 之后**直接发，不要先 claimInterface**
  *     （配件模式下接口尚未就绪，先 claim 会失败）。
- *  3. `SEND_STRING` 的字符串必须 **UTF-16LE 且含结尾 `\0`**，
- *     否则 52 号请求只返回失败、不报原因，极难排查。
+ *  3. **`SEND_STRING` 的字符串必须是 UTF-8 + 单个 `\0`**。
+ *     ⚠️ 这条曾写错成"UTF-16LE"，导致手机上身份只剩首字符
+ *     （`manufacturer=U model=u version=1`）→ 与 `accessory_filter.xml` 不匹配
+ *     → 系统不派发 → `openAccessory` 拿不到权限 → 宿主永远等不到 CNXN。
+ *     编码实现在 `:protocol` 的 `AccessoryIdentity.encodeSendString`，并有单测钉住。
  */
 object Aoa {
 
@@ -27,7 +30,8 @@ object Aoa {
     const val REQUEST_SEND_STRING = 52
     const val REQUEST_START = 53
 
-    // 二期（HID）保留，MVP 不使用
+    // HID 注入（路线图 P1 输入通道）。常量与语义见 `:protocol` 的 [AoaHid]，
+    // 执行器是本包的 [HidInjector]。
     const val REQUEST_REGISTER_HID = 54
     const val REQUEST_UNREGISTER_HID = 55
     const val REQUEST_SET_HID_REPORT_DESC = 56
