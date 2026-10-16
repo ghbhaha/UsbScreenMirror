@@ -65,6 +65,14 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     @Volatile
     private var forceRetried = false
 
+    /**
+     * 连续建链失败次数（成功一次即归零），用于轮询退避。
+     *
+     * 用原子类而不是普通 int：`onError` 可能从会话线程过来（`HostSession.fail`），
+     * 而 `onReady` 与轮询都在主线程。
+     */
+    private val consecutiveFailures = java.util.concurrent.atomic.AtomicInteger()
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private var tickCount = 0L
 
@@ -99,9 +107,20 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
                 runCatching { router?.pollOnce() }
                     .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
             }
-            mainHandler.postDelayed(this, POLL_INTERVAL_MS)
+            mainHandler.postDelayed(this, nextPollDelayMs())
         }
     }
+
+    /**
+     * 轮询间隔：连续失败时**指数退避**（2s → 4s → 8s → 16s → 30s 封顶）。
+     *
+     * 为什么要退避：设备一直在、但握手一直失败时（例如它已被别的宿主 App 占成孤儿链路），
+     * 固定 2 秒轮询会无休止重试；退避能在**不放弃**的前提下把空转降到最低。
+     * 建链成功 后 [consecutiveFailures] 归零，立刻回到最快档。
+     */
+    private fun nextPollDelayMs(): Long =
+        (POLL_INTERVAL_MS shl consecutiveFailures.get().coerceIn(0, MAX_POLL_BACKOFF_SHIFT))
+            .coerceAtMost(MAX_POLL_INTERVAL_MS)
 
     private val detachReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
@@ -275,6 +294,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     ) {
         logger.i(TAG, "link ready: aoaVersion=$aoaVersion device=${device.deviceId}")
 
+        // 建链成功 -> 退避归零，轮询回到最快档
+        consecutiveFailures.set(0)
+
         lastDevice = device
         // aoaVersion == 0 表示这次是按"已是配件、跳过握手"的快路径连的，
         // 配件身份未被验证过（可能还是别的宿主 App 留下的）
@@ -305,6 +327,16 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     override fun onError(message: String, cause: Throwable?) {
         runOnUiThread { statusText.text = "ERROR: $message" }
         logger.e(TAG, message, cause)
+
+        // ★ 自动重连（P0）：链路错误后**必须**把会话清掉 ——
+        //   前台轮询的接管条件是 `session == null`，不清就永远不会自动重试
+        //   （加自动重连之前，`readFully timeout` 之类断链后只能靠用户点按钮）。
+        //   注意 stopSession 里有 UI 调用（setVideoSize），只能放主线程。
+        runOnUiThread { stopSession() }
+        consecutiveFailures.incrementAndGet()
+        // 断线是"新情况"（设备可能马上回来），重置自动重试计数；
+        // 否则几次偶发断线就会耗光 MAX_ATTEMPTS_PER_DEVICE 配额，自动重连永久失效
+        router?.resetAttempts()
 
         // ★ 自愈：快路径（跳过握手）连上的链路如果没人应答，说明配件身份不是我们的
         //   —— 手机很可能被"别的宿主 App"切成了配件模式，系统因此没有拉起我们的手机端 App。
@@ -428,6 +460,12 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         const val STATS_INTERVAL_MS = 1000L
         const val STATS_LOG_EVERY_TICKS = 5L
         const val POLL_INTERVAL_MS = 2_000L
+
+        /** 轮询退避的上限（连续失败会 2s→4s→8s… 最长等这么久再试）。 */
+        const val MAX_POLL_INTERVAL_MS = 30_000L
+
+        /** 退避最多翻几番（2s 左移 4 位 = 32s，会被上面那条封到 30s）。 */
+        const val MAX_POLL_BACKOFF_SHIFT = 4
 
         /** adb 调试入口用的 extra：`--es replay_path <绝对路径>`。 */
         const val EXTRA_REPLAY_PATH = "replay_path"

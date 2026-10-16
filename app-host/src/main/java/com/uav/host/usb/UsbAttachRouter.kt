@@ -253,7 +253,9 @@ class UsbAttachRouter(
             callback.onError(
                 "等待重枚举超时。检查：① 手机是否弹出『打开该 App 处理 USB 配件』；" +
                     "② OTG 线是否支持数据传输；" +
-                    "③ 若手机原本已被其它宿主 App 占用为配件，请拔线重插一次"
+                    "③ 若手机原本已被其它宿主 App 占用为配件，请拔线重插一次。" +
+                    "（会自动重试：手机端若持着一个收不到应答的配件 fd，会在约 12s 后自行释放，" +
+                    "届时下一次握手即可成功）"
             )
             return
         }
@@ -322,6 +324,21 @@ class UsbAttachRouter(
         device?.let { attemptCounts.remove(it.deviceId) }
         callback.onError("USB 设备已拔出")
     }
+
+    /**
+     * 重置自动重试计数（链路断开时由上层调用）。
+     *
+     * 断线是**新情况** —— 设备可能马上回来、也可能刚被重新枚举。若不重置，
+     * 几次偶发断线就会把 [MAX_ATTEMPTS_PER_DEVICE] 的配额耗光，
+     * 「自动重连」便永久失效（这正是加自动重连前的老毛病）。
+     */
+    fun resetAttempts() {
+        attemptCounts.clear()
+    }
+
+    /** 当前是否已有设备被判定为"试够了"。仅用于日志/诊断。 */
+    fun exhaustedDeviceIds(): List<Int> =
+        attemptCounts.filterValues { it >= MAX_ATTEMPTS_PER_DEVICE }.keys.toList()
 
     fun close() {
         if (!closed.compareAndSet(false, true)) return

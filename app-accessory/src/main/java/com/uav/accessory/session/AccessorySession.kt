@@ -51,6 +51,21 @@ class AccessorySession(
         fun onStatus(text: String) {}
         fun onError(message: String, cause: Throwable?)
         fun onClosed(reason: String) {}
+
+        /**
+         * 会话起来了、但宿主长时间**没有任何报文**。
+         *
+         * ★ 这**不是普通断线**，而是实测确认过的一种"假配件"：
+         *   配件字符串已经写进驱动、框架因此把 attach 派发给了我们，
+         *   但 gadget 实际还停在普通模式 —— 而 `/dev/usb_accessory` 是**独占打开**的，
+         *   我们一旦握着一个这样的 fd，手机端就**再也切不进配件模式**：
+         *   宿主侧表现为无限"等待重枚举超时"，只能靠拔插或强杀 App 恢复。
+         *   （实测：停掉 App 释放 fd 后，**下一次握手立刻成功**。）
+         *
+         * 因此实现方应当**只释放、不重连** —— 把 gadget 让出来等宿主重新握手，
+         * 那时系统会重新派发 attach，链路自然建起来。
+         */
+        fun onIdleTimeout(reason: String) {}
     }
 
     /** 由 App 侧实现（`CaptureService`），负责虚拟屏 + 编码器。 */
@@ -83,6 +98,18 @@ class AccessorySession(
     /** 因"本会话还没发流头"而被丢弃的帧数（正常只会在重连瞬间出现少量）。 */
     val framesDroppedBeforeHeader = java.util.concurrent.atomic.AtomicLong()
 
+    /**
+     * 是否已收到宿主的**第一条**报文。
+     *
+     * 用来给"假配件"设期限：拿到 fd 不等于宿主真的在那头
+     * （详见 [Listener.onIdleTimeout] 的说明）。
+     */
+    private val hostSeen = AtomicBoolean(false)
+
+    /** 空闲看门狗线程；收到宿主报文或会话关闭时打断。 */
+    @Volatile
+    private var idleWatchdog: Thread? = null
+
     @Volatile
     var negotiatedOptions: ParsedOpen? = null
         private set
@@ -101,6 +128,37 @@ class AccessorySession(
         connection = conn
         conn.start()
         logger.i(TAG, "accessory session started on ${transport.label} (本机 ${localWidth}x$localHeight)")
+        startIdleWatchdog()
+    }
+
+    /**
+     * 看门狗：会话起来后若 [IDLE_RELEASE_MS] 内宿主一条报文都没发，判定为"假配件"并主动释放。
+     *
+     * 这是解开**互锁**的关键一步 —— 我们不放 fd，手机端就切不进配件模式，
+     * 宿主就永远等不到重枚举，死锁一直持续到拔插为止。
+     */
+    private fun startIdleWatchdog() {
+        val t = Thread({
+            try {
+                Thread.sleep(IDLE_RELEASE_MS)
+            } catch (ie: InterruptedException) {
+                return@Thread // 已收到宿主报文、或会话被主动关闭
+            }
+            if (closed.get() || hostSeen.get()) return@Thread
+
+            val reason = "宿主 ${IDLE_RELEASE_MS / 1000}s 内无任何报文"
+            logger.w(
+                TAG,
+                "$reason —— 判定为假配件，释放 fd（否则会堵死配件模式切换；宿主侧会一直报" +
+                    "『等待重枚举超时』）"
+            )
+            // 先释放再通知：fd 必须真的关掉，gadget 才能让出来
+            close()
+            listener.onIdleTimeout(reason)
+        }, "uav-accessory-idle")
+        t.isDaemon = true
+        idleWatchdog = t
+        t.start()
     }
 
     // ------------------------------------------------------------------ 发送
@@ -152,6 +210,11 @@ class AccessorySession(
     private val connectionListener = object : ConnectionListener {
 
         override fun onMessage(message: AdbMessage) {
+            // 宿主确实在（哪怕只是发来一条我们不认识的报文）—— 期限解除
+            if (hostSeen.compareAndSet(false, true)) {
+                idleWatchdog?.interrupt()
+                idleWatchdog = null
+            }
             when (message.commandType) {
                 Command.CNXN -> handleCnxn(message)
                 Command.OPEN -> handleOpen(message)
@@ -237,6 +300,8 @@ class AccessorySession(
 
     fun close() {
         if (!closed.compareAndSet(false, true)) return
+        idleWatchdog?.interrupt()
+        idleWatchdog = null
         stopCaptureQuietly()
         connection?.close()
         connection = null
@@ -252,5 +317,13 @@ class AccessorySession(
 
     companion object {
         const val TAG = "UAV-Accessory"
+
+        /**
+         * 会话启动后多久没收到宿主报文就释放 fd。
+         *
+         * 取值权衡：正常链路里宿主 claim 完接口就发 CNXN（1~3s 量级），
+         * 12s 有充足余量；又不能太长，否则"假配件"会把手机端堵住十几秒以上。
+         */
+        const val IDLE_RELEASE_MS = 12_000L
     }
 }

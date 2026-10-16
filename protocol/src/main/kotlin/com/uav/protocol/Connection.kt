@@ -320,6 +320,19 @@ class Connection(
         } catch (t: Throwable) {
             logger.w(tag, "listener.onClosed threw: ${t.message}", t)
         }
+        // ★ 与 [fail] 同理：会话已经结束，必须把底层通道关掉。
+        //   漏掉它就等于漏掉 Android 上的 `/dev/usb_accessory` fd，
+        //   会让手机端再也切不进配件模式（宿主侧无限「等待重枚举超时」）。
+        closeTransportQuietly()
+    }
+
+    /** 关闭底层通道；`transport.close()` 自身幂等，重复调用无害。 */
+    private fun closeTransportQuietly() {
+        try {
+            transport.close()
+        } catch (t: Throwable) {
+            logger.w(tag, "closing transport failed: ${t.message}", t)
+        }
     }
 
     private fun fail(cause: Throwable) {
@@ -332,6 +345,17 @@ class Connection(
         } catch (t: Throwable) {
             logger.w(tag, "listener.onError threw: ${t.message}", t)
         }
+        // ★ 出错也必须把底层通道关掉，否则 **fd 泄漏**。
+        //
+        //   这里踩过一个很贵的坑：`closing` 在上面已经被置 true，于是之后即便有人
+        //   规规矩矩调用 `close()`，也会被 `closing.getAndSet(true)` 挡掉，
+        //   `transport.close()` 永远不会执行 —— fd 就这么一直开着。
+        //
+        //   在 Android 上后果极重：`/dev/usb_accessory` 是**独占打开**的，漏掉的 fd 会
+        //   让手机端**再也切不进配件模式**，宿主侧表现为无限「等待重枚举超时」，
+        //   只能靠拔插或强杀 App 恢复（实测：停掉 App 释放 fd 后，下一次握手立刻成功）。
+        //   而且此刻 transport 已不可用（读到 EIO 之类），继续持有也没有任何意义。
+        closeTransportQuietly()
     }
 
     private fun closeSinks() {
@@ -353,7 +377,7 @@ class Connection(
         writeQueue.clear()
         writeQueue.offer(SHUTDOWN)
         closeSinks()
-        transport.close()
+        closeTransportQuietly()
         readerThread?.interrupt()
         writerThread?.interrupt()
         readerThread = null

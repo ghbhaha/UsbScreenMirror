@@ -90,6 +90,24 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
 
     private var rotationWatcherRegistered = false
 
+    // ---------------------------------------------------------------- 自动重连（P0）
+
+    /** 连续重连尝试次数；成功建链后归零。 */
+    private val reconnectAttempts = java.util.concurrent.atomic.AtomicInteger()
+
+    private val reconnectHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    private val reconnectTask = Runnable { attemptReconnect() }
+
+    /**
+     * 服务正在收尾（用户点停止 / 重连放弃 / `onDestroy`）。
+     *
+     * 没有它会出现这种情况：`stopEverything()` 主动 `close()` 会话后，异步到达的
+     * `onClosed` 又把"我们自己的停止"当成断线，于是排一次重连 —— 服务刚停又被拉起。
+     */
+    @Volatile
+    private var stopping = false
+
     /** 收到 OPEN 但录屏授权还没到时的挂起参数。 */
     @Volatile
     private var pendingOptions: ParsedOpen? = null
@@ -307,6 +325,11 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         )
         session = s
         activeSession = s
+        // 建链成功 -> 取消排队中的重连、计数归零（下次断开又是全新的 N 次机会）。
+        // 这条也顺手解决了"主动重启后被 onClosed 误排重连"的重复建链问题。
+        cancelReconnect()
+        reconnectAttempts.set(0)
+        stopping = false
         s.start()
         AccessoryStatus.set("配件已打开（${accessory.model}/${accessory.manufacturer}），等待宿主报文")
     }
@@ -410,12 +433,51 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     override fun onError(message: String, cause: Throwable?) {
         AndroidLogger.e(TAG, message, cause)
         AccessoryStatus.set("错误: $message")
+
+        // ★ 链路级错误（`readFully timeout` 之类）走的是这里，**不一定**会再走 onClosed，
+        //   所以必须在这里也安排重连，否则断了照样回不来。
+        //   用 `session != null` 判断，避免与 onClosed 重复排队、白白吃掉重连配额。
+        if (!stopping && (session != null || fdChannel != null)) {
+            // ★ 必须真的把 fd 关掉（见 releaseTransport）：只把引用置 null 会漏 fd，
+            //   而漏掉的 fd 会让手机端永久切不进配件模式。
+            releaseTransport("链路错误: $message")
+            scheduleReconnect(message)
+        }
     }
 
+    /**
+     * 传输会话结束。
+     *
+     * ★ **不再直接 `stopSelf()`** —— 那正是"断了就回不来"的根源。
+     *   改为自动重连，并且**保留投影与编码器**：`MediaProjection` 令牌只允许
+     *   `createVirtualDisplay` 一次，销毁就等于要重新弹一次录屏授权 ——
+     *   而"免去这次重新授权"恰恰是自动重连的意义。
+     */
     override fun onClosed(reason: String) {
         AccessoryStatus.set("会话结束: $reason")
-        stopEverything()
-        stopSelf()
+        session = null
+        activeSession = null
+        if (stopping) {
+            // 我们自己主动关的（用户点停止 / 重连放弃），别再排一次重连
+            AndroidLogger.i(TAG, "服务正在收尾，不安排重连（$reason）")
+            return
+        }
+        scheduleReconnect(reason)
+    }
+
+    /**
+     * "假配件"：会话起来了但宿主一声不响。
+     *
+     * ★ **刻意只释放、不重连。** 原因见 [AccessorySession.Listener.onIdleTimeout]：
+     *   fd 被我们握着时手机端切不进配件模式，硬重连只会再次拿到同一个假配件、
+     *   把互锁继续维持下去。释放之后等宿主重新握手，系统会重新派发 attach，
+     *   那时 [ProjectionActivity.onNewIntent] 会把会话重新拉起来。
+     */
+    override fun onIdleTimeout(reason: String) {
+        AndroidLogger.w(TAG, "释放假配件（$reason），等待宿主重新握手")
+        cancelReconnect()
+        releaseTransport("假配件: $reason")
+        AccessoryStatus.set("配件无应答（$reason），已释放。等待宿主重新握手…")
     }
 
     // ------------------------------------------------------------------ 前台通知
@@ -469,32 +531,88 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
 
     // ------------------------------------------------------------------ 生命周期
 
+    // ------------------------------------------------------------------ 自动重连（P0）
+
     /**
-     * 只拆掉**传输会话与 fd**，保留投影与编码器。
+     * 链路断开后安排一次自动重连。
      *
-     * 用于配件重新接入：旧 fd 已随重枚举失效，但投影令牌是一次性的，
-     * 停掉投影就意味着要重新弹一次录屏授权。
+     * 为什么不销毁编码器 / 虚拟屏：`MediaProjection` 令牌只允许 `createVirtualDisplay`
+     * 一次，销毁就意味着要**重新弹一次录屏授权**。重连成功后走 `resendStartup()`
+     * 复用既有编码器（该路径已在"配件重新接入"场景验证过）。
+     *
+     * 放弃时也**不是**简单退出：会清干净并 `stopSelf()`，把状态交还给系统 ——
+     * 用户重新插线时系统仍会派发配件 intent 把我们拉起。
      */
+    private fun scheduleReconnect(reason: String) {
+        val n = reconnectAttempts.incrementAndGet()
+        if (n > MAX_RECONNECT_ATTEMPTS) {
+            AndroidLogger.w(TAG, "自动重连放弃（已试 $MAX_RECONNECT_ATTEMPTS 次）：$reason")
+            AccessoryStatus.set("自动重连失败，已停止。请重新插线")
+            stopEverything()
+            stopSelf()
+            return
+        }
+        AndroidLogger.i(TAG, "安排自动重连第 $n/$MAX_RECONNECT_ATTEMPTS 次（原因：$reason）")
+        AccessoryStatus.set(
+            "链路断开（$reason），${RECONNECT_DELAY_MS / 1000}s 后自动重连（第 $n 次）…"
+        )
+        reconnectHandler.removeCallbacks(reconnectTask)
+        reconnectHandler.postDelayed(reconnectTask, RECONNECT_DELAY_MS)
+    }
+
+    private fun attemptReconnect() {
+        val accessory = resolveAccessory(null)
+        if (accessory == null) {
+            // 多半是物理拔出：系统会重新派发 intent 把我们拉起，这里继续排队等（次数上限兜底）
+            AccessoryStatus.set("未找到 USB 配件，继续等待…")
+            scheduleReconnect("配件不存在")
+            return
+        }
+        // ★ USB 操作不能放主线程（红线）：openAccessory 可能阻塞
+        Thread({ openAccessoryAndStartSession(accessory) }, "uav-reconnect").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun cancelReconnect() {
+        reconnectHandler.removeCallbacks(reconnectTask)
+    }
+
+    /**
+     * 只拆掉**传输层**（会话 + fd + 抓流），保留投影与编码器。
+     *
+     * 用于配件重新接入与链路出错：旧 fd 已失效，但投影令牌是一次性的，
+     * 停掉投影就意味着要重新弹一次录屏授权。
+     *
+     * ★ 一定要真的 `close()` 而不是只把引用置 null。
+     *   `/dev/usb_accessory` 是**独占打开**的，漏掉一个 fd 就会把手机端
+     *   "切进配件模式"的路径**永久堵死**：宿主侧表现为无限『等待重枚举超时』，
+     *   只能靠拔插或强杀 App 恢复（实测：释放 fd 后下一次握手立刻成功）。
+     */
+    private fun releaseTransport(reason: String) {
+        session?.close()
+        session = null
+        activeSession = null
+        dumpChannel?.close()
+        dumpChannel = null
+        fdChannel?.close()
+        fdChannel = null
+        AndroidLogger.i(TAG, "传输层已释放（$reason）")
+    }
+
     private fun teardownSessionOnly() {
         if (session == null && fdChannel == null) return
         AccessoryStatus.set("配件重新接入，重建传输会话（保留编码器）…")
-        session?.close()
-        session = null
-        activeSession = null
-        dumpChannel?.close()
-        dumpChannel = null
-        fdChannel = null
+        releaseTransport("配件重新接入")
     }
 
     private fun stopEverything() {
+        stopping = true
+        cancelReconnect()
         pendingOptions = null
         stopCapture()
-        session?.close()
-        session = null
-        activeSession = null
-        dumpChannel?.close()
-        dumpChannel = null
-        fdChannel = null
+        releaseTransport("停止采集")
         projection?.let { p ->
             runCatching { p.unregisterCallback(projectionCallback) }
             runCatching { p.stop() }
@@ -526,6 +644,17 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         const val EXTRA_FORCE_RESTART = "forceRestart"
 
         const val DUMP_FILE_NAME = "uav-dump.uav"
+
+        /** 自动重连：最多试几次（每次间隔 [RECONNECT_DELAY_MS]）。 */
+        const val MAX_RECONNECT_ATTEMPTS = 10
+
+        /**
+         * 自动重连间隔。
+         *
+         * 取 3 秒：太短会在 USB 尚未稳定时反复失败（每次失败还会占掉一次配额），
+         * 太长则用户要干等。10 次 × 3s ≈ 30 秒的耐心窗口，实测够用。
+         */
+        const val RECONNECT_DELAY_MS = 3_000L
 
         /** openAccessory 的重试次数与间隔（应对"系统派发晚于服务启动"的瞬时无权限）。 */
         const val OPEN_ACCESSORY_ATTEMPTS = 6
