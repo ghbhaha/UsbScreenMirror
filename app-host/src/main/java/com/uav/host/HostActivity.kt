@@ -91,6 +91,18 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     private var oneToOne = true
 
     /**
+     * 「用户主动切换画质、正在重开会话」标志（10.17）。
+     *
+     * 为 `true` 时，瞬时握手失败不当 ERROR 展示、也不触发强制 AOA 重握手 ——
+     * 那类失败是"手机端还在推流 + 宿主刚重连"的字节交错，自动重试即恢复。
+     * 首个视频帧到达（或 [_clearExpectingRestartDelayed] 超时兜底）即清除。
+     */
+    private var expectingRestart = false
+
+    /** 切换重开的兜底清理：即使一直没出画面，也不能让标志永久挂着掩盖真错误。 */
+    private val clearExpectingRestartDelayed = Runnable { expectingRestart = false }
+
+    /**
      * 触摸注入控制器（路线图 P1「输入通道」）：把**宿主屏幕上的触摸**转发成手机上的触摸。
      *
      * 坐标换算在 `:protocol/TouchMapper`（纯逻辑 + 单测），本类只负责
@@ -390,6 +402,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         statusText.text = getString(
             if (oneToOne) R.string.host_status_switch_11 else R.string.host_status_switch_hd
         )
+        // 标记"预期内重开"：期间瞬时握手失败不弹 ERROR（见 onError），45s 兜底清除
+        expectingRestart = true
+        mainHandler.removeCallbacks(clearExpectingRestartDelayed)
+        mainHandler.postDelayed(clearExpectingRestartDelayed, RESTART_FLAG_TIMEOUT_MS)
         stopSession()
         router?.scanAndAttach()
     }
@@ -795,6 +811,20 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     override fun onError(message: String, cause: Throwable?) {
+        // ★ 10.17：用户主动切换画质时的"预期内重开" —— 首个握手偶尔会撞上手机端仍在推流的
+        //   字节（`bad magic` / 握手超时），自动重试即可恢复。这里**不弹 ERROR**，免得让用户以为
+        //   坏了；也**不触发"强制 AOA 重握手"**（那会真重枚举手机，对一次画质切换是过重的反应）。
+        if (expectingRestart) {
+            logger.w(TAG, "切换画质重开会话中的瞬时失败（将自动重试）: $message", cause)
+            runOnUiThread {
+                statusText.text = getString(R.string.host_status_restarting)
+                stopSession()
+            }
+            consecutiveFailures.incrementAndGet()
+            router?.resetAttempts()
+            return
+        }
+
         // ★ 出错必须把菜单叫回来：面板收起时错误信息是看不见的，
         //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
         runOnUiThread { statusText.text = "ERROR: $message" }
@@ -846,6 +876,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     override fun onFirstFrame() {
+        // 重开会话成功（画面出来了）→ 清掉"切换中"标志
+        expectingRestart = false
         runOnUiThread { statusText.text = "投屏中（首帧已输出）" }
         // 画面出来了就把菜单收起来，让视频干净地占满整屏（只自动收一次，见 menuAutoCollapsed）。
         // 想调参数时点一下画面外的空白处即可叫回来。
@@ -937,6 +969,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     override fun onDestroy() {
         mainHandler.removeCallbacks(statsTicker)
         mainHandler.removeCallbacks(usbPoller)
+        mainHandler.removeCallbacks(clearExpectingRestartDelayed)
         runCatching { unregisterReceiver(detachReceiver) }
         router?.close()
         router = null
@@ -997,6 +1030,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
          * 真正的横竖屏切换会让目标尺寸变化 40% 以上（1024 -> 1920）。
          */
         const val AREA_RENEGOTIATE_RATIO = 0.10
+
+        /** 「切换画质重开中」标志的兜底存活时长（ms）；出画面会提前清除。 */
+        const val RESTART_FLAG_TIMEOUT_MS = 45_000L
 
         /** adb 调试入口用的 extra：`--ez no_audio true`（关掉音频，A/B 对比用）。 */
         const val EXTRA_NO_AUDIO = "no_audio"
