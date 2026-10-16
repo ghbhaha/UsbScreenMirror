@@ -97,8 +97,13 @@ class HidInjector(
         return true
     }
 
-    /** 注销 HID 设备（拔线后 id 也会自动失效，这里用于主动收尾）。 */
-    fun unregister(id: Int): Boolean {
+    /**
+     * 注销 HID 设备（拔线后 id 也会自动失效，这里用于主动收尾）。
+     *
+     * @param logFailure 失败是否记警告。**清理残留**时要传 false ——
+     *   扫一段 id 空间时，"这个 id 本来就不存在"是**正常结果**，不该刷警告。
+     */
+    fun unregister(id: Int, logFailure: Boolean = true): Boolean {
         val n = connection.controlTransfer(
             AoaHid.REQTYPE_OUT_VENDOR_DEVICE,
             AoaHid.UNREGISTER_HID,
@@ -109,7 +114,7 @@ class HidInjector(
             timeoutMs,
         )
         val ok = n >= 0
-        if (!ok) logger.w(TAG, "UNREGISTER_HID[$id] 失败 n=$n")
+        if (!ok && logFailure) logger.w(TAG, "UNREGISTER_HID[$id] 失败 n=$n")
         return ok
     }
 

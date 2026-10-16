@@ -10,6 +10,7 @@ import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.Surface
 import android.view.View
@@ -17,14 +18,14 @@ import android.widget.Button
 import android.widget.TextView
 import androidx.core.content.IntentCompat
 import com.uav.host.debug.FileByteChannel
+import com.uav.host.input.HidTouchController
 import com.uav.host.session.HostSession
 import com.uav.host.usb.BulkByteChannel
 import com.uav.host.usb.BulkPair
-import com.uav.host.usb.HidInjector
 import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.AspectRatioSurfaceView
-import com.uav.protocol.HidTouchPanel
 import com.uav.protocol.Protocol
+import com.uav.protocol.TouchMapper
 import com.uav.protocol.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
@@ -53,16 +54,19 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     private var replayChannel: FileByteChannel? = null
 
     /**
-     * HID 注入器（路线图 P1「输入通道」的探针）。
+     * 触摸注入控制器（路线图 P1「输入通道」）：把**宿主屏幕上的触摸**转发成手机上的触摸。
      *
-     * 绑定到**本次连接的** `UsbDeviceConnection`：重枚举后旧连接即失效，
-     * 所以每次 [onReady] 都会重建，并清掉已注册的 HID id。
+     * 坐标换算在 `:protocol/TouchMapper`（纯逻辑 + 单测），本类只负责
+     * 「从 MotionEvent 取点 → 换算 → 交给控制器」这段接线。
      */
-    private var hidInjector: HidInjector? = null
+    private var hidTouch: HidTouchController? = null
 
-    /** 已注册的 HID 设备 id；0 = 未注册（拔线/重枚举后需要重新注册）。 */
-    @Volatile
-    private var hidDeviceId = 0
+    /**
+     * 是否已经向手机发出过 `DOWN`。
+     *
+     * 没有 DOWN 的 MOVE/UP **一律不发** —— 否则手机上会出现幽灵触摸（手指根本没按下去）。
+     */
+    private var touchActive = false
 
     @Volatile
     private var surfaceReady = false
@@ -170,6 +174,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             surfaceReady = false
             logger.i(TAG, "surface destroyed")
+            // 手指若还按着，必须补一个抬起 —— 否则手机上那根手指会**一直按住**。
+            // （正常路径上 View 会先收到 ACTION_CANCEL，这里只是兜底，`up()` 自身幂等。）
+            touchActive = false
+            hidTouch?.up()
             // ★ 只停渲染，**不动链路**。这里踩过一个整进程崩溃和一个重连死锁：
             //
             //   1) 崩溃：`surfaceDestroyed` 先于 `onDestroy`，旧代码只在 `onDestroy`
@@ -196,6 +204,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         statsText = findViewById(R.id.stats)
 
         surfaceView.holder.addCallback(surfaceCallback)
+
+        // 触摸注入：把宿主屏幕上的触摸转发成手机上的触摸（路线图 P1）。
+        hidTouch = HidTouchController(logger)
+        surfaceView.setOnTouchListener { _, event -> handleSurfaceTouch(event) }
 
         val screen = DisplaySize.of(this)
         logger.i(TAG, "host screen ${screen.x}x${screen.y}, protocol v${Protocol.VERSION}")
@@ -317,105 +329,137 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             return true
         }
 
-        // ---- HID 注入探针（路线图 P1 输入通道；先只做"单点绝对坐标触摸屏"）----
+        // ---- HID 触摸注入的排障入口（正常情况下**自动注册**，不需要这些）----
         //
         // am start -n com.uav.host/.HostActivity --ez hid_probe true
-        //   注册一个 HID 触摸屏设备。注册成功后手机上 `dumpsys input` 应多出一个触摸屏，
-        //   `getevent -l` 也能看到一个新的 /dev/input/eventN。
+        //   强制重新注册触摸屏（排查"手机上没出现触摸设备"用）。
         if (intent?.getBooleanExtra(EXTRA_HID_PROBE, false) == true) {
-            logger.i(TAG, "收到 HID 探针指令")
-            startHidProbe()
+            logger.i(TAG, "收到指令：强制重新注册 HID 触摸屏")
+            hidTouch?.forceReRegister()
             return true
         }
 
-        // am start -n com.uav.host/.HostActivity --ez hid_tap true --ei tap_x 612 --ei tap_y 160
-        //   发一次点按，验证报告真的进了手机的输入子系统（不传坐标则用安全位置）。
-        //   可加 --ei hold_ms 2500 拉长按住时长（配合手机「显示点按操作反馈」可截图留证）。
+        // am start -n com.uav.host/.HostActivity --ez hid_tap true [--ei tap_x X --ei tap_y Y --ei hold_ms Ms]
+        //   在**手机坐标**上发一次点按，不用真去点宿主屏幕就能验证注入链路（不传坐标用安全位置）。
         if (intent?.getBooleanExtra(EXTRA_HID_TAP, false) == true) {
-            val x = intent.getIntExtra(EXTRA_TAP_X, Int.MIN_VALUE)
-            val y = intent.getIntExtra(EXTRA_TAP_Y, Int.MIN_VALUE)
-            val hold = intent.getIntExtra(EXTRA_HOLD_MS, HID_TAP_HOLD_MS.toInt())
-            logger.i(TAG, "收到 HID 点按指令: x=$x y=$y hold=${hold}ms")
-            sendHidTap(x, y, hold)
+            val xArg = intent.getIntExtra(EXTRA_TAP_X, Int.MIN_VALUE)
+            val yArg = intent.getIntExtra(EXTRA_TAP_Y, Int.MIN_VALUE)
+            val hold = intent.getIntExtra(EXTRA_HOLD_MS, DEFAULT_TAP_HOLD_MS)
+            debugTap(xArg, yArg, hold)
             return true
         }
 
         return false
     }
 
-    // ------------------------------------------------------------------ HID 注入探针
+    // ------------------------------------------------------------------ 触摸注入（宿主 → 手机）
 
     /**
-     * 注册一个「单点绝对坐标触摸屏」。
+     * 宿主屏幕上的触摸 → 手机。
      *
-     * 坐标空间取手机在 `CNXN` 里上报的**屏幕尺寸** —— 不是编码后的视频尺寸
-     * （后者是 `max_size` 缩放过的，用它会让触摸落点整体偏移）。
+     * 规则：
+     *  - 只有落在**视频显示区**内的触摸才转发（信箱边忽略，见 [TouchMapper]）；
+     *  - 维护"已经发出 DOWN"的状态：没有 DOWN 的 MOVE/UP 一律不发，否则手机上会出现
+     *    幽灵触摸（明明没按下去却响应了）；
+     *  - 手指拖出显示区 → 立刻等价于抬起，避免手机上的手指"卡"在边缘。
+     *
+     * 多点触摸暂不支持（只跟 pointer 0），见路线图 P2。
      */
-    private fun startHidProbe() {
-        val injector = hidInjector
-        if (injector == null) {
-            logger.w(TAG, "HID 探针：还没建链（这些请求要等手机进入配件模式之后才有效）")
-            return
-        }
-        val w = session?.peerWidth ?: 0
-        val h = session?.peerHeight ?: 0
-        if (w <= 0 || h <= 0) {
-            logger.w(TAG, "HID 探针：还没收到手机的 CNXN（拿不到屏幕尺寸）")
-            return
-        }
-        // USB 操作必须在 worker 线程（红线）
-        Thread({
-            val descriptor = HidTouchPanel.descriptor(w, h)
-            logger.i(TAG, "HID 探针：描述符 ${descriptor.size}B，坐标空间 ${w}x$h")
-            if (injector.registerAndLoad(HID_DEVICE_ID, descriptor)) {
-                hidDeviceId = HID_DEVICE_ID
-                logger.i(
-                    TAG,
-                    "HID 探针：注册成功。验证：手机上 dumpsys input | grep -i -A3 hid " +
-                        "或 getevent -pl"
-                )
-            } else {
-                logger.e(TAG, "HID 探针：注册失败（见上面哪一条请求返回了负数）")
+    private fun handleSurfaceTouch(event: MotionEvent): Boolean {
+        val s = session ?: return false
+        val viewW = surfaceView.width
+        val viewH = surfaceView.height
+        val screenW = s.peerWidth
+        val screenH = s.peerHeight
+        if (viewW <= 0 || viewH <= 0 || screenW <= 0 || screenH <= 0) return false
+
+        val point = TouchMapper.mapTouch(
+            viewX = event.getX(0).toInt(),
+            viewY = event.getY(0).toInt(),
+            viewW = viewW,
+            viewH = viewH,
+            videoW = surfaceView.videoWidth,
+            videoH = surfaceView.videoHeight,
+            screenW = screenW,
+            screenH = screenH,
+        )
+
+        return when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (point == null) {
+                    // 落在信箱边/显示区外：不转发。日志有助于判断"为什么点了没反应"
+                    if (DebugTools.ENABLED) {
+                        logger.i(
+                            TAG,
+                            "触摸忽略：视图内 (${event.getX(0).toInt()},${event.getY(0).toInt()}) " +
+                                "不在显示区内（view=${viewW}x$viewH video=" +
+                                "${surfaceView.videoWidth}x${surfaceView.videoHeight}）",
+                        )
+                    }
+                    touchActive = false
+                    false
+                } else {
+                    if (DebugTools.ENABLED) {
+                        logger.i(
+                            TAG,
+                            "触摸转发：视图内 (${event.getX(0).toInt()},${event.getY(0).toInt()})" +
+                                " / view=${viewW}x$viewH video=" +
+                                "${surfaceView.videoWidth}x${surfaceView.videoHeight}" +
+                                " 手机屏=${screenW}x$screenH → 手机 (${point.x},${point.y})",
+                        )
+                    }
+                    touchActive = true
+                    hidTouch?.down(point.x, point.y)
+                    true
+                }
             }
-        }, "uav-hid-probe").apply { isDaemon = true }.start()
+
+            MotionEvent.ACTION_MOVE -> {
+                if (!touchActive) return false
+                if (point == null) {
+                    // 拖到信箱边/显示区外：等价于抬指，否则手机上会一直按着
+                    touchActive = false
+                    hidTouch?.up()
+                } else {
+                    hidTouch?.move(point.x, point.y)
+                }
+                true
+            }
+
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL,
+            MotionEvent.ACTION_POINTER_UP,
+            -> {
+                if (!touchActive) return false
+                touchActive = false
+                hidTouch?.up()
+                true
+            }
+
+            else -> false
+        }
     }
 
     /**
-     * 发一次点按（按下 → 停 [holdMs] → 抬起）。
+     * 在**手机坐标**上发一次点按（排障用）。
      *
      * 不传坐标时落在一个**安全位置**（屏幕上方 6% 处的正中，通常是状态栏下方的空白区），
-     * 避免误触手机上的按钮（实测手机上就有"停止投屏"这种一按就断链的按钮）。
-     *
-     * @param holdMs 按住时长。探针留证时拉长到 2s 以上，普通点按保持默认的几十毫秒。
+     * 避免误触手机上的按钮（手机上就有"停止投屏"这种一按就断链的按钮）。
      */
-    private fun sendHidTap(xArg: Int, yArg: Int, holdMs: Int) {
-        val injector = hidInjector
-        val id = hidDeviceId
-        if (injector == null || id == 0) {
-            logger.w(TAG, "HID 点按：尚未注册 HID 设备（先跑一次 --ez hid_probe true）")
-            return
-        }
+    private fun debugTap(xArg: Int, yArg: Int, holdMs: Int) {
         val w = session?.peerWidth ?: 0
         val h = session?.peerHeight ?: 0
-        val x = if (xArg == Int.MIN_VALUE) w / 2 else xArg
-        val y = if (yArg == Int.MIN_VALUE) (h * 0.06f).toInt() else yArg
         if (w <= 0 || h <= 0) {
-            logger.w(TAG, "HID 点按：拿不到手机屏幕尺寸，无法做安全兜底坐标")
+            logger.w(TAG, "HID 点按：还没收到手机的 CNXN（拿不到屏幕尺寸）")
             return
         }
-        val hold = holdMs.coerceIn(1, HID_TAP_MAX_HOLD_MS)
-        Thread({
-            val down = HidTouchPanel.report(x, y, tipDown = true)
-            val up = HidTouchPanel.report(x, y, tipDown = false)
-            val okDown = injector.sendReport(id, down)
-            try {
-                Thread.sleep(hold.toLong())
-            } catch (ie: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-            val okUp = injector.sendReport(id, up)
-            logger.i(TAG, "HID 点按 (${x},${y}) 按住 ${hold}ms：按下=$okDown 抬起=$okUp")
-        }, "uav-hid-tap").apply { isDaemon = true }.start()
+        val size = TouchMapper.logicalPhoneSize(
+            w, h, surfaceView.videoWidth, surfaceView.videoHeight,
+        ) ?: return
+        val x = if (xArg == Int.MIN_VALUE) size.width / 2 else xArg
+        val y = if (yArg == Int.MIN_VALUE) (size.height * 0.06f).toInt() else yArg
+        logger.i(TAG, "HID 点按指令：手机坐标 ($x,$y) 按住 ${holdMs}ms（逻辑空间 ${size.width}x${size.height}）")
+        hidTouch?.debugTap(x, y, holdMs)
     }
 
     // ------------------------------------------------------------------ router 回调
@@ -434,11 +478,6 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     ) {
         logger.i(TAG, "link ready: aoaVersion=$aoaVersion device=${device.deviceId}")
 
-        // HID 注入器绑定到本次连接。★ 旧的 HID 注册随重枚举一起失效，
-        //   所以这里必须清零（真机上要重新 REGISTER_HID + 重发描述符）。
-        hidInjector = HidInjector(connection, logger)
-        hidDeviceId = 0
-
         // 建链成功 -> 退避归零，轮询回到最快档
         consecutiveFailures.set(0)
 
@@ -447,7 +486,15 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // 配件身份未被验证过（可能还是别的宿主 App 留下的）
         fastPathUnverified = aoaVersion == 0
 
+        // ⚠️ 顺序要求：`stopSession()` 里会 `hidTouch.onLinkLost()`（作废旧连接），
+        //    所以它必须排在下面"绑定新连接"**之前** —— 反过来的话刚绑上就被清掉了，
+        //    表现为触摸屏永远注册不上（踩过）。
         stopSession()
+
+        // 触摸注入绑定到**本次连接**。★ 旧的 HID 注册随重枚举一起失效（id 只在连接内有效），
+        //   这里清零 id，等拿到视频尺寸（= 手机屏幕尺寸 + 视频方向都已知）时重新注册。
+        touchActive = false
+        hidTouch?.onLinkReady(connection)
 
         val channel = BulkByteChannel(connection, pair, logger)
         // ★ 先把上一次会话残留在 FIFO 里的字节丢掉，再开新会话。
@@ -508,6 +555,11 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     override fun onVideoSize(width: Int, height: Int) {
         runOnUiThread { surfaceView.setVideoSize(width, height) }
+        // ★ 视频尺寸是**触摸坐标空间**的权威线索：手机屏幕的物理尺寸只在 CNXN 报一次，
+        //   旋转后不会重报，只能靠视频方向推出它当前的长宽（见 TouchMapper）。
+        //   空间变了控制器会自动重新注册 HID（描述符里的 Logical Max 就是空间尺寸）。
+        val s = session ?: return
+        hidTouch?.updateGeometry(s.peerWidth, s.peerHeight, width, height)
     }
 
     override fun onFirstFrame() {
@@ -581,6 +633,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         if (surfaceReady) surfaceView.holder.surface else null
 
     private fun stopSession() {
+        // 链路没了：旧 HID 注册随之失效。逻辑触点状态交给控制器保留 ——
+        // 重连后它会把"手指还按着"补发回去，避免手机上手指"卡住"。
+        touchActive = false
+        hidTouch?.onLinkLost()
         session?.close()
         session = null
         replayChannel?.close()
@@ -596,6 +652,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         router?.close()
         router = null
         stopSession()
+        hidTouch?.close()
+        hidTouch = null
         super.onDestroy()
     }
 
@@ -621,7 +679,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         /** adb 调试入口用的 extra：`--ez scan true`。 */
         const val EXTRA_SCAN = "scan"
 
-        /** adb 调试入口用的 extra：`--ez hid_probe true`（注册 HID 触摸屏探针）。 */
+        /** adb 调试入口用的 extra：`--ez hid_probe true`（强制重新注册触摸屏）。 */
         const val EXTRA_HID_PROBE = "hid_probe"
 
         /** adb 调试入口用的 extra：`--ez hid_tap true [--ei tap_x N --ei tap_y M --ei hold_ms ms]`。 */
@@ -630,16 +688,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         const val EXTRA_TAP_X = "tap_x"
         const val EXTRA_TAP_Y = "tap_y"
 
-        /** 点按的按住时长（毫秒）。探针留证时拉长，普通点按用默认值。 */
+        /** 点按的按住时长（毫秒）。留证时拉长，普通点按用默认值。 */
         const val EXTRA_HOLD_MS = "hold_ms"
 
-        /** 探针用的 HID 设备 id（AOA 允许一个配件注册多个 HID 设备，我们先只用 1）。 */
-        const val HID_DEVICE_ID = 1
-
-        /** 点按时按住的时长：留够时间让手机侧产生明确的按下/抬起两条事件。 */
-        const val HID_TAP_HOLD_MS = 80L
-
-        /** 按住时长上限，防止 `--ei hold_ms` 传个离谱的值把线程占住。 */
-        const val HID_TAP_MAX_HOLD_MS = 10_000
+        /** 排障点按的默认按住时长：够手机侧产生明确的按下/抬起两条事件。 */
+        const val DEFAULT_TAP_HOLD_MS = 80
     }
 }
