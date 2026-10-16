@@ -25,6 +25,8 @@ import com.uav.host.usb.BulkByteChannel
 import com.uav.host.usb.BulkPair
 import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.AspectRatioSurfaceView
+import com.uav.protocol.BufferedByteChannel
+import com.uav.protocol.ByteChannel
 import com.uav.protocol.Protocol
 import com.uav.protocol.Scale
 import com.uav.protocol.TouchPoint
@@ -719,11 +721,16 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         //   （触点状态**不清** —— 重连后要按它补发"还按着的那些手指"。）
         hidTouch?.onLinkReady(connection)
 
-        val channel = BulkByteChannel(connection, pair, logger)
+        val raw = BulkByteChannel(connection, pair, logger)
         // ★ 先把上一次会话残留在 FIFO 里的字节丢掉，再开新会话。
         //   否则第一个 payload 会被当成流头解析，静默配错解码器（实测踩到过）。
-        channel.drainStaleInput()
-        bulkChannel = channel
+        raw.drainStaleInput()
+        bulkChannel = raw
+        // ★ 10.16 内核 panic 防线：协议层无论要多少（哪怕 24B 报文头），对内核的 bulkTransfer
+        //   永远整块（readChunkSize=16KB ≥ 端点包长 512B）发起，多到货的进残留缓冲续读。
+        //   直接把协议层的小请求透传给内核，MTK 主机栈不截断 actual_length → usercopy BUG → 重启
+        //   （实测：kmalloc-128 被要求拷 391B，Comm: uav-reader）。
+        val channel: ByteChannel = BufferedByteChannel(raw, pair.readChunkSize)
         val transport = Transport(channel, logger, TAG)
 
         val screen = DisplaySize.of(this)

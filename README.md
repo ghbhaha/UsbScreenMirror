@@ -98,7 +98,7 @@
 ## 构建与验证
 
 ```bash
-# 协议层单测（唯一可纯本地验证的部分，当前 229 项）
+# 协议层单测（唯一可纯本地验证的部分，当前 237 项）
 ./gradlew :protocol:test
 
 # 两个 APK
@@ -195,7 +195,7 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
 | 项 | 状态 |
 | --- | --- |
 | 端到端投屏（MVP） | ✅ **真机验证通过**——宿主 `SurfaceView` 上出现手机画面 |
-| 协议层单测 | ✅ **229 项全绿**（含两端 `Connection` 对跑的端到端协议联调） |
+| 协议层单测 | ✅ **237 项全绿**（含两端 `Connection` 对跑的端到端协议联调） |
 | 离线回放 | ✅ 28.7 MB 真机抓流按 PTS 配速回放，`dropped=1` |
 | release 构建 | ✅ 已端到端真机验证（功能完整，仅少了调试入口） |
 | 实测机型 | 宿主 BOE **P40UCH** / Android 14；配件 HONOR **MAA-AN10** / Android 16 |
