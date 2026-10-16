@@ -114,10 +114,14 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
      * 前台轮询兜底：实测宿主设备（BOE P40UCH）在手机重枚举后**只发 DETACHED、不发 ATTACHED**，
      * 只靠 `USB_DEVICE_ATTACHED` 广播会让"插线即投"彻底失效。
      * 因此在 Activity 可见期间定时扫一遍设备列表，发现没试过的就自动握手。
+     *
+     * ⚠️ 必须同时要求 **Surface 就绪**：没有 Surface 时握手也白搭
+     *   （`handleConfigFrame` 会等不到 Surface 而失败），而且每次握手都会让手机**重新枚举**
+     *   USB —— 切后台时反复重枚举纯属浪费，还会把自动重试配额耗掉。
      */
     private val usbPoller = object : Runnable {
         override fun run() {
-            if (session == null) {
+            if (session == null && surfaceReady) {
                 runCatching { router?.pollOnce() }
                     .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
             }
@@ -150,6 +154,13 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         override fun surfaceCreated(holder: SurfaceHolder) {
             surfaceReady = true
             logger.i(TAG, "surface created: ${holder.surface}")
+            // 优先「原地重建解码器」：链路不动，只把解码器挂到新 Surface 上。
+            session?.resumeRendering()
+            // 会话已经没了（链路错误 / 首次启动）时，才重新建链。
+            if (session == null) {
+                logger.i(TAG, "无活动会话，立即尝试建立链接")
+                router?.scanAndAttach()
+            }
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -159,6 +170,20 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             surfaceReady = false
             logger.i(TAG, "surface destroyed")
+            // ★ 只停渲染，**不动链路**。这里踩过一个整进程崩溃和一个重连死锁：
+            //
+            //   1) 崩溃：`surfaceDestroyed` 先于 `onDestroy`，旧代码只在 `onDestroy`
+            //      才停会话 → 这段窗口里解码线程仍在往**刚失效的 Surface** 上渲 →
+            //      `CodecException: rendering to non-initialized(obsolete) surface`
+            //      → `uav-decode` 线程 FATAL → App 崩。
+            //   2) 死锁：如果索性把整个会话停掉，链路一断，手机端会释放配件 fd；
+            //      超过它 12s 的空闲看门狗后就不再重开，而手机**本来就在配件模式**时
+            //      `START_ACCESSORY` 不会重新枚举、系统也不会重新派发 attach
+            //      → 没人再打开那个 fd → 宿主无限「等待手机 CNXN 超时」。
+            //
+            //   所以正确做法是：**只释放解码器、停止渲染，链路原样保持**。
+            //   解码器另有一层兜底（见 `VideoDecoder.drainOutput`）。
+            session?.suspendRendering()
         }
     }
 

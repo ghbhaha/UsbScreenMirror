@@ -46,10 +46,23 @@ class VideoDecoder(
     /** 是否已完成 configure。 */
     val isConfigured: Boolean get() = codec != null
 
+    /** Surface 是否已失效（失效后本实例不再渲染，需重建）。 */
+    val isSurfaceLost: Boolean get() = surfaceLost
+
     /** 当前生效的解码尺寸（= 流头尺寸）。 */
     val size: Pair<Int, Int>? get() = configuredSize
 
     private val bufferInfo = MediaCodec.BufferInfo()
+
+    /**
+     * Surface 已失效（被销毁 / 被回收）。
+     *
+     * 一旦置位就**不再投喂、不再排空** —— 解码器绑定的 Surface 是 configure 那一刻捕获的，
+     * 而 Android 侧 Surface 失效后任何 `releaseOutputBuffer(render=true)` 都会抛
+     * `CodecException: rendering to non-initialized(obsolete) surface`。
+     */
+    @Volatile
+    private var surfaceLost = false
 
     /**
      * 每解出一帧、即将交给 Surface 合成时回调 —— 端到端延迟测量用（计划 4.10）。
@@ -127,6 +140,7 @@ class VideoDecoder(
      * @return true 表示该帧已被送入解码器
      */
     fun feed(frame: Frame): Boolean {
+        if (surfaceLost) return false
         val c = codec ?: return false
 
         val inIndex = try {
@@ -162,6 +176,7 @@ class VideoDecoder(
 
     /** 排空所有已就绪的输出缓冲，**直接渲染到 Surface**。 */
     fun drainOutput() {
+        if (surfaceLost) return
         codec?.let { drainOutput(it) }
     }
 
@@ -178,7 +193,29 @@ class VideoDecoder(
             val ptsUs = bufferInfo.presentationTimeUs
             val atNanos = System.nanoTime()
             // 直渲：releaseOutputBuffer(index, true) 把这一帧交给 SurfaceFlinger 合成
-            c.releaseOutputBuffer(outIndex, true)
+            try {
+                c.releaseOutputBuffer(outIndex, true)
+            } catch (t: Throwable) {
+                // ★ 这里曾经**不加保护**，于是踩了一个整进程崩溃：
+                //
+                //   `SurfaceView` 的 Surface 失效（Activity 销毁/重建、屏幕关闭、
+                //   系统回收）后，渲染会抛
+                //   `CodecException: rendering to non-initialized(obsolete) surface`。
+                //   而这一层就是解码线程（`uav-decode`）的最内层 —— 异常没人接住，
+                //   线程直接带着 FATAL EXCEPTION 死掉，**整个 App 崩**。
+                //
+                //   而"Surface 已销毁、会话还没停"这段窗口是**真实存在**的：
+                //   `surfaceDestroyed` 回调先于 `onDestroy`，中间解码线程完全可能
+                //   正好在渲一帧。所以必须在最内层接住，把它降级成"画面停住 + 日志"。
+                surfaceLost = true
+                logger.w(
+                    TAG,
+                    "Surface 已失效，停止渲染（${t.javaClass.simpleName}: ${t.message}）" +
+                        " —— 会话层会重建解码器",
+                )
+                onError?.invoke(t)
+                return
+            }
             framesDecoded.incrementAndGet()
             onFrameDecoded?.invoke(ptsUs, atNanos)
         }
@@ -187,6 +224,7 @@ class VideoDecoder(
     fun release() {
         releaseCodec()
         configuredSize = null
+        surfaceLost = false
     }
 
     private fun releaseCodec() {

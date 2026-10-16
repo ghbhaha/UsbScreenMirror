@@ -90,6 +90,32 @@ class HostSession(
     @Volatile
     private var decoder: VideoDecoder? = null
 
+    /**
+     * 最近一次 CONFIG 的**原始 payload** 与流头尺寸。
+     *
+     * 为什么必须留一份：MediaCodec 的 output surface **在 `configure` 时固定、无法改绑**，
+     * 所以"换 Surface"只能新建解码器，而它的 csd 只能来自同一份 CONFIG。
+     * Surface 被销毁（切后台）时把解码器放掉、Surface 回来时用它重建。
+     */
+    @Volatile
+    private var lastConfig: ByteArray? = null
+
+    @Volatile
+    private var lastConfigSize: Pair<Int, Int>? = null
+
+    /**
+     * 是否处于"要渲染"状态。
+     *
+     * Surface 被销毁后置 false：链路照常消费，但**不喂解码器、不渲染**。
+     * 见 `HostActivity.surfaceCallback` 里记的那两个坑（崩溃 + 重连死锁）。
+     */
+    @Volatile
+    private var rendering = true
+
+    /** 需要在（新的）Surface 上重建解码器；由消费线程执行，保证与帧处理同序。 */
+    @Volatile
+    private var pendingRebuild = false
+
     @Volatile
     private var phoneWidth = 0
 
@@ -264,8 +290,15 @@ class HostSession(
             val frame = videoQueue.take(POLL_MS)
             if (frame == null) {
                 if (videoQueue.isClosed) break
-                decoder?.drainOutput()
+                if (rendering) decoder?.drainOutput()
                 continue
+            }
+
+            // ★ 换了 Surface 就必须重建解码器（MediaCodec 的 output surface 不能改绑）。
+            //   放在消费线程里做而不是在 `surfaceCreated` 回调里做：既保证
+            //   "重建 → 喂帧"的顺序，也避免与 handleConfigFrame 并发 configure。
+            if (pendingRebuild && rendering && rebuildDecoder()) {
+                pendingRebuild = false
             }
 
             if (frame.isConfig) {
@@ -273,6 +306,10 @@ class HostSession(
                 handleConfigFrame(frame)
                 continue
             }
+
+            // Surface 不在（切后台）：只丢帧，**不动链路** —— 保持消费，手机侧就不会
+            // 因为"宿主零报文"而进空闲看门狗（那样会释放配件 fd，链路就回不来了）。
+            if (!rendering) continue
 
             val d = decoder
             if (d == null) {
@@ -295,6 +332,83 @@ class HostSession(
     }
 
     /**
+     * 解码器出错（与链路错误分开处理）。
+     *
+     * ★ 确认是 **Surface 失效**时**不结束会话**，改成"丢帧 + 申请重建"：
+     *   会话一旦结束，手机端会释放配件 fd，而手机此刻**本来就在配件模式**
+     *   （`START_ACCESSORY` 不会重新枚举、系统也不会重新派发 attach）→ 没人再打开
+     *   那个 fd → 宿主永远等不到 CNXN。切后台 40s 就能稳定复现这个死锁。
+     *   所以这里只把解码器放掉，等 `surfaceCreated` 时用缓存的 CONFIG 重建。
+     */
+    private fun onDecoderError(t: Throwable) {
+        logger.e(TAG, "decoder error: ${t.message}", t)
+        if (decoder?.isSurfaceLost == true) {
+            suspendRendering()
+        }
+    }
+
+    // ------------------------------------------------------------------ 渲染的挂起与恢复
+
+    /**
+     * Surface 被销毁（切后台 / 屏幕关闭 / Activity 销毁中）→ **停渲染，但保持链路**。
+     *
+     * 解码器绑定的是 `configure` 那一刻的 Surface，失效后既不能继续渲染也不能改绑，
+     * 所以直接放掉；[lastConfig] 留着，Surface 回来时用它重建。
+     */
+    fun suspendRendering() {
+        rendering = false
+        decoder?.let {
+            it.release()
+            logger.i(TAG, "Surface 已销毁：已释放解码器、停止渲染（链路保持）")
+        }
+        decoder = null
+    }
+
+    /** Surface 回来了 → 让消费线程用缓存的 CONFIG 在新 Surface 上重建解码器。 */
+    fun resumeRendering() {
+        if (rendering) return
+        rendering = true
+        pendingRebuild = lastConfig != null
+        logger.i(
+            TAG,
+            if (pendingRebuild) "Surface 已恢复：准备用缓存的 CONFIG 重建解码器"
+            else "Surface 已恢复（尚未收到 CONFIG，等它到达）",
+        )
+    }
+
+    /**
+     * 用缓存的 CONFIG 在当前 Surface 上新建解码器。
+     *
+     * ⚠️ 只能在消费线程调用（见 [consumerLoop]）。
+     * @return 是否真的建好了（Surface 还没回来或没有 CONFIG 时返回 false，调用方继续丢帧）
+     */
+    private fun rebuildDecoder(): Boolean {
+        val config = lastConfig ?: return false
+        val size = lastConfigSize ?: return false
+        val surface = surfaceProvider() ?: return false
+
+        decoder?.release()
+        val d = VideoDecoder(
+            surface = surface,
+            logger = logger,
+            onConfigured = { w, h -> listener.onVideoSize(w, h) },
+            onError = ::onDecoderError,
+        )
+        d.onFrameDecoded = ::onFrameDecoded
+        if (!d.configure(size.first, size.second, config)) {
+            fail("Surface 恢复后 decoder 重新 configure 失败（${size.first}x${size.second}）")
+            return false
+        }
+        decoder = d
+        logger.i(
+            TAG,
+            "解码器已在新 Surface 上重建（${size.first}x${size.second}，csd=${config.size}B）" +
+                " —— 新解码器没有历史参考帧，最多到下一个 I 帧（3s）画面才干净",
+        )
+        return true
+    }
+
+    /**
      * 回放配速**不在这里做**。
      *
      * 真机实测教训：把配速放在消费线程上完全无效 —— 读线程是全速把文件灌进深度为 4 的
@@ -308,11 +422,28 @@ class HostSession(
             logger.w(TAG, "CONFIG 帧到达但尚无流头，忽略（正常不应发生）")
             return
         }
+        // ★ 先留底：Surface 重建时只能靠它重新 configure（output surface 不能改绑）
+        lastConfig = frame.data
+        lastConfigSize = header.width to header.height
+
+        // Surface 不在（切后台）：只缓存，不算失败 —— 回来时用它重建解码器
+        if (!rendering) {
+            logger.i(TAG, "Surface 不在，先缓存 CONFIG ${frame.data.size}B，等 Surface 回来再建解码器")
+            pendingRebuild = true
+            return
+        }
+
         // ★ 等 Surface 就绪：回放是磁盘速度，CONFIG 可能比 surfaceCreated 先到。
         //   SurfaceView 的回调通常几十毫秒内就到，这里给一个短的等待窗口，
         //   超时才算真失败（避免白白报错打断一次回放）。
         val surface = awaitSurface(SURFACE_WAIT_MS)
         if (surface == null) {
+            // 等待期间被挂起（切后台）不算失败 —— 缓存的 CONFIG 已经留好了
+            if (!rendering) {
+                logger.i(TAG, "等待 Surface 期间被挂起，改为等 Surface 回来再建解码器")
+                pendingRebuild = true
+                return
+            }
             fail("Surface 在 ${SURFACE_WAIT_MS}ms 内仍未就绪，无法配置解码器")
             return
         }
@@ -322,7 +453,7 @@ class HostSession(
             surface = surface,
             logger = logger,
             onConfigured = { w, h -> listener.onVideoSize(w, h) },
-            onError = { t -> logger.e(TAG, "decoder error: ${t.message}", t) },
+            onError = ::onDecoderError,
         )
         // 端到端延迟采样点：每解出一帧就记一次（计划 4.10）
         d.onFrameDecoded = ::onFrameDecoded
