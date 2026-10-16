@@ -2,6 +2,7 @@ package com.uav.host.session
 
 import android.view.Surface
 import com.uav.host.AndroidLogger
+import com.uav.host.audio.AudioPlayer
 import com.uav.host.video.VideoDecoder
 import com.uav.protocol.AdbMessage
 import com.uav.protocol.Bytes
@@ -57,6 +58,17 @@ class HostSession(
     private val listener: Listener,
     /** 回放模式：跳过 CNXN/OPEN 握手，直接消费文件里的 WRTE。 */
     private val replay: Boolean = false,
+
+    /** 是否向手机请求音频（10.13）。关掉用于 A/B 对比排障。 */
+    private val audioEnabled: Boolean = true,
+
+    /**
+     * 音频起播延迟（A/V 粗补偿）。
+     *
+     * 音频管线比视频少一段（无合成 / 无 vsync），所以默认让音频**晚一点起播**去凑齐差值。
+     * 这是个**起播时刻**的一次性补偿，不是长期漂移校正；精确同步留待后续项。
+     */
+    private val audioDelayMs: Int = DEFAULT_AUDIO_DELAY_MS,
 ) {
 
     interface Listener {
@@ -76,6 +88,21 @@ class HostSession(
     }
 
     private val videoQueue = FrameQueue(StreamId.VIDEO, logger = logger)
+
+    /**
+     * 音频队列（10.13）。
+     *
+     * 深度比视频大：AAC 帧约 21ms 一个（约 47 个/秒），深度 8 才对应 ~170ms 的抖动吸收，
+     * 而视频一方 4 帧就已经是 ~130ms。音频帧都不是关键帧，队满时丢弃代价只是一声咔哒。
+     */
+    private val audioQueue = FrameQueue(StreamId.AUDIO, capacity = AUDIO_QUEUE_DEPTH, logger = logger)
+
+    private var audio: AudioPlayer? = null
+
+    private var audioThread: Thread? = null
+
+    /** 音频 CONFIG 只该生效一次；重复到达时说明手机端重发了（重连），需要重配。 */
+    private var audioConfigured = AtomicBoolean(false)
 
     private val peerCnxnLatch = CountDownLatch(1)
     private val openAckLatch = CountDownLatch(1)
@@ -175,10 +202,18 @@ class HostSession(
 
         val conn = Connection(transport, logger, TAG, connectionListener)
         conn.registerSink(StreamId.VIDEO, videoQueue)
+        // 音频也注册：手机没发音频时这条 sink 只是闲着，不产生任何开销
+        conn.registerSink(StreamId.AUDIO, audioQueue)
         connection = conn
         conn.start()
 
         consumerThread = Thread({ consumerLoop() }, "uav-decode").apply {
+            isDaemon = true
+            start()
+        }
+        // ★ 音频单独一条线程：它会被 AudioTrack 的阻塞写压住节拍，
+        //   与视频共用会让视频的丢帧/重建把它带停（听感上就是咔哒声）。
+        audioThread = Thread({ audioLoop() }, "uav-audio-in").apply {
             isDaemon = true
             start()
         }
@@ -216,7 +251,7 @@ class HostSession(
             // ★ max_size 由宿主计算后下发（计划 4.3）：CNXN 交换后两边尺寸都已知
             val maxSize = Scale.computeMaxSize(phoneWidth, phoneHeight, localWidth, localHeight)
             negotiatedMaxSize = maxSize
-            val options = Options.defaultOptions(maxSize)
+            val options = Options.defaultOptions(maxSize).apply { audio = audioEnabled }
 
             connection?.send(Command.OPEN, StreamId.CONTROL, 0, Options.buildPayload(options))
             listener.onStatus(
@@ -280,6 +315,63 @@ class HostSession(
             if (closed.get()) return
             listener.onClosed(reason)
             stopInternal()
+        }
+    }
+
+    // ------------------------------------------------------------------ 音频消费（10.13）
+
+    /**
+     * 音频消费循环。
+     *
+     * 与视频循环的三处刻意差异：
+     *  1. **不因 Surface 消失而停** —— 音频与显示无关，切后台时声音继续（像普通播放器）；
+     *  2. **不做关键帧等待** —— 音频帧没有依赖关系，随时可开始；
+     *  3. **不重建解码器** —— AAC 没有"尺寸随旋转变化"的问题。
+     */
+    private fun audioLoop() {
+        logger.i(TAG, "音频消费线程启动（A/V 补偿 ${audioDelayMs}ms，请求音频=$audioEnabled）")
+        while (running.get() && !Thread.currentThread().isInterrupted) {
+            val frame = audioQueue.take(POLL_MS)
+            if (frame == null) {
+                if (audioQueue.isClosed) break
+                continue
+            }
+
+            if (frame.isConfig) {
+                handleAudioConfig(frame)
+                continue
+            }
+
+            // 没启用 / 还没 configure 时静默丢弃（手机端正常情况下根本不会发）
+            audio?.feed(frame)
+        }
+    }
+
+    /**
+     * 处理音频 CONFIG 帧：配置（或重配）解码器与 `AudioTrack`。
+     *
+     * ★ CONFIG **永不吞掉**（与视频同一约定）：重连后手机端会重发流头 + CONFIG，
+     *   旧解码器已经作废，必须按新到达的 CONFIG 重建 —— 否则重连后就没声音了。
+     */
+    private fun handleAudioConfig(frame: Frame) {
+        if (!audioEnabled) {
+            if (audioConfigured.compareAndSet(false, true)) {
+                logger.i(TAG, "本次未启用音频（宿主关闭），忽略手机端发来的音频流")
+            }
+            return
+        }
+        val header = audioQueue.header ?: connection?.headerOf(StreamId.AUDIO)
+        if (header == null) {
+            logger.w(TAG, "音频 CONFIG 到达但还没有流头，忽略（正常不应发生）")
+            return
+        }
+        val player = audio ?: AudioPlayer(logger = logger).also { audio = it }
+        if (player.start(header, frame.data, audioDelayMs)) {
+            audioConfigured.set(true)
+            logger.i(TAG, "音频解码器已配置：$header，CONFIG=${frame.data.size}B")
+        } else {
+            // start() 内部已经把资源收敛掉了，这里只需记账（不要掐会话）
+            audioConfigured.set(false)
         }
     }
 
@@ -506,12 +598,17 @@ class HostSession(
     private fun stopInternal() {
         running.set(false)
         videoQueue.close()
+        audioQueue.close()
         decoder?.release()
         decoder = null
+        audio?.release()
+        audio = null
         connection?.close()
         consumerThread?.interrupt()
+        audioThread?.interrupt()
         sessionThread?.interrupt()
         consumerThread = null
+        audioThread = null
         sessionThread = null
         logger.i(TAG, "host session stopped")
     }
@@ -591,7 +688,8 @@ class HostSession(
     fun stats(): String =
         "phone=${if (phoneWidth > 0) "${phoneWidth}x$phoneHeight" else "-"} " +
             "maxSize=$negotiatedMaxSize | ${connection?.stats?.snapshot() ?: "-"} | " +
-            "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | ${latencyLine()}"
+            "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | " +
+            "audioQueue=$audioQueue | ${audio?.stats() ?: "no audio"} | ${latencyLine()}"
 
     companion object {
         const val TAG = "UAV-Host"
@@ -616,5 +714,21 @@ class HostSession(
          * 又不至于把 100ms 的重复帧算进来。
          */
         const val FRESH_GAP_US = 50_000L
+
+        /** 音频队列深度。AAC 帧约 21ms 一个，深度 8 ≈ 170ms 的抖动吸收。 */
+        const val AUDIO_QUEUE_DEPTH = 8
+
+        /**
+         * 默认 A/V 粗补偿（毫秒）。
+         *
+         * 取值依据：音频管线比视频**少一段**（不经 SurfaceFlinger 合成、无 vsync 等待），
+         * 所以音频天然领先。实测视频 fresh 口径 p95 ≈ 150ms（10.6），扣掉音频自身
+         * 管线（采集 ~21ms + 编码 + USB + 解码 + 播放缓冲）后，差值落在几十毫秒量级 ——
+         * 取 60ms 作为起点。
+         *
+         * ⚠️ **这是估算的起点，不是测出来的值**：真正的同步需要对照测量
+         * （做法见 docs/实施计划.md 10.13 末尾）。用 `--ei audio_delay_ms N` 现场调。
+         */
+        const val DEFAULT_AUDIO_DELAY_MS = 60
     }
 }

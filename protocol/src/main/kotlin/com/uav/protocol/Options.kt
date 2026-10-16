@@ -5,7 +5,7 @@ package com.uav.protocol
  *
  * 格式（计划 4.3）：
  * ```
- * newScreen<videoId>:<audioId> max_size=<宿主算出的值>&video_bit_rate=8000000&max_fps=30&audio=false
+ * newScreen<videoId>:<audioId> max_size=<宿主算出的值>&video_bit_rate=8000000&max_fps=30&audio=true&audio_bit_rate=128000
  * ```
  * - `videoId` / `audioId` 与 [StreamId] 的固定常量一致（1 / 2），只是为了让服务串语义自解释。
  * - **payload 必须以 `\0` 结尾**（易漏点），由 [buildPayload] 统一负责。
@@ -76,12 +76,18 @@ class Options {
         get() = getBoolean(KEY_AUDIO, DEFAULT_AUDIO)
         set(v) { map[KEY_AUDIO] = v.toString() }
 
+    /** 音频码率（bps）。只作用于音频流；视频码率另见 [videoBitRate]。 */
+    var audioBitRate: Int
+        get() = getInt(KEY_AUDIO_BIT_RATE, AudioSpec.DEFAULT_BIT_RATE)
+        set(v) { map[KEY_AUDIO_BIT_RATE] = v.toString() }
+
     companion object {
 
         const val KEY_MAX_SIZE = "max_size"
         const val KEY_VIDEO_BIT_RATE = "video_bit_rate"
         const val KEY_MAX_FPS = "max_fps"
         const val KEY_AUDIO = "audio"
+        const val KEY_AUDIO_BIT_RATE = "audio_bit_rate"
 
         const val SERVICE_PREFIX = "newScreen"
 
@@ -91,8 +97,17 @@ class Options {
         /** 计划 4.5：映射到 `KEY_MAX_FPS_TO_ENCODER`。 */
         const val DEFAULT_MAX_FPS = 30
 
-        /** MVP 不启用音频（计划 3.11）。 */
-        const val DEFAULT_AUDIO = false
+        /**
+         * 默认**启用**音频（10.13）。
+         *
+         * 早先 MVP 是 `false`（当时没有音频管线）。现在音频已经实现，默认开启才符合
+         * "投屏"的预期；要 A/B 对比或排障时由宿主显式置 `false` 即可
+         * （宿主端 `--ez no_audio true`）。
+         *
+         * ⚠️ 手机端拿不到内录权限时必须**降级为无音频**并如实记日志，
+         * **不能**因为这一项为 true 就把整个会话掐掉。
+         */
+        const val DEFAULT_AUDIO = true
 
         /** I 帧间隔（秒）：由 10s 收紧到 3s，与丢帧策略联动（计划 4.5）。 */
         const val I_FRAME_INTERVAL_SECONDS = 3
@@ -100,12 +115,14 @@ class Options {
         fun serviceName(videoId: Int = StreamId.VIDEO, audioId: Int = StreamId.AUDIO): String =
             "$SERVICE_PREFIX$videoId:$audioId"
 
-        /** MVP 默认参数集（`max_size` 由宿主算好后 [maxSize] 赋入）。 */
+        /** 默认参数集（`max_size` 由宿主算好后 [maxSize] 赋入）。 */
         fun defaultOptions(maxSize: Int? = null): Options = Options().apply {
             this.maxSize = maxSize
             videoBitRate = DEFAULT_VIDEO_BIT_RATE
             maxFps = DEFAULT_MAX_FPS
+            // 显式写出来（而不是靠默认值生效）：串里看得到才好在真机日志里核对
             audio = DEFAULT_AUDIO
+            audioBitRate = AudioSpec.DEFAULT_BIT_RATE
         }
 
         /**

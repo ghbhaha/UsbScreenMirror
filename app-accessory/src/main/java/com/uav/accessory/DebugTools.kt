@@ -27,4 +27,16 @@ internal object DebugTools {
      * release = `false`（只转发，不落盘）。
      */
     val DUMP_ENABLED: Boolean = BuildConfig.DEBUG
+
+    /**
+     * 是否启用**探测类**调试入口。
+     *
+     * 目前门控测试音（[com.uav.accessory.audio.TestTonePlayer]）。
+     * 与 [DUMP_ENABLED] 同源（都是 `BuildConfig.DEBUG`），但分开命名是为了表达动机不同：
+     * 抓流是**诊断链路**，测试音是**制造一个已知的输入**（用来判定内录到底录没录到声音）。
+     *
+     * ⚠️ 测试音会**真的从手机扬声器响**（内录的混音是 `LOOP_BACK | RENDER`，
+     * 回送给捕获方的同时仍正常播放），所以绝不能在 release 里留着。
+     */
+    val PROBE_ENABLED: Boolean = BuildConfig.DEBUG
 }

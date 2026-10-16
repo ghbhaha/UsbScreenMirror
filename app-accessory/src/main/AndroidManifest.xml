@@ -11,6 +11,21 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      音频内录（计划 10.13）需要两样东西，缺一不可：
+
+      1. RECORD_AUDIO —— 运行时权限，内录（AudioPlaybackCapture）硬性要求；
+      2. microphone 前台服务类型 + 对应权限 —— ★ 这一条最容易漏。
+
+         AOSP 的 ForegroundServiceTypePolicy 里，`mediaProjection` 类型的运行时前提
+         只有 CAPTURE_VIDEO_OUTPUT + OP_PROJECT_MEDIA，**不含 RECORD_AUDIO**；
+         而 RECORD_AUDIO 属于「使用时权限」，应用在后台时只有当前台服务带了
+         **覆盖该权限的类型**（即 microphone）才放行。
+         漏掉它的后果不是报错，而是**录到全 0** —— 最难查的那种失败。
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
@@ -40,11 +55,14 @@
         <!--
           ★ 顺序敏感：Android 14+ 必须先以 mediaProjection 类型进入前台，
             之后才允许 getMediaProjection()（见 CaptureService 的启动顺序注释）
+
+          microphone 类型是为音频内录准备的；运行时会按"宿主是否要音频 + 是否已授权"决定
+          实际传哪些类型（见 CaptureService.canDeclareMicrophoneType）。
         -->
         <service
             android:name=".CaptureService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection|microphone" />
     </application>
 
 </manifest>

@@ -62,6 +62,16 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
      */
     private var hidTouch: HidTouchController? = null
 
+    /**
+     * 是否向手机请求音频（10.13）。
+     *
+     * 默认开启；调试入口 `--ez no_audio true` 可关（只在 debug 包生效）。
+     */
+    private var audioEnabled = true
+
+    /** 音频起播延迟（A/V 粗补偿），可由 `--ei audio_delay_ms N` 调整。 */
+    private var audioDelayMs = HostSession.DEFAULT_AUDIO_DELAY_MS
+
     @Volatile
     private var surfaceReady = false
 
@@ -282,7 +292,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
                         intent.hasExtra(EXTRA_HID_TAP) ||
                         intent.hasExtra(EXTRA_HOLD_MS) ||
                         intent.hasExtra(EXTRA_TAP2_X) ||
-                        intent.hasExtra(EXTRA_TAP2_Y)
+                        intent.hasExtra(EXTRA_TAP2_Y) ||
+                        intent.hasExtra(EXTRA_NO_AUDIO) ||
+                        intent.hasExtra(EXTRA_AUDIO_DELAY_MS)
                     )
             ) {
                 logger.w(TAG, "release 构建：调试入口已关闭，忽略 intent extra")
@@ -345,6 +357,25 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             val hold = intent.getIntExtra(EXTRA_HOLD_MS, DEFAULT_TAP_HOLD_MS)
             debugTap(xArg, yArg, x2Arg, y2Arg, hold)
             return true
+        }
+
+        // ---- 音频开关与 A/V 粗补偿（10.13）----
+        //
+        // 这两个**不接管 intent**，只改参数，所以放在最后、返回 false 继续正常流程。
+        //
+        // am start -n com.uav.host/.HostActivity --ez scan true --ez no_audio true
+        //   关掉音频（A/B 对比"到底有没有声音"、或手机上没给录音权限时用）。
+        // am start -n com.uav.host/.HostActivity --ez scan true --ei audio_delay_ms 200
+        //   调整音频起播延迟（对齐音画；默认见 HostSession.DEFAULT_AUDIO_DELAY_MS）。
+        intent?.let {
+            if (it.hasExtra(EXTRA_NO_AUDIO)) {
+                audioEnabled = !it.getBooleanExtra(EXTRA_NO_AUDIO, false)
+                logger.i(TAG, "音频已${if (audioEnabled) "启用" else "关闭"}（调试参数）")
+            }
+            if (it.hasExtra(EXTRA_AUDIO_DELAY_MS)) {
+                audioDelayMs = it.getIntExtra(EXTRA_AUDIO_DELAY_MS, audioDelayMs).coerceIn(0, 2_000)
+                logger.i(TAG, "音频起播延迟 = ${audioDelayMs}ms（调试参数）")
+            }
         }
 
         return false
@@ -536,6 +567,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             surfaceProvider = ::currentSurface,
             logger = logger,
             listener = this,
+            audioEnabled = audioEnabled,
+            audioDelayMs = audioDelayMs,
         )
         session = s
         s.start()
@@ -721,5 +754,11 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         /** 排障点按的默认按住时长：够手机侧产生明确的按下/抬起两条事件。 */
         const val DEFAULT_TAP_HOLD_MS = 80
+
+        /** adb 调试入口用的 extra：`--ez no_audio true`（关掉音频，A/B 对比用）。 */
+        const val EXTRA_NO_AUDIO = "no_audio"
+
+        /** adb 调试入口用的 extra：`--ei audio_delay_ms N`（音频起播延迟，对齐音画用）。 */
+        const val EXTRA_AUDIO_DELAY_MS = "audio_delay_ms"
     }
 }

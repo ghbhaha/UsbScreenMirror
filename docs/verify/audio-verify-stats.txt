@@ -1,0 +1,7 @@
+10-16 18:33:34.982  3631  3631 I UAV-Host: STATS phone=1224x2700 maxSize=1920 | msgs(r/w)=20070/2 sizeChanges=2 | video=avc1 872x1920 frames=6340 config=3 bytes=149153240 | audio=aac  48000x2 frames=13720 config=1 bytes=4683254 | queue=FrameQueue(video size=0/4 dropped=0[0 nonKey/0 key]) | decoded=4564 queued=4565 inputStalls=0 cfgFailures=0 size=872x1920 | audioQueue=FrameQueue(audio size=2/8 dropped=0[0 nonKey/0 key]) | audio 48000Hz/2ch frames=13714 pcm=54856KB 最大rms=-4.6dBFS 最近rms=-22.0dBFS 输入超时=0 | delay avg=60.3 p50=57.3 p95=82.8 p99=94.8 max=107.6ms n=300 bad=0 | fresh avg=60.1 p50=57.1 p95=82.8 p99=94.8 max=107.6ms n=300 bad=0 skew=±1ms
+10-16 18:33:28.339 11441 16097 I UAV-Audio: 音频帧 #13400（347B，累计 53604KB PCM，rms=-16.1dBFS 峰值=0.0dBFS，静音帧=6748 有声帧=6653）
+10-16 18:33:30.474 11441 16097 I UAV-Audio: 音频帧 #13500（320B，累计 54004KB PCM，rms=-6.5dBFS 峰值=0.0dBFS，静音帧=6748 有声帧=6753）
+10-16 18:33:32.609 11441 16097 I UAV-Audio: 音频帧 #13600（335B，累计 54404KB PCM，rms=-11.8dBFS 峰值=0.0dBFS，静音帧=6748 有声帧=6853）
+10-16 18:33:34.738 11441 16097 I UAV-Audio: 音频帧 #13700（340B，累计 54804KB PCM，rms=-20.8dBFS 峰值=0.0dBFS，静音帧=6748 有声帧=6953）
+10-16 18:33:36.856 11441 16097 I UAV-Audio: 音频帧 #13800（342B，累计 55200KB PCM，rms=-20.9dBFS 峰值=0.0dBFS，静音帧=6748 有声帧=7052）
+10-16 18:33:39.008 11441 16097 I UAV-Audio: 音频帧 #13900（341B，累计 55604KB PCM，rms=-9.1dBFS 峰值=0.0dBFS，静音帧=6748 有声帧=7153）

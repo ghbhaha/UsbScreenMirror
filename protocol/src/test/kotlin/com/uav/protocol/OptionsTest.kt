@@ -16,7 +16,8 @@ class OptionsTest {
         assertEquals(2_400, o.maxSize)
         assertEquals(8_000_000, o.videoBitRate)
         assertEquals(30, o.maxFps)
-        assertFalse(o.audio)
+        assertTrue("10.13 起音频默认开启", o.audio)
+        assertEquals(AudioSpec.DEFAULT_BIT_RATE, o.audioBitRate)
         assertEquals(3, Options.I_FRAME_INTERVAL_SECONDS)
     }
 
@@ -40,7 +41,8 @@ class OptionsTest {
         assertTrue(text.contains("max_size=2400"))
         assertTrue(text.contains("video_bit_rate=8000000"))
         assertTrue(text.contains("max_fps=30"))
-        assertTrue(text.contains("audio=false"))
+        assertTrue(text.contains("audio=true"))
+        assertTrue(text.contains("audio_bit_rate=128000"))
     }
 
     @Test

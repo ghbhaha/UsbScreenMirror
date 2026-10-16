@@ -6,12 +6,24 @@ import java.io.EOFException
  * 12 字节流头（计划 4.4），只作为某条流的**首条 `WRTE` 的 payload** 出现，且仅一次：
  *
  * ```
- * codecId(4 ASCII) + width(4, LE) + height(4, LE)
+ * codecId(4 ASCII) + A(4, LE) + B(4, LE)
  * ```
  *
- * ★ **`width`/`height` 是唯一的尺寸权威来源** —— 即编码器实际输出尺寸。
+ * 后两个 u32 的**语义随流的种类变化**（同一个线格式，不加新的报文类型）：
+ *
+ * | 流 | A | B | 权威含义 |
+ * | --- | --- | --- | --- |
+ * | 视频（[StreamId.VIDEO]） | `width` | `height` | ★ 编码器实际输出尺寸 |
+ * | 音频（[StreamId.AUDIO]） | 采样率 | 声道数 | 解码器 / `AudioTrack` 的格式 |
+ *
+ * ★ **视频的 `width`/`height` 是唯一的尺寸权威来源**。
  * 宿主 `MediaCodec.configure` 的宽高与 `SurfaceView` 的宽高比都取此值。
- * **不来自 H.264 SPS 位流解析**，MVP 不需要任何位流语法解析（计划 4.4）。
+ * **不来自 H.264 SPS 位流解析**，本项目不需要任何位流语法解析（计划 4.4）。
+ *
+ * ★ 音频沿用同一个 12B 长度**不是偷懒**：接收端识别"尺寸变更后重发的流头"靠的是
+ * "payload 恰好 12 字节"（帧 payload 是 `12 + size`，size ≥ 1，所以 ≥ 13）。
+ * 给音频换一个不同长度的头会让这条判据失效。
+ * 音频不需要"旋转后重发"这套，但**重连后必须重发**（见 [audio]）。
  */
 data class StreamHeader(
     val codecId: String,
@@ -24,6 +36,12 @@ data class StreamHeader(
     /** 宽高比，用于 `SurfaceView.onMeasure`。 */
     val aspectRatio: Float get() = width.toFloat() / height.toFloat()
 
+    /** 音频流时：A 位即采样率。视频流上无意义。 */
+    val audioSampleRate: Int get() = width
+
+    /** 音频流时：B 位即声道数。视频流上无意义。 */
+    val audioChannels: Int get() = height
+
     fun encode(): ByteArray {
         val out = ByteArray(SIZE)
         System.arraycopy(CodecId.encode(codecId), 0, out, 0, CodecId.SIZE)
@@ -32,7 +50,13 @@ data class StreamHeader(
         return out
     }
 
-    override fun toString(): String = "StreamHeader($codecId ${width}x$height)"
+    override fun toString(): String = when (codecId) {
+        // 音频把两个字段叫 width/height 会误导排错（日志里出现 "48000x2"），单独渲染。
+        // codecId 由 `decode` / 构造路径统一为 4 字符规范形态，可直接比。
+        AudioSpec.CODEC_ID -> "StreamHeader($codecId ${width}Hz ${height}ch)"
+
+        else -> "StreamHeader($codecId ${width}x$height)"
+    }
 
     companion object {
         const val SIZE = 12
@@ -44,6 +68,63 @@ data class StreamHeader(
         const val MAX_DIM = 8192
 
         /**
+         * 构造音频流头：`sampleRate` / `channels` 落在 A / B 两个 u32 上。
+         *
+         * ⚠️ 音频流头**在每次新连接上都必须重发**（哪怕编码器是复用的）——
+         * 宿主侧的解码器是**按连接**新建的，不给流头它就一直等不到格式。
+         */
+        fun audio(
+            sampleRate: Int = AudioSpec.SAMPLE_RATE,
+            channels: Int = AudioSpec.CHANNELS,
+            codecId: String = AudioSpec.CODEC_ID,
+        ): StreamHeader {
+            require(sampleRate in AudioSpec.SAMPLE_RATE_RANGE) {
+                "音频采样率越界：$sampleRate（合法 ${AudioSpec.SAMPLE_RATE_RANGE}）"
+            }
+            require(channels in AudioSpec.CHANNELS_RANGE) {
+                "音频声道数越界：$channels（合法 ${AudioSpec.CHANNELS_RANGE}）"
+            }
+            return StreamHeader(codecId, sampleRate, channels)
+        }
+
+        /**
+         * 解析**音频**流的 12B 流头：比 [decode] 多校验采样率与声道数的范围。
+         *
+         * 这里不能复用视频的 `MIN_DIM..MAX_DIM` 校验 —— 48000 Hz 会被它判成非法。
+         * 但也**不能完全不校验**：USB FIFO 里残留的帧数据同样可能凑出 12 字节，
+         * 拿到垃圾去 configure 解码器会静默配错采样率（听感上只是"音调不对"，
+         * 极难定位），所以必须挡在门口。
+         */
+        fun decodeAudio(buf: ByteArray, off: Int = 0, len: Int = buf.size - off): StreamHeader {
+            val h = decode(buf, off, len, expectVideoDims = false)
+            // codecId 已由 [decode] 规范化，可直接与常量比对
+            if (h.codecId !in AUDIO_CODEC_IDS) {
+                throw ProtocolException(
+                    "音频流头的 codecId '${h.codecId}' 不是已知音频编码 " +
+                        "(${AUDIO_CODEC_IDS.joinToString("/")}) —— 多半是把帧数据误当流头"
+                )
+            }
+            if (h.audioSampleRate !in AudioSpec.SAMPLE_RATE_RANGE) {
+                throw ProtocolException(
+                    "音频流头采样率不合理：${h.audioSampleRate} Hz " +
+                        "(合法 ${AudioSpec.SAMPLE_RATE_RANGE}) —— 多半是把帧数据误当流头"
+                )
+            }
+            if (h.audioChannels !in AudioSpec.CHANNELS_RANGE) {
+                throw ProtocolException(
+                    "音频流头声道数不合理：${h.audioChannels} " +
+                        "(合法 ${AudioSpec.CHANNELS_RANGE}) —— 多半是把帧数据误当流头"
+                )
+            }
+            return h
+        }
+
+        /** 允许出现在音频流头上的 `codecId`（本项目实际只用 [AudioSpec.CODEC_ID]）。 */
+        val AUDIO_CODEC_IDS = listOf(
+            AudioSpec.CODEC_ID, CodecId.OPUS, CodecId.FLAC, CodecId.RAW,
+        )
+
+        /**
          * 解析 12B 流头。
          *
          * ★ 这里做**严格校验**，原因是实测踩过的坑：上一次会话在 USB FIFO 里留下的帧数据，
@@ -52,8 +133,9 @@ data class StreamHeader(
          *   严格校验让这种情况变成可识别的错误，上层据此把它当"杂散 payload"丢弃并继续等待真流头。
          *
          * @param expectVideoDims `width/height` 是否应当是"视频像素尺寸"。
-         *   只有视频流才以宽高作尺寸权威；音频流的这两个字段语义未定义（MVP 不启用音频），
-         *   因此对非视频流只校验 `codecId`，不校验数值范围。
+         *   只有视频流才以宽高作尺寸权威。音频流的这两个字段是**采样率/声道数**
+         *   （必须用 [decodeAudio] 解析，它会换成音频的范围校验）；其它流的数值语义
+         *   未定义，只校验 `codecId` 可打印。
          */
         fun decode(
             buf: ByteArray,
@@ -76,7 +158,25 @@ data class StreamHeader(
                     )
                 }
             }
-            val codecId = CodecId.decode(buf, off)
+            // 4 个字节全是空格（0x20 是可打印字符，能过上面那道可打印性检查）会解出空串，
+            // 让后面的 `CodecId.normalize` 抛 IllegalArgumentException —— 那不是
+            // ProtocolException，会**穿透调用方的 catch** 把读线程打挂。先在这里挡住。
+            val raw = CodecId.decode(buf, off)
+            if (raw.isEmpty()) {
+                throw ProtocolException(
+                    "stream header codecId 全为空格 (${Hex.toHexString(buf, off, SIZE)}) " +
+                        "—— 多半是把帧数据误当流头"
+                )
+            }
+
+            // ★ 统一成**规范形态**（右补空格到 4 字符）。
+            //
+            //   原因：`CodecId.decode` 会去掉右填充空格（"aac " -> "aac"），而构造路径
+            //   （`StreamHeader(CodecId.AAC, ...)`）带着补齐后的空格。两种形态混在一起会让
+            //   `data class` 的 `equals` **不可靠** —— "解码出来的头"与"构造的头"不相等，
+            //   而 `Connection` 正是靠 `updated != headers[streamId]` 判断"流头变了没"。
+            //   规范化之后 `codecId` 恒为 4 字符，相等性才有意义。
+            val codecId = CodecId.normalize(raw)
 
             val width = Bytes.getIntLE(buf, off + 4)
             val height = Bytes.getIntLE(buf, off + 8)

@@ -162,7 +162,8 @@ class SessionFlowTest {
         assertEquals(maxSize, parsed.maxSize)
         assertEquals(8_000_000, parsed.videoBitRate)
         assertEquals(30, parsed.maxFps)
-        assertTrue("MVP 必须下发 audio=false", !parsed.audio)
+        assertTrue("10.13 起宿主默认请求音频", parsed.audio)
+        assertEquals(AudioSpec.DEFAULT_BIT_RATE, parsed.options.audioBitRate)
 
         // 6) 流头
         val deadline = System.currentTimeMillis() + 3_000

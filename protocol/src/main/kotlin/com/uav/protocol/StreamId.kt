@@ -18,8 +18,8 @@ object StreamId {
     /** `CLSE.arg0 = 0xFFFFFFFF` 表示整条连接关闭（Int 视角即 -1）。 */
     const val CLOSE_ALL = -1
 
-    /** MVP 实际存在的流：control + video（audio 不启用）。 */
-    val MVP_STREAMS = intArrayOf(CONTROL, VIDEO)
+    /** 当前实际使用的流：control + video + audio（10.13 起音频已启用）。 */
+    val MVP_STREAMS = intArrayOf(CONTROL, VIDEO, AUDIO)
 
     fun name(id: Int): String = when (id) {
         CONTROL -> "control"

@@ -1,5 +1,6 @@
 package com.uav.accessory
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.usb.UsbAccessory
@@ -16,12 +18,16 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import android.view.Display
+import androidx.core.content.ContextCompat
+import com.uav.accessory.audio.AudioPipeline
 import com.uav.accessory.session.AccessorySession
 import com.uav.accessory.usb.FdByteChannel
 import com.uav.accessory.video.VirtualDisplayEncoder
 import com.uav.protocol.ByteChannel
+import com.uav.protocol.Flags
 import com.uav.protocol.ParsedOpen
 import com.uav.protocol.StreamHeader
+import com.uav.protocol.StreamId
 import com.uav.protocol.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
@@ -63,13 +69,34 @@ object AccessoryStatus {
  * 另外：投影 token **一次性**，`createVirtualDisplay` 只能调一次；
  * 旋转场景（P0 路线图）复用的是"resize + setSurface + 编码器重配置"三件套，不重建虚拟屏。
  */
-class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncoder.Sink {
+class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncoder.Sink, AudioPipeline.Sink {
 
     private var session: AccessorySession? = null
     private var fdChannel: FdByteChannel? = null
     private var dumpChannel: com.uav.accessory.debug.DumpByteChannel? = null
     private var encoder: VirtualDisplayEncoder? = null
     private var projection: MediaProjection? = null
+
+    /**
+     * 音频内录管线（10.13）。
+     *
+     * 与 [encoder] 一样**不随链路断开而销毁** —— 重建要重新申请 `AudioRecord`，
+     * 没必要；重连后走 [AudioPipeline.resendStartup] 即可。
+     */
+    private var audio: AudioPipeline? = null
+
+    /** 宿主是否请求了音频（来自 `OPEN` 的 `audio` 参数）。 */
+    @Volatile
+    private var audioRequested = false
+
+    /**
+     * 本次前台服务是否包含 `microphone` 类型。
+     *
+     * ★ 必须显式记账：`startForeground` 的类型与"是否真的在录音"要对得上，
+     *   否则会出现"录音被系统静默掐掉"（Android 14 的 while-in-use 规则）。
+     */
+    @Volatile
+    private var microphoneTypeActive = false
 
     /**
      * 屏幕旋转监听（P0「旋转三件套」）。
@@ -337,14 +364,22 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     // ------------------------------------------------------------------ 采集
 
     private fun startCaptureInternal(options: ParsedOpen, session: AccessorySession) {
+        audioRequested = options.audio
+
         // ★ 配件重新接入时复用既有编码器：投影令牌只允许 createVirtualDisplay 一次，
         //   重建会失败并要求用户重新授权。这里只重发流头 + 缓存的 CONFIG。
         val existing = encoder
         if (existing != null && existing.isRunning) {
             val ok = existing.resendStartup()
+            // 音频同样只重发流头 + CONFIG —— 宿主的音频解码器也是按连接新建的
+            val audioResumed = resumeAudio()
             AccessoryStatus.set(
-                if (ok) "复用既有编码器，已重发流头与 CONFIG"
-                else "复用既有编码器（无缓存 CONFIG，宿主可能无法解码）"
+                when {
+                    !ok -> "复用既有编码器（无缓存 CONFIG，宿主可能无法解码）"
+                    audioResumed == null -> "复用既有编码器，已重发流头与 CONFIG（宿主未要音频）"
+                    audioResumed -> "复用既有编码器与内录，已重发两条流的流头与 CONFIG"
+                    else -> "复用既有编码器（音频重发失败：还没有音频 CONFIG）"
+                }
             )
             return
         }
@@ -369,13 +404,108 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         }
         encoder = enc
         registerRotationWatcher()
-        AccessoryStatus.set("编码中：${screen.x}x${screen.y} -> ${scaled[0]}x${scaled[1]}")
+        startAudioIfWanted(p, options)
+        AccessoryStatus.set(
+            "编码中：${screen.x}x${screen.y} -> ${scaled[0]}x${scaled[1]} ${audioNote()}"
+        )
+    }
+
+    // ------------------------------------------------------------------ 音频内录（10.13）
+
+    /** 状态文案后缀：让手机界面上直接看得到"这次到底有没有声音"。 */
+    private fun audioNote(): String = when {
+        !audioRequested -> "（宿主未要音频）"
+        audio?.isRunning != true -> "（⚠️ 无音频）"
+        else -> "（含内录音频）"
+    }
+
+    /** 重连路径：复用既有内录。返回 null 表示宿主这次没要音频。 */
+    private fun resumeAudio(): Boolean? {
+        if (!audioRequested) return null
+        val a = audio ?: return false
+        if (!a.isRunning) return false
+        return a.resendStartup()
+    }
+
+    /**
+     * 首次启动路径：按需拉起内录。
+     *
+     * ★ **任何失败都只降级、不掐会话**：没给录音权限、ROM 阉割内录、被系统活动限制挡住
+     *   —— 这些都不该让用户连画面都看不到。
+     */
+    private fun startAudioIfWanted(p: MediaProjection, options: ParsedOpen) {
+        if (!audioRequested) {
+            AndroidLogger.i(TAG, "宿主未请求音频，本次只投屏")
+            return
+        }
+
+        val existing = audio
+        if (existing != null && existing.isRunning) {
+            existing.resendStartup()
+            return
+        }
+
+        if (!hasRecordAudioPermission()) {
+            AndroidLogger.w(
+                TAG,
+                "宿主请求了音频，但 RECORD_AUDIO 未授权 —— 本次只投屏。" +
+                    "在手机上授予『录音』权限后重新投屏即可带声音"
+            )
+            AccessoryStatus.set("无录音权限，仅投屏")
+            return
+        }
+
+        val pipe = AudioPipeline(
+            projection = p,
+            sink = this,
+            logger = AndroidLogger,
+            bitRate = options.options.audioBitRate,
+        )
+        // 先把 microphone 前台服务类型补上 —— 否则在后台录音会被系统静默掐成静音
+        ensureMicrophoneType()
+        if (pipe.start()) {
+            audio = pipe
+        } else {
+            AndroidLogger.w(TAG, "内录未能启动（原因见上），本次只投屏")
+        }
+    }
+
+    private fun hasRecordAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
+    // ------------------------------------------------------------------ 音频编码器回调
+    //
+    // 注意方法名带 `Audio` 前缀：与视频的 Sink 方法签名相同，若同名会被合并成一个实现，
+    // 结果是把音频帧发进视频流（静默错流），所以刻意区分。
+
+    override fun onAudioStreamHeader(header: StreamHeader) {
+        session?.sendStreamHeader(header, StreamId.AUDIO)
+    }
+
+    override fun onAudioConfig(payload: ByteArray) {
+        // CONFIG 帧：宿主据此 configure 音频解码器（永不吞掉）
+        session?.sendFrame(Flags.pack(0, config = true), payload, StreamId.AUDIO)
+    }
+
+    override fun onAudioFrame(ptsAndFlags: Long, data: ByteArray) {
+        session?.sendFrame(ptsAndFlags, data, StreamId.AUDIO)
+    }
+
+    override fun onAudioError(t: Throwable) {
+        // ★ 音频出问题**不掐会话**：把管线停掉即可，视频继续
+        AndroidLogger.e(TAG, "内录出错，本次将不再有声音: ${t.message}", t)
+        AccessoryStatus.set("内录出错（已停用音频）: ${t.message}")
+        runCatching { audio?.stop() }
+        audio = null
     }
 
     private fun stopCapture() {
         unregisterRotationWatcher()
         encoder?.stop()
         encoder = null
+        audio?.stop()
+        audio = null
     }
 
     // ------------------------------------------------------------------ 旋转监听（P0）
@@ -486,16 +616,54 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         val notification = buildNotification()
         if (typed && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             // 阶段二：拿到投影后必须带上 mediaProjection 类型，之后才允许 getMediaProjection()
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
-            )
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            if (canDeclareMicrophoneType()) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                microphoneTypeActive = true
+            }
+            startForeground(NOTIFICATION_ID, notification, type)
         } else {
             // 阶段一：此时还没有投影，用不带类型的 startForeground（等价于 type NONE），
             // 避免过早声明 mediaProjection 类型导致校验失败
             startForeground(NOTIFICATION_ID, notification)
         }
+    }
+
+    /**
+     * 内录能否声明 `microphone` 前台服务类型。
+     *
+     * ★ 这是本次音频改造里最"反直觉"的一条：**只用 `mediaProjection` 类型是不够的**。
+     *   查 AOSP 的 `ForegroundServiceTypePolicy` 清单可以看到：
+     *   - `mediaProjection` 类型的运行时前提只有 `CAPTURE_VIDEO_OUTPUT` + `OP_PROJECT_MEDIA`
+     *     —— **里面没有 `RECORD_AUDIO`**；
+     *   - `RECORD_AUDIO` 只出现在 `microphone` 类型的前提下。
+     *
+     *   而 `RECORD_AUDIO` 属于"使用时权限"（Android 11 起）：应用退到后台后，
+     *   只有当前台服务带了**覆盖该权限的类型**才允许使用。所以后台内录必须并上
+     *   `microphone` 类型，否则会出现最恶心的形态 —— **不报错、但录到全 0**。
+     *
+     * ⚠️ 反向风险同样要防：`microphone` 类型要求**先拿到 RECORD_AUDIO**，
+     *   没授权就传这个类型会直接抛 SecurityException，把整个前台服务（也就是投屏）打掉。
+     *   所以这里层层设限：宿主没要音频 → 不加；没授权 → 不加。
+     */
+    private fun canDeclareMicrophoneType(): Boolean {
+        if (!audioRequested) return false
+        // FOREGROUND_SERVICE_TYPE_MICROPHONE 常量 API 30 才有
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        return hasRecordAudioPermission()
+    }
+
+    /**
+     * 确保前台服务已带上 `microphone` 类型。
+     *
+     * 时序上"要不要音频"是收到宿主 `OPEN` 才知道的，而前台服务早就以
+     * `mediaProjection` 类型起来了 —— 所以这里要**再调一次 `startForeground`
+     * 把类型并上去**（官方文档明确支持"服务后续需要新权限时再调一次并追加类型"）。
+     */
+    private fun ensureMicrophoneType() {
+        if (microphoneTypeActive || !canDeclareMicrophoneType()) return
+        goForeground(typed = true)
+        AndroidLogger.i(TAG, "前台服务已追加 microphone 类型（内录在后台录音需要它）")
     }
 
     private fun buildNotification(): Notification {
@@ -681,6 +849,7 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
 
         fun stopIntent(context: Context): Intent =
             Intent(context, CaptureService::class.java).apply { action = ACTION_STOP }
+
 
         /** 当前活跃会话的只读引用（供 Activity 在授权被拒时回 CLSE）。 */
         @Volatile

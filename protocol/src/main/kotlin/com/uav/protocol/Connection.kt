@@ -222,11 +222,26 @@ class Connection(
         }
     }
 
+    /**
+     * 按流的种类解析 12B 流头。
+     *
+     * 视频流用 `width`/`height` 作尺寸权威（范围校验能挡掉绝大多数"帧数据被误当流头"）；
+     * 音频流上这两个字段是采样率/声道数，必须换成音频的范围校验
+     * —— 48000 Hz 会被视频的 `MIN_DIM..MAX_DIM` 判成非法（见 [FrameCodec] 的说明）。
+     */
+    private fun decodeStreamHeader(payload: ByteArray, streamId: Int): StreamHeader = when (streamId) {
+        StreamId.VIDEO -> StreamHeader.decode(payload, 0, payload.size, expectVideoDims = true)
+        StreamId.AUDIO -> StreamHeader.decodeAudio(payload, 0, payload.size)
+        // 其它流（未来扩展）：只校验 codecId 可打印，数值语义未知
+        else -> StreamHeader.decode(payload, 0, payload.size, expectVideoDims = false)
+    }
+
     private fun dispatchWrite(message: AdbMessage) {
         val streamId = message.arg0
         val sink = sinks[streamId]
         if (sink == null) {
-            // 未知流 id：记日志并忽略（向前兼容）。audio 在 MVP 中不存在，故不刷屏警告。
+            // 未注册接收端的流：记日志并忽略（向前兼容）。
+            // 正常不应出现 —— 视频/音频流在 start() 时都已 registerSink。
             logger.w(
                 tag,
                 "WRTE for unregistered stream ${StreamId.name(streamId)} " +
@@ -241,11 +256,7 @@ class Connection(
             //   判为非法流头。此时**不能**拿垃圾去 configure 解码器（会静默配错尺寸），
             //   而应当把它当杂散 payload 丢掉，继续等真正的流头。
             val header = try {
-                StreamHeader.decode(
-                    message.payload, 0, message.payload.size,
-                    // 只有视频流以宽高作尺寸权威；非视频流这两个字段语义未定义
-                    expectVideoDims = streamId == StreamId.VIDEO,
-                )
+                decodeStreamHeader(message.payload, streamId)
             } catch (pe: ProtocolException) {
                 val n = stats.strayPayloads.incrementAndGet()
                 if (n <= STRAY_WARN_LIMIT || n % 100 == 0L) {
@@ -272,10 +283,7 @@ class Connection(
         //   注入解码器（见 HostSession），在它前面垫字节会破坏这个前提。
         if (message.payload.size == StreamHeader.SIZE) {
             val updated = try {
-                StreamHeader.decode(
-                    message.payload, 0, message.payload.size,
-                    expectVideoDims = streamId == StreamId.VIDEO,
-                )
+                decodeStreamHeader(message.payload, streamId)
             } catch (pe: ProtocolException) {
                 logger.w(tag, "12B payload 但不是合法流头，忽略: ${pe.message}")
                 null
@@ -287,8 +295,7 @@ class Connection(
                 stats.sizeChanges.incrementAndGet()
                 logger.i(
                     tag,
-                    "stream[${StreamId.name(streamId)}] 流头更新（尺寸变更）: " +
-                        "${old?.width}x${old?.height} -> ${updated.width}x${updated.height}"
+                    "stream[${StreamId.name(streamId)}] 流头更新: $old -> $updated"
                 )
                 sink.onHeader(updated)
             }
