@@ -5,9 +5,14 @@ package com.uav.protocol
  *
  * 格式（计划 4.3）：
  * ```
- * newScreen<videoId>:<audioId> max_size=<宿主算出的值>&video_bit_rate=8000000&max_fps=30&audio=true&audio_bit_rate=128000
+ * newScreen<videoId>:<audioId> max_size=<宿主算出的值>&display_width=1920&display_height=1023&video_bit_rate=8000000&max_fps=30&audio=true&audio_bit_rate=128000
  * ```
  * - `videoId` / `audioId` 与 [StreamId] 的固定常量一致（1 / 2），只是为了让服务串语义自解释。
+ * - `display_width` / `display_height`（10.15，**1:1 像素映射**）：宿主**视频显示区**的可用尺寸。
+ *   手机端拿它算编码尺寸（`align8(min(手机长边, 显示区适配后长边))`）。
+ *   之所以不只用 `max_size`：显示区随**画面比例**变化，手机一旋转，需要的尺寸就变了 ——
+ *   把显示区给手机，它就能在旋转时**自己重算**，不必重新协商。
+ *   老宿主不给这两项时，手机端退回 `max_size`（向前兼容）。
  * - **payload 必须以 `\0` 结尾**（易漏点），由 [buildPayload] 统一负责。
  * - 未知 key **忽略而非报错**（向前兼容）。
  */
@@ -64,6 +69,25 @@ class Options {
             if (v == null) map.remove(KEY_MAX_SIZE) else map[KEY_MAX_SIZE] = v.toString()
         }
 
+    /**
+     * 宿主**视频显示区**的可用宽（px，10.15）。`null` = 宿主没给（退回 `max_size` 口径）。
+     *
+     * 注意是**可用区**（宿主根视图尺寸），不是画面实际尺寸 ——
+     * 画面按比例信箱式适配后的尺寸由 [Scale.fitInside] 算，两端共用同一套规则。
+     */
+    var displayWidth: Int?
+        get() = map[KEY_DISPLAY_WIDTH]?.toIntOrNull()?.takeIf { it > 0 }
+        set(v) {
+            if (v == null || v <= 0) map.remove(KEY_DISPLAY_WIDTH) else map[KEY_DISPLAY_WIDTH] = v.toString()
+        }
+
+    /** 宿主**视频显示区**的可用高（px，10.15）。语义同 [displayWidth]。 */
+    var displayHeight: Int?
+        get() = map[KEY_DISPLAY_HEIGHT]?.toIntOrNull()?.takeIf { it > 0 }
+        set(v) {
+            if (v == null || v <= 0) map.remove(KEY_DISPLAY_HEIGHT) else map[KEY_DISPLAY_HEIGHT] = v.toString()
+        }
+
     var videoBitRate: Int
         get() = getInt(KEY_VIDEO_BIT_RATE, DEFAULT_VIDEO_BIT_RATE)
         set(v) { map[KEY_VIDEO_BIT_RATE] = v.toString() }
@@ -84,6 +108,8 @@ class Options {
     companion object {
 
         const val KEY_MAX_SIZE = "max_size"
+        const val KEY_DISPLAY_WIDTH = "display_width"
+        const val KEY_DISPLAY_HEIGHT = "display_height"
         const val KEY_VIDEO_BIT_RATE = "video_bit_rate"
         const val KEY_MAX_FPS = "max_fps"
         const val KEY_AUDIO = "audio"
@@ -115,9 +141,20 @@ class Options {
         fun serviceName(videoId: Int = StreamId.VIDEO, audioId: Int = StreamId.AUDIO): String =
             "$SERVICE_PREFIX$videoId:$audioId"
 
-        /** 默认参数集（`max_size` 由宿主算好后 [maxSize] 赋入）。 */
-        fun defaultOptions(maxSize: Int? = null): Options = Options().apply {
+        /**
+         * 默认参数集（`max_size` 由宿主算好后 [maxSize] 赋入）。
+         *
+         * @param displayW/displayH 宿主视频显示区尺寸（1:1 像素映射，10.15）。给 0 或负值表示未知，
+         *   此时不下发这两项，手机端退回 `max_size`。
+         */
+        fun defaultOptions(
+            maxSize: Int? = null,
+            displayW: Int = 0,
+            displayH: Int = 0,
+        ): Options = Options().apply {
             this.maxSize = maxSize
+            this.displayWidth = displayW
+            this.displayHeight = displayH
             videoBitRate = DEFAULT_VIDEO_BIT_RATE
             maxFps = DEFAULT_MAX_FPS
             // 显式写出来（而不是靠默认值生效）：串里看得到才好在真机日志里核对
@@ -195,4 +232,30 @@ data class ParsedOpen(
     val videoBitRate: Int get() = options.videoBitRate
     val maxFps: Int get() = options.maxFps
     val audio: Boolean get() = options.audio
+
+    /** 宿主视频显示区可用宽（px）；`null` = 宿主没给（老宿主，退回 [maxSize]）。 */
+    val displayWidth: Int? get() = options.displayWidth
+
+    /** 宿主视频显示区可用高（px）；语义同 [displayWidth]。 */
+    val displayHeight: Int? get() = options.displayHeight
+
+    /**
+     * 手机端实际要用的**编码长边上限**（1:1 像素映射，10.15）。
+     *
+     * - 宿主给了显示区 → 按 `手机尺寸 + 显示区` 现算（[Scale.oneToOneMaxSize]）。
+     *   ★ 关键是**每次要用时都现算**：手机旋转后源尺寸变了，显示区不变，
+     *     现算出来的就是新方向下的正确值 —— 不需要重新协商。
+     * - 宿主没给 → 退回它下发的 `max_size`（老行为）。
+     *
+     * @param phoneW/phoneH **当前**手机屏幕尺寸（旋转后要传新值）
+     * @return `null` 表示两头都没有，调用方自行决定（应退回源长边）
+     */
+    fun encodeMaxSize(phoneW: Int, phoneH: Int): Int? {
+        val dw = displayWidth
+        val dh = displayHeight
+        if (dw != null && dh != null) {
+            return Scale.oneToOneMaxSize(phoneW, phoneH, dw, dh)
+        }
+        return maxSize
+    }
 }

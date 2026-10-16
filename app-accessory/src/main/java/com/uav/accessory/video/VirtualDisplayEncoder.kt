@@ -154,7 +154,11 @@ class VirtualDisplayEncoder(
         this.negotiatedOptions = options
         this.srcWidth = srcWidth
         this.srcHeight = srcHeight
-        this.maxSize = options.maxSize ?: Scale.longSide(srcWidth, srcHeight)
+        // ★ 1:1 像素映射（10.15）：优先按宿主**视频显示区**算编码尺寸，
+        //   而不是按宿主长边拍一个值 —— 后者在宿主横屏时会多编 3 倍多的像素。
+        //   用 encodeMaxSize 而不是直接用 options.maxSize，是为了旋转后能重算（见 rebuildForSizeChange）。
+        this.maxSize = options.encodeMaxSize(srcWidth, srcHeight)
+            ?: Scale.longSide(srcWidth, srcHeight)
         this.densityDpi = context.resources.displayMetrics.densityDpi
 
         val scaled = Scale.scaledSize(srcWidth, srcHeight, maxSize)
@@ -164,7 +168,8 @@ class VirtualDisplayEncoder(
         logger.i(
             TAG,
             "virtualDisplay ${srcWidth}x$srcHeight -> scaled ${outputWidth}x$outputHeight " +
-                "(max_size=$maxSize, bitrate=${options.videoBitRate}, max_fps=${options.maxFps})"
+                "(max_size=$maxSize, ${describeSizeSource(options)}, " +
+                "bitrate=${options.videoBitRate}, max_fps=${options.maxFps})"
         )
 
         val surface = buildEncoder(outputWidth, outputHeight, options)
@@ -297,7 +302,15 @@ class VirtualDisplayEncoder(
             if (stopped) return false
             val vd = virtualDisplay ?: return false
 
-            val scaled = Scale.scaledSize(newSrcW, newSrcH, maxSize)
+            // ★ 旋转后必须**重算** max_size（10.15）：1:1 的目标尺寸由"画面比例在宿主显示区里
+            //   适配后有多大"决定，横竖屏切换时它变化很大（实测 1024 -> 1920）。
+            //   沿用旋转前的值会让宿主不得不放大画面（糊），或者继续多编几倍像素（浪费）。
+            val newMaxSize = opts.encodeMaxSize(newSrcW, newSrcH)
+                ?: Scale.longSide(newSrcW, newSrcH)
+            val oldMaxSize = maxSize
+            maxSize = newMaxSize
+
+            val scaled = Scale.scaledSize(newSrcW, newSrcH, newMaxSize)
             if (scaled[0] == outputWidth && scaled[1] == outputHeight) {
                 // 源尺寸变了但缩放后编码尺寸相同（例如变化在 max_size 阈值以内）：
                 // 不必重建，但要把源尺寸记下来，否则会每次轮询都重新算一遍
@@ -310,6 +323,7 @@ class VirtualDisplayEncoder(
             logger.i(
                 TAG,
                 "旋转：源 ${srcWidth}x$srcHeight -> ${newSrcW}x$newSrcH，" +
+                    "max_size $oldMaxSize -> $newMaxSize（${describeSizeSource(opts)}），" +
                     "编码 ${outputWidth}x$outputHeight -> ${scaled[0]}x${scaled[1]}"
             )
 
@@ -543,6 +557,18 @@ class VirtualDisplayEncoder(
 
     companion object {
         const val TAG = "UAV-Video"
+
+        /**
+         * 日志用：这一版尺寸是"按宿主显示区算的 1:1"还是"按宿主长边的旧口径"。
+         *
+         * 排错时这两种情况的症状完全不同（前者画面本该锐利，后者在宿主横屏时白编几倍像素），
+         * 所以每次打尺寸都要带上是哪一种。
+         */
+        private fun describeSizeSource(options: ParsedOpen): String {
+            val w = options.displayWidth
+            val h = options.displayHeight
+            return if (w != null && h != null) "1:1(宿主显示区 ${w}x$h)" else "旧口径(宿主长边)"
+        }
 
         const val MIME_TYPE = "video/avc"
 

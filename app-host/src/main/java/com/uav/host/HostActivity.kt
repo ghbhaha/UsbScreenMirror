@@ -26,6 +26,7 @@ import com.uav.host.usb.BulkPair
 import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.AspectRatioSurfaceView
 import com.uav.protocol.Protocol
+import com.uav.protocol.Scale
 import com.uav.protocol.TouchPoint
 import com.uav.protocol.TouchMapper
 import com.uav.protocol.Transport
@@ -52,6 +53,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     /** 顶部的整块界面（状态 + 统计 + 按钮）；可以整体收起，让画面干净地占满。 */
     private lateinit var overlayView: View
+
+    /** 根容器：视频显示区的"可用区"就是它（1:1 协商与"点空白处切菜单"都用它）。 */
+    private lateinit var rootView: View
 
     /** 菜单当前是否展开。 */
     private var menuShown = true
@@ -228,6 +232,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         statusText = findViewById(R.id.status)
         statsText = findViewById(R.id.stats)
         overlayView = findViewById(R.id.overlay)
+        rootView = findViewById(R.id.root)
 
         surfaceView.holder.addCallback(surfaceCallback)
 
@@ -297,7 +302,52 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // 菜单面板自己吃掉触摸：否则点在面板的空白处会被根容器当成"点空白处"而把菜单关掉
         overlayView.setOnTouchListener { _, _ -> true }
 
-        findViewById<View>(R.id.root).setOnTouchListener { _, event -> handleBlankAreaTouch(event) }
+        rootView.setOnTouchListener { _, event -> handleBlankAreaTouch(event) }
+
+        // 1:1 像素映射（10.15）：宿主**自己**旋转/分屏时显示区会变，而本 Activity 声明了
+        // `configChanges=orientation|screenSize|screenLayout|density` ⇒ **不会重建**，
+        // 会话里的 max_size 就会过期（典型症状：画面变糊，因为手机按旧尺寸编、宿主放大显示）。
+        // 所以每次布局变化都核一下"按新显示区该编多大"，差得明显就重建会话。
+        rootView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> renegotiateForDisplayArea() }
+    }
+
+    /** 根视图当前尺寸（= 视频显示区的可用区）。未布局时返回 null。 */
+    private fun rootArea(): IntArray? {
+        if (!::rootView.isInitialized) return null
+        val w = rootView.width
+        val h = rootView.height
+        return if (w > 0 && h > 0) intArrayOf(w, h) else null
+    }
+
+    /**
+     * 显示区变了 → 该编的尺寸也变 → 重启会话让新尺寸生效。
+     *
+     * 为什么是"重启会话"而不是"发个新参数"：尺寸是在 `OPEN` 里协商的，手机端拿到新参数后会
+     * 重建编码器 —— 而重建的入口只有两条（首次 OPEN、本机旋转），没有"改尺寸"的独立消息。
+     * 重启走的是已验过的自动重连路径（约 1.5s、不重新弹录屏授权），代价可控。
+     */
+    private fun renegotiateForDisplayArea() {
+        val s = session ?: return
+        val area = rootArea() ?: return
+        val pw = s.peerWidth
+        val ph = s.peerHeight
+        if (pw <= 0 || ph <= 0) return
+
+        val want = Scale.oneToOneMaxSize(pw, ph, area[0], area[1])
+        val have = s.negotiatedMaxSize
+        if (have <= 0 || want <= 0) return
+
+        val diff = kotlin.math.abs(want - have).toDouble() / have
+        if (diff <= AREA_RENEGOTIATE_RATIO) return
+
+        logger.i(
+            TAG,
+            "宿主显示区 ${area[0]}x${area[1]} 变化 -> 1:1 目标 max_size $have -> $want（差 ${(diff * 100).toInt()}%），重建会话"
+        )
+        statusText.text = "显示区变了，按新尺寸重建会话…"
+        stopSession()
+        // 交给轮询/直接扫描接管；新会话会按当前显示区重新算尺寸
+        router?.scanAndAttach()
     }
 
     /**
@@ -686,6 +736,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             listener = this,
             audioEnabled = audioEnabled,
             audioDelayMs = audioDelayMs,
+            // ★ 1:1 像素映射：把"视频显示区的可用区"交给会话去算编码尺寸（取当前值）
+            displayArea = { rootArea() },
         )
         session = s
         s.start()
@@ -886,6 +938,14 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         /** 菜单展开/收起的动画时长。够快（不拖沓）又够慢（不是硬闪）。 */
         const val MENU_ANIM_MS = 160L
+
+        /**
+         * 宿主显示区变化多少才值得重建会话（1:1 像素映射，10.15）。
+         *
+         * 10% 的阈值是为了躲开布局抖动与对齐取整带来的 1~2px 噪声 ——
+         * 真正的横竖屏切换会让目标尺寸变化 40% 以上（1024 -> 1920）。
+         */
+        const val AREA_RENEGOTIATE_RATIO = 0.10
 
         /** adb 调试入口用的 extra：`--ez no_audio true`（关掉音频，A/B 对比用）。 */
         const val EXTRA_NO_AUDIO = "no_audio"

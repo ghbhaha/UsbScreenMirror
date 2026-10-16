@@ -69,6 +69,15 @@ class HostSession(
      * 这是个**起播时刻**的一次性补偿，不是长期漂移校正；精确同步留待后续项。
      */
     private val audioDelayMs: Int = DEFAULT_AUDIO_DELAY_MS,
+
+    /**
+     * 宿主**视频显示区**的可用尺寸 `[w, h]`（= 根视图尺寸，px）；尚未布局时返回 `null`。
+     *
+     * 1:1 像素映射（10.15）的输入：编码尺寸按"画面在这个区域里适配后有多大"来定，
+     * 而不是按宿主面板长边。做成回调是因为视图尺寸随旋转/分屏动态变化，
+     * 必须在发 `OPEN` 的那一刻取**当前值**。
+     */
+    private val displayArea: () -> IntArray? = { null },
 ) {
 
     interface Listener {
@@ -193,6 +202,10 @@ class HostSession(
     /** 会话实际协商出来的参数，供 UI 显示。 */
     @Volatile
     var negotiatedMaxSize: Int = 0
+
+    /** 本次协商用的宿主显示区（`""` = 未知，走了回退口径）。仅用于日志/STATS 核对。 */
+    @Volatile
+    var negotiatedDisplayArea: String = ""
         private set
 
     val isReplay: Boolean get() = replay
@@ -248,15 +261,37 @@ class HostSession(
                 return
             }
 
-            // ★ max_size 由宿主计算后下发（计划 4.3）：CNXN 交换后两边尺寸都已知
-            val maxSize = Scale.computeMaxSize(phoneWidth, phoneHeight, localWidth, localHeight)
+            // ★ max_size 由宿主计算后下发（计划 4.3）：CNXN 交换后两边尺寸都已知。
+            //   10.15 起按**视频显示区**算（1:1 像素映射），并把显示区一并下发 ——
+            //   这样手机端旋转时能自己重算（见 ParsedOpen.encodeMaxSize），不必重新协商。
+            val area = runCatching { displayArea() }.getOrNull()
+            val availW = area?.getOrNull(0) ?: 0
+            val availH = area?.getOrNull(1) ?: 0
+            val maxSize = Scale.oneToOneMaxSize(
+                phoneW = phoneWidth,
+                phoneH = phoneHeight,
+                availW = availW,
+                availH = availH,
+                hostPanelW = localWidth,
+                hostPanelH = localHeight,
+            )
             negotiatedMaxSize = maxSize
-            val options = Options.defaultOptions(maxSize).apply { audio = audioEnabled }
+            negotiatedDisplayArea = if (availW > 0 && availH > 0) "${availW}x$availH" else ""
+            val options = Options.defaultOptions(maxSize, availW, availH).apply { audio = audioEnabled }
 
             connection?.send(Command.OPEN, StreamId.CONTROL, 0, Options.buildPayload(options))
+            val sizeSrc = if (availW > 0 && availH > 0) {
+                "显示区 ${availW}x$availH（1:1 → max_size=$maxSize）"
+            } else {
+                "按面板长边 ${localWidth}x$localHeight 回退（显示区未知 → max_size=$maxSize）"
+            }
             listener.onStatus(
-                "OPEN 已发送：手机 ${phoneWidth}x$phoneHeight / 本机 ${localWidth}x$localHeight " +
-                    "→ max_size=$maxSize，等待 OKAY…"
+                "OPEN 已发送：手机 ${phoneWidth}x$phoneHeight / $sizeSrc，等待 OKAY…"
+            )
+            logger.i(
+                TAG,
+                "OPEN options: max_size=$maxSize display_area=${if (availW > 0) "${availW}x$availH" else "-"} " +
+                    "phone=${phoneWidth}x$phoneHeight panel=${localWidth}x$localHeight"
             )
 
             if (!openAckLatch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
@@ -687,7 +722,9 @@ class HostSession(
 
     fun stats(): String =
         "phone=${if (phoneWidth > 0) "${phoneWidth}x$phoneHeight" else "-"} " +
-            "maxSize=$negotiatedMaxSize | ${connection?.stats?.snapshot() ?: "-"} | " +
+            "maxSize=$negotiatedMaxSize" +
+            (if (negotiatedDisplayArea.isEmpty()) "" else "(显示区 $negotiatedDisplayArea)") +
+            " | ${connection?.stats?.snapshot() ?: "-"} | " +
             "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | " +
             "audioQueue=$audioQueue | ${audio?.stats() ?: "no audio"} | ${latencyLine()}"
 

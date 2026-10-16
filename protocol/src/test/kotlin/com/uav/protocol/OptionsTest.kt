@@ -120,4 +120,55 @@ class OptionsTest {
         assertEquals(0, o.size)
         assertNull(o.maxSize)
     }
+
+    // ------------------------------------------------------------------ 1:1 显示区（10.15）
+
+    @Test
+    fun `显示区随 OPEN 往返且老宿主不带这两项`() {
+        val withArea = Options.defaultOptions(1024, 1920, 1023)
+        val text = withArea.toParamString()
+        assertTrue("串里要看得见，才好真机核对：$text", text.contains("display_width=1920"))
+        assertTrue(text.contains("display_height=1023"))
+
+        val back = Options.parsePayload(Options.buildPayload(withArea))
+        assertEquals(1920, back.displayWidth)
+        assertEquals(1023, back.displayHeight)
+        assertEquals(1024, back.maxSize)
+
+        // 老宿主（不给显示区）—— 解析回来必须是 null，而不是 0
+        val old = Options.parsePayload(Options.buildPayload(Options.defaultOptions(1920)))
+        assertEquals(null, old.displayWidth)
+        assertEquals(null, old.displayHeight)
+        assertFalse(old.options.toParamString().contains("display_"))
+    }
+
+    @Test
+    fun `非法显示区被当作未提供`() {
+        val o = Options.defaultOptions(1024, 0, -5)
+        assertEquals(null, o.displayWidth)
+        assertEquals(null, o.displayHeight)
+        assertFalse(o.toParamString().contains("display_"))
+
+        // 解析侧同理：0/负数/非数字一律当没给
+        val parsed = Options.parsePayload(
+            "newScreen1:2 max_size=1024&display_width=0&display_height=abc".toByteArray() + byteArrayOf(0)
+        )
+        assertEquals(null, parsed.displayWidth)
+        assertEquals(null, parsed.displayHeight)
+    }
+
+    @Test
+    fun `编码尺寸优先用显示区算 1比1，缺省退回 max_size`() {
+        val withArea = Options.parsePayload(
+            Options.buildPayload(Options.defaultOptions(1920, 1920, 1023))
+        )
+        // 显示区 1920x1023 + 手机 1224x2700 -> 1024（不是 max_size 的 1920）
+        assertEquals(1024, withArea.encodeMaxSize(1224, 2700))
+        // 同一显示区，手机旋转成横屏 -> 现算出更大的值
+        assertEquals(1920, withArea.encodeMaxSize(2700, 1224))
+
+        val old = Options.parsePayload(Options.buildPayload(Options.defaultOptions(1920)))
+        assertEquals(1920, old.encodeMaxSize(1224, 2700))
+        assertEquals(null, Options.parsePayload(Options.buildPayload(Options())).encodeMaxSize(1224, 2700))
+    }
 }
