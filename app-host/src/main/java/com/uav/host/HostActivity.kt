@@ -25,6 +25,7 @@ import com.uav.host.usb.BulkPair
 import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.AspectRatioSurfaceView
 import com.uav.protocol.Protocol
+import com.uav.protocol.TouchPoint
 import com.uav.protocol.TouchMapper
 import com.uav.protocol.Transport
 import com.uav.protocol.e
@@ -60,13 +61,6 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
      * 「从 MotionEvent 取点 → 换算 → 交给控制器」这段接线。
      */
     private var hidTouch: HidTouchController? = null
-
-    /**
-     * 是否已经向手机发出过 `DOWN`。
-     *
-     * 没有 DOWN 的 MOVE/UP **一律不发** —— 否则手机上会出现幽灵触摸（手指根本没按下去）。
-     */
-    private var touchActive = false
 
     @Volatile
     private var surfaceReady = false
@@ -174,10 +168,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             surfaceReady = false
             logger.i(TAG, "surface destroyed")
-            // 手指若还按着，必须补一个抬起 —— 否则手机上那根手指会**一直按住**。
-            // （正常路径上 View 会先收到 ACTION_CANCEL，这里只是兜底，`up()` 自身幂等。）
-            touchActive = false
-            hidTouch?.up()
+            // 手指若还按着，必须全部补抬起 —— 否则手机上那几根手指会**一直按住**。
+            // （正常路径上 View 会先收到 ACTION_CANCEL，这里只是兜底，`cancelAll()` 幂等。）
+            hidTouch?.cancelAll()
             // ★ 只停渲染，**不动链路**。这里踩过一个整进程崩溃和一个重连死锁：
             //
             //   1) 崩溃：`surfaceDestroyed` 先于 `onDestroy`，旧代码只在 `onDestroy`
@@ -287,7 +280,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
                         intent.hasExtra(EXTRA_FORCE_HANDSHAKE) ||
                         intent.hasExtra(EXTRA_HID_PROBE) ||
                         intent.hasExtra(EXTRA_HID_TAP) ||
-                        intent.hasExtra(EXTRA_HOLD_MS)
+                        intent.hasExtra(EXTRA_HOLD_MS) ||
+                        intent.hasExtra(EXTRA_TAP2_X) ||
+                        intent.hasExtra(EXTRA_TAP2_Y)
                     )
             ) {
                 logger.w(TAG, "release 构建：调试入口已关闭，忽略 intent extra")
@@ -341,11 +336,14 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         // am start -n com.uav.host/.HostActivity --ez hid_tap true [--ei tap_x X --ei tap_y Y --ei hold_ms Ms]
         //   在**手机坐标**上发一次点按，不用真去点宿主屏幕就能验证注入链路（不传坐标用安全位置）。
+        //   再加 --ei tap2_x X --ei tap2_y Y 就是**双指同时按**（验证多点，见 10.12）。
         if (intent?.getBooleanExtra(EXTRA_HID_TAP, false) == true) {
             val xArg = intent.getIntExtra(EXTRA_TAP_X, Int.MIN_VALUE)
             val yArg = intent.getIntExtra(EXTRA_TAP_Y, Int.MIN_VALUE)
+            val x2Arg = intent.getIntExtra(EXTRA_TAP2_X, Int.MIN_VALUE)
+            val y2Arg = intent.getIntExtra(EXTRA_TAP2_Y, Int.MIN_VALUE)
             val hold = intent.getIntExtra(EXTRA_HOLD_MS, DEFAULT_TAP_HOLD_MS)
-            debugTap(xArg, yArg, hold)
+            debugTap(xArg, yArg, x2Arg, y2Arg, hold)
             return true
         }
 
@@ -355,15 +353,14 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     // ------------------------------------------------------------------ 触摸注入（宿主 → 手机）
 
     /**
-     * 宿主屏幕上的触摸 → 手机。
+     * 宿主屏幕上的触摸 → 手机（**支持多点**）。
      *
      * 规则：
-     *  - 只有落在**视频显示区**内的触摸才转发（信箱边忽略，见 [TouchMapper]）；
-     *  - 维护"已经发出 DOWN"的状态：没有 DOWN 的 MOVE/UP 一律不发，否则手机上会出现
-     *    幽灵触摸（明明没按下去却响应了）；
-     *  - 手指拖出显示区 → 立刻等价于抬起，避免手机上的手指"卡"在边缘。
-     *
-     * 多点触摸暂不支持（只跟 pointer 0），见路线图 P2。
+     *  - 只有落在**视频显示区**内的触点才转发（信箱边忽略，见 [TouchMapper]）；
+     *  - 按 `pointerId` 逐个跟踪，抬起要显式发（否则手机上那根手指会"一直按住"）；
+     *  - 某个触点被拖出显示区 → 视同抬起，避免手机上的手指"卡"在边缘；
+     *  - 槽位分配（pointerId → 槽位号）交给 `MultiTouchTracker`，它满了会**拒绝**新手指
+     *    而不是挤掉已有的。
      */
     private fun handleSurfaceTouch(event: MotionEvent): Boolean {
         val s = session ?: return false
@@ -373,9 +370,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         val screenH = s.peerHeight
         if (viewW <= 0 || viewH <= 0 || screenW <= 0 || screenH <= 0) return false
 
-        val point = TouchMapper.mapTouch(
-            viewX = event.getX(0).toInt(),
-            viewY = event.getY(0).toInt(),
+        /** 把第 [pointerIndex] 个触点映射成手机坐标；不在显示区内返回 null。 */
+        fun mapPointer(pointerIndex: Int) = TouchMapper.mapTouch(
+            viewX = event.getX(pointerIndex).toInt(),
+            viewY = event.getY(pointerIndex).toInt(),
             viewW = viewW,
             viewH = viewH,
             videoW = surfaceView.videoWidth,
@@ -384,55 +382,67 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             screenH = screenH,
         )
 
-        return when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                if (point == null) {
-                    // 落在信箱边/显示区外：不转发。日志有助于判断"为什么点了没反应"
-                    if (DebugTools.ENABLED) {
-                        logger.i(
-                            TAG,
-                            "触摸忽略：视图内 (${event.getX(0).toInt()},${event.getY(0).toInt()}) " +
-                                "不在显示区内（view=${viewW}x$viewH video=" +
-                                "${surfaceView.videoWidth}x${surfaceView.videoHeight}）",
-                        )
-                    }
-                    touchActive = false
-                    false
+        /** 只在 debug 包打，用于判断"点了没反应"是落在信箱边还是映射错了。 */
+        fun logDown(pointerIndex: Int, phone: TouchPoint?) {
+            if (!DebugTools.ENABLED) return
+            val inView = "(${event.getX(pointerIndex).toInt()},${event.getY(pointerIndex).toInt()})"
+            val geom = "/ view=${viewW}x$viewH video=" +
+                "${surfaceView.videoWidth}x${surfaceView.videoHeight} 手机屏=${screenW}x$screenH"
+            // 带上 pointer 信息：多点时要能一眼看出"事件流里到底有几个 pointer、id 各是多少"
+            val who = "pointer=${event.getPointerId(pointerIndex)} (共 ${event.pointerCount})"
+            logger.i(
+                TAG,
+                if (phone == null) {
+                    "触摸忽略：视图内 $inView $who 不在显示区内（$geom）"
                 } else {
-                    if (DebugTools.ENABLED) {
-                        logger.i(
-                            TAG,
-                            "触摸转发：视图内 (${event.getX(0).toInt()},${event.getY(0).toInt()})" +
-                                " / view=${viewW}x$viewH video=" +
-                                "${surfaceView.videoWidth}x${surfaceView.videoHeight}" +
-                                " 手机屏=${screenW}x$screenH → 手机 (${point.x},${point.y})",
-                        )
-                    }
-                    touchActive = true
-                    hidTouch?.down(point.x, point.y)
-                    true
-                }
-            }
+                    "触摸转发：视图内 $inView $who $geom → 手机 (${phone.x},${phone.y})"
+                },
+            )
+        }
 
-            MotionEvent.ACTION_MOVE -> {
-                if (!touchActive) return false
-                if (point == null) {
-                    // 拖到信箱边/显示区外：等价于抬指，否则手机上会一直按着
-                    touchActive = false
-                    hidTouch?.up()
-                } else {
-                    hidTouch?.move(point.x, point.y)
+        return when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val idx = event.actionIndex
+                val phone = mapPointer(idx)
+                logDown(idx, phone)
+                if (phone != null) {
+                    hidTouch?.down(event.getPointerId(idx), phone.x, phone.y)
                 }
                 true
             }
 
-            MotionEvent.ACTION_UP,
-            MotionEvent.ACTION_CANCEL,
-            MotionEvent.ACTION_POINTER_UP,
-            -> {
-                if (!touchActive) return false
-                touchActive = false
-                hidTouch?.up()
+            MotionEvent.ACTION_MOVE -> {
+                for (i in 0 until event.pointerCount) {
+                    val pid = event.getPointerId(i)
+                    val phone = mapPointer(i)
+                    if (phone == null) {
+                        // 拖到信箱边/显示区外：等价于抬指，否则手机上会一直按着
+                        hidTouch?.up(pid)
+                    } else {
+                        hidTouch?.move(pid, phone.x, phone.y)
+                    }
+                }
+                true
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                hidTouch?.up(event.getPointerId(event.actionIndex))
+                true
+            }
+
+            MotionEvent.ACTION_UP -> {
+                // 抬起前先按最终坐标更新一次，避免"最后一跳"
+                for (i in 0 until event.pointerCount) {
+                    mapPointer(i)?.let { hidTouch?.move(event.getPointerId(i), it.x, it.y) }
+                }
+                for (i in 0 until event.pointerCount) {
+                    hidTouch?.up(event.getPointerId(i))
+                }
+                true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                hidTouch?.cancelAll()
                 true
             }
 
@@ -441,12 +451,12 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     /**
-     * 在**手机坐标**上发一次点按（排障用）。
+     * 在**手机坐标**上发点按（排障用）。给了第二组坐标就是**双指同时按**。
      *
      * 不传坐标时落在一个**安全位置**（屏幕上方 6% 处的正中，通常是状态栏下方的空白区），
      * 避免误触手机上的按钮（手机上就有"停止投屏"这种一按就断链的按钮）。
      */
-    private fun debugTap(xArg: Int, yArg: Int, holdMs: Int) {
+    private fun debugTap(xArg: Int, yArg: Int, x2Arg: Int, y2Arg: Int, holdMs: Int) {
         val w = session?.peerWidth ?: 0
         val h = session?.peerHeight ?: 0
         if (w <= 0 || h <= 0) {
@@ -456,10 +466,25 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         val size = TouchMapper.logicalPhoneSize(
             w, h, surfaceView.videoWidth, surfaceView.videoHeight,
         ) ?: return
+
         val x = if (xArg == Int.MIN_VALUE) size.width / 2 else xArg
         val y = if (yArg == Int.MIN_VALUE) (size.height * 0.06f).toInt() else yArg
-        logger.i(TAG, "HID 点按指令：手机坐标 ($x,$y) 按住 ${holdMs}ms（逻辑空间 ${size.width}x${size.height}）")
-        hidTouch?.debugTap(x, y, holdMs)
+
+        // 第二根手指：默认在屏幕上方居右（与第一根拉开的两个独立坐标）
+        val twoFingers = x2Arg != Int.MIN_VALUE
+        val x2 = if (!twoFingers) 0 else if (x2Arg == Int.MIN_VALUE) (size.width * 0.75f).toInt() else x2Arg
+        val y2 = if (y2Arg == Int.MIN_VALUE) (size.height * 0.12f).toInt() else y2Arg
+
+        logger.i(
+            TAG,
+            if (twoFingers) {
+                "HID 双指点按指令：手机坐标 ($x,$y) + ($x2,$y2) 按住 ${holdMs}ms" +
+                    "（逻辑空间 ${size.width}x${size.height}）"
+            } else {
+                "HID 点按指令：手机坐标 ($x,$y) 按住 ${holdMs}ms（逻辑空间 ${size.width}x${size.height}）"
+            },
+        )
+        hidTouch?.debugTap(x, y, holdMs, if (twoFingers) x2 else null, if (twoFingers) y2 else null)
     }
 
     // ------------------------------------------------------------------ router 回调
@@ -493,7 +518,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         // 触摸注入绑定到**本次连接**。★ 旧的 HID 注册随重枚举一起失效（id 只在连接内有效），
         //   这里清零 id，等拿到视频尺寸（= 手机屏幕尺寸 + 视频方向都已知）时重新注册。
-        touchActive = false
+        //   （触点状态**不清** —— 重连后要按它补发"还按着的那些手指"。）
         hidTouch?.onLinkReady(connection)
 
         val channel = BulkByteChannel(connection, pair, logger)
@@ -633,9 +658,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         if (surfaceReady) surfaceView.holder.surface else null
 
     private fun stopSession() {
-        // 链路没了：旧 HID 注册随之失效。逻辑触点状态交给控制器保留 ——
+        // 链路没了：旧 HID 注册随之失效。触点状态**保留**在控制器里 ——
         // 重连后它会把"手指还按着"补发回去，避免手机上手指"卡住"。
-        touchActive = false
         hidTouch?.onLinkLost()
         session?.close()
         session = null
@@ -687,6 +711,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         const val EXTRA_TAP_X = "tap_x"
         const val EXTRA_TAP_Y = "tap_y"
+
+        /** 第二根手指（给了就是双指同时按，用于验证多点）。 */
+        const val EXTRA_TAP2_X = "tap2_x"
+        const val EXTRA_TAP2_Y = "tap2_y"
 
         /** 点按的按住时长（毫秒）。留证时拉长，普通点按用默认值。 */
         const val EXTRA_HOLD_MS = "hold_ms"

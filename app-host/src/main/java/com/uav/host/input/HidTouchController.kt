@@ -5,7 +5,9 @@ import com.uav.host.AndroidLogger
 import com.uav.host.usb.HidInjector
 import com.uav.protocol.HidTouchPanel
 import com.uav.protocol.Logger
+import com.uav.protocol.MultiTouchTracker
 import com.uav.protocol.TouchMapper
+import com.uav.protocol.TouchSlot
 import com.uav.protocol.d
 import com.uav.protocol.e
 import com.uav.protocol.i
@@ -14,37 +16,49 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 宿主屏幕触摸 → 手机（AOA **HID 触摸屏**注入）。
+ * 宿主屏幕触摸 → 手机（AOA **HID 触摸屏**注入，支持**多点**）。
  *
  * ### 分工
  *
- * - 坐标换算（视图 → 手机像素）是纯逻辑，在 `:protocol` 的 [TouchMapper] 里，有单测；
+ * - 「触点 → 槽位」的分配是纯逻辑，在 `:protocol` 的 [MultiTouchTracker]（有单测）；
+ * - 坐标换算同样是纯逻辑，在 `:protocol` 的 [TouchMapper]（有单测）；
  * - 本类只管**状态与串行发送**：注册时机、坐标空间变化（旋转）时的重注册、
  *   以及"断链时手指还按着"的重发。
  *
- * ### 三条必须守住的规则（都是真机上踩出来的）
+ * ### 四条必须守住的规则（都是真机上踩出来的）
  *
  * 1. **所有 USB 操作在 worker 线程**（本类自带单线程执行器）。
- *    用单线程而不是线程池，是因为 HID 报告**必须保序**：down → move… → up 顺序错了，
- *    手机上就会出现幽灵点击或手指"卡住"。
- * 2. ★ **HID 的 id 只在本次连接内有效**：重枚举后旧 id 作废，必须重新
- *    `REGISTER_HID` + 重发描述符，并**重发当前触摸状态**（否则断线瞬间按着的手指会"卡住"）。
- *    见 `docs/实施计划.md` 10.8 / 10.9。
- * 3. ★ **坐标空间随旋转变**：手机屏幕物理尺寸只在 `CNXN` 报一次，旋转后要靠**视频方向**
- *    推（[TouchMapper.logicalPhoneSize]）。空间变了必须**重新注册**（描述符里的
- *    Logical Max 就是空间尺寸，改不了）。
+ *    用单线程而不是线程池，是因为 HID 报告**必须保序** —— 顺序错了手机上就会出现
+ *    幽灵点击或手指"卡住"。
+ * 2. ★ **HID 的 id 只在本次连接内有效**：重枚举后旧 id 作废，
+ *    必须重新 `REGISTER_HID` + 重发描述符，并**重发当前触摸状态**。
+ *    见 `docs/实施计划.md` 10.8 / 10.11。
+ * 3. ★ **注册前要扫掉残留**：HID 注册挂在手机的配件功能上，只有**真重枚举**才拆得掉；
+ *    而"已是配件"的快路径**不重枚举** → 每次重连都会在手机上多留一个幽灵触摸屏。
+ * 4. ★ **坐标空间随旋转变**：手机屏幕物理尺寸只在 `CNXN` 报一次，旋转后要靠**视频方向**
+ *    推（[TouchMapper.logicalPhoneSize]）。空间变了必须**重新注册**。
  *
- * ### 什么时候注册
+ * ### 线程约定
  *
- * 不在"链路就绪"就注册 —— 那时还不知道手机屏幕尺寸（要等它 `CNXN`）。
- * 所以由调用方在**拿到视频尺寸**（解码器 configure 成功 → 即 `onVideoSize`）时调
- * [updateGeometry]，此刻两个信息都齐了。
+ * 触摸事件相关方法（[down]/[move]/[up]/[cancelAll]）**只在触摸线程（UI 线程）调用** ——
+ * [tracker] 不是线程安全的。快照取好后交给 worker 去编码/发送。
  */
 class HidTouchController(private val logger: Logger = AndroidLogger) {
 
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread(r, "uav-hid-touch").apply { isDaemon = true }
     }
+
+    /** 触点 → 槽位分配（只在触摸线程改）。 */
+    private val tracker = MultiTouchTracker(HidTouchPanel.MAX_FINGERS)
+
+    /**
+     * 最近一次的触点快照（不可变）。
+     *
+     * 重连/重注册后据此把"当前按着"补发回去，否则手机上手指会"卡住"不抬。
+     */
+    @Volatile
+    private var lastSnapshot: List<TouchSlot> = emptyList()
 
     /** 当前连接对应的注入器；断链置 null。 */
     @Volatile
@@ -61,29 +75,7 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
     @Volatile
     private var spaceHeight = 0
 
-    /** 手机屏幕物理尺寸（CNXN 报的，旋转不变）。 */
-    @Volatile
-    private var screenWidth = 0
-
-    @Volatile
-    private var screenHeight = 0
-
-    /**
-     * 当前**逻辑**触点状态。
-     *
-     * 用"逻辑"而不是"最后一帧发出去的状态"：断链期间手指可能抬起（那次 UP 没发出去），
-     * 重连时按这里的状态重发/不重发才是对的。
-     */
-    @Volatile
-    private var touching = false
-
-    @Volatile
-    private var touchX = 0
-
-    @Volatile
-    private var touchY = 0
-
-    /** 移动事件的节流时刻（只在 UI 线程读写）。 */
+    /** 移动事件的节流时刻（只在触摸线程读写）。 */
     private var lastMoveNanos = 0L
 
     /** id 递增分配：同一个 id 重复 REGISTER_HID 语义不明确，换个新的更省心。 */
@@ -106,13 +98,13 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
             registeredId = 0
             idSeq.set(0)
             sweptThisConnection = false
-            if (touching) {
-                logger.i(TAG, "链路重建：手指仍按着，注册后会重发 ($touchX,$touchY)")
+            if (lastSnapshot.any { it.down }) {
+                logger.i(TAG, "链路重建：手指仍按着，注册后会重发")
             }
         }
     }
 
-    /** 链路断开：清掉注入器与 id（**保留**逻辑触点状态，重连后据此重发）。 */
+    /** 链路断开：清掉注入器与 id（**保留**触点状态，重连后据此重发）。 */
     fun onLinkLost() {
         worker.execute {
             injector = null
@@ -136,16 +128,16 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
             return
         }
         worker.execute {
-            screenWidth = screenW
-            screenHeight = screenH
             if (spaceWidth == size.width && spaceHeight == size.height) {
                 ensureRegisteredLocked()
                 return@execute
             }
-            val spaceChanged = registeredId != 0
-            if (spaceChanged) {
+            if (registeredId != 0) {
                 // 描述符里的 Logical Max 就是空间尺寸，改不了 —— 只能注销后按新空间重新注册
-                logger.i(TAG, "坐标空间变化（${spaceWidth}x$spaceHeight → ${size.width}x${size.height}），重新注册触摸屏")
+                logger.i(
+                    TAG,
+                    "坐标空间变化（${spaceWidth}x$spaceHeight → ${size.width}x${size.height}），重新注册触摸屏",
+                )
                 injector?.unregister(registeredId)
                 registeredId = 0
             }
@@ -180,8 +172,7 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
             logger.w(TAG, "还没有触摸坐标空间（缺 CNXN / 流头），暂不注册")
             return
         }
-        val id = idSeq.incrementAndGet()
-        val descriptor = HidTouchPanel.descriptor(spaceWidth, spaceHeight)
+
         // ★ 注册前先扫掉**上一次连接残留**的 HID 设备。
         //
         //   为什么需要：HID 注册挂在手机的**配件功能**上，只有真正的 USB 重枚举才会把它拆掉。
@@ -199,6 +190,9 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
                 logger.i(TAG, "清理了 $removed 个上一次连接残留的 HID 设备（避免手机累积幽灵触摸屏）")
             }
         }
+
+        val id = idSeq.incrementAndGet()
+        val descriptor = HidTouchPanel.descriptor(spaceWidth, spaceHeight)
         if (!inj.registerAndLoad(id, descriptor)) {
             logger.e(TAG, "HID 触摸屏注册失败（手机是否在配件模式？）")
             return
@@ -206,53 +200,60 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
         registeredId = id
         logger.i(
             TAG,
-            "HID 触摸屏已注册 id=$id，逻辑空间 ${spaceWidth}x$spaceHeight（描述符 ${descriptor.size}B）",
+            "HID 触摸屏已注册 id=$id，逻辑空间 ${spaceWidth}x$spaceHeight" +
+                "，最多 ${HidTouchPanel.MAX_FINGERS} 点（描述符 ${descriptor.size}B）",
         )
         // ★ 重连/重注册后必须把"当前按着"这一状态补发回去，否则手机上手指会"卡住"不抬
-        if (touching) {
-            logger.i(TAG, "重发当前触点 ($touchX,$touchY)")
-            rawSendLocked(touchX, touchY, down = true)
+        val snap = lastSnapshot
+        if (snap.any { it.down }) {
+            logger.i(TAG, "重发当前触点（${snap.count { it.down }} 个）")
+            rawSendLocked(snap)
         }
     }
 
-    // ------------------------------------------------------------------ 触摸事件
+    // ------------------------------------------------------------------ 触摸事件（触摸线程）
 
-    /** 按下。 */
-    fun down(x: Int, y: Int) {
-        touchX = x
-        touchY = y
-        touching = true
-        worker.execute { sendLocked(x, y, down = true) }
+    /** 手指按下。 */
+    fun down(pointerId: Int, x: Int, y: Int) {
+        if (!tracker.down(pointerId, x, y)) {
+            logger.w(TAG, "触点已满（${HidTouchPanel.MAX_FINGERS}），忽略 pointerId=$pointerId")
+            return
+        }
+        publish()
     }
 
     /**
-     * 移动。
+     * 手指移动。
      *
      * 拖动会以屏幕刷新率产生事件（60~120Hz），所以先在**调用线程**做一次节流 ——
      * 否则执行器队列会被排满，触摸延迟会越拖越大。
      */
-    fun move(x: Int, y: Int) {
-        if (!touching) return
+    fun move(pointerId: Int, x: Int, y: Int) {
+        if (!tracker.move(pointerId, x, y)) return
         val now = System.nanoTime()
         if (now - lastMoveNanos < MOVE_INTERVAL_NANOS) return
         lastMoveNanos = now
-        touchX = x
-        touchY = y
-        worker.execute { sendLocked(x, y, down = true) }
+        publish()
     }
 
-    /** 抬起。 */
-    fun up() {
-        if (!touching) return
-        touching = false
-        val x = touchX
-        val y = touchY
-        worker.execute { sendLocked(x, y, down = false) }
+    /** 手指抬起。 */
+    fun up(pointerId: Int) {
+        if (!tracker.up(pointerId)) return
+        publish()
     }
 
-    /** 断链/挂起时的兜底：把逻辑状态清干净（不发任何报文）。 */
-    fun cancelTouch() {
-        touching = false
+    /** 全部抬起（手势取消 / 宿主切后台）。 */
+    fun cancelAll() {
+        if (tracker.activeCount == 0) return
+        tracker.cancelAll()
+        publish()
+    }
+
+    /** 取快照 → 存起来（供重连重发）→ 交给 worker 编码发送。 */
+    private fun publish() {
+        val snap = tracker.snapshot()
+        lastSnapshot = snap
+        worker.execute { sendLocked(snap) }
     }
 
     /**
@@ -260,8 +261,20 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
      *
      * 坐标是**手机屏幕像素**（与探针阶段一致）。用于 `--ez hid_tap true` 排障：
      * 不用真去点宿主屏幕就能验证注入链路。
+     *
+     * 给了 [x2]/[y2] 就是**双指同时按** —— 这是验证"多点报告真的被手机当成两根手指"
+     * 最直接的手段（宿主侧没法简单地凭空造出双指手势）。
      */
-    fun debugTap(x: Int, y: Int, holdMs: Int) {
+    fun debugTap(x: Int, y: Int, holdMs: Int, x2: Int? = null, y2: Int? = null) {
+        val second = if (x2 != null && y2 != null) x2 to y2 else null
+        val down = List(HidTouchPanel.MAX_FINGERS) { i ->
+            when (i) {
+                0 -> TouchSlot(i, x, y, true)
+                1 -> if (second != null) TouchSlot(i, second.first, second.second, true) else TouchSlot(i, 0, 0, false)
+                else -> TouchSlot(i, 0, 0, false)
+            }
+        }
+        val up = List(HidTouchPanel.MAX_FINGERS) { i -> TouchSlot(i, 0, 0, false) }
         worker.execute {
             if (registeredId == 0) ensureRegisteredLocked()
             if (registeredId == 0) {
@@ -269,30 +282,33 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
                 return@execute
             }
             val hold = holdMs.coerceIn(1, MAX_TAP_HOLD_MS)
-            val okDown = rawSendLocked(x, y, down = true)
+            val okDown = rawSendLocked(down)
             try {
                 Thread.sleep(hold.toLong())
             } catch (ie: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-            val okUp = rawSendLocked(x, y, down = false)
-            logger.i(TAG, "HID 点按 ($x,$y) 按住 ${hold}ms：按下=$okDown 抬起=$okUp")
+            val okUp = rawSendLocked(up)
+            val n = if (second == null) 1 else 2
+            logger.i(TAG, "HID 点按 ${n} 指 ($x,$y) 按住 ${hold}ms：按下=$okDown 抬起=$okUp")
         }
     }
 
+    // ------------------------------------------------------------------ 发送（worker 线程）
+
     /** 只在 worker 线程调用：必要时先注册，再发一条报告。 */
-    private fun sendLocked(x: Int, y: Int, down: Boolean) {
+    private fun sendLocked(snapshot: List<TouchSlot>) {
         if (registeredId == 0) ensureRegisteredLocked()
         if (registeredId == 0) return
-        rawSendLocked(x, y, down)
+        rawSendLocked(snapshot)
     }
 
     /** 只在 worker 线程调用：不做注册检查，直接发。 */
-    private fun rawSendLocked(x: Int, y: Int, down: Boolean): Boolean {
+    private fun rawSendLocked(snapshot: List<TouchSlot>): Boolean {
         val inj = injector ?: return false
         val id = registeredId
         if (id == 0) return false
-        return if (inj.sendReport(id, HidTouchPanel.report(x, y, down))) {
+        return if (inj.sendReport(id, HidTouchPanel.report(snapshot))) {
             true
         } else {
             // 发失败通常意味着链路已经没了；把 id 作废，等重新注册
@@ -303,7 +319,8 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
     }
 
     fun close() {
-        touching = false
+        tracker.cancelAll()
+        lastSnapshot = emptyList()
         injector = null
         registeredId = 0
         worker.shutdownNow()
@@ -311,7 +328,11 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
 
     /** 供状态行显示。 */
     fun describe(): String =
-        if (registeredId != 0) "触摸 ${spaceWidth}x$spaceHeight" else "触摸未注册"
+        if (registeredId != 0) {
+            "触摸 ${spaceWidth}x$spaceHeight/${HidTouchPanel.MAX_FINGERS}点"
+        } else {
+            "触摸未注册"
+        }
 
     companion object {
         const val TAG = "UAV-Host"

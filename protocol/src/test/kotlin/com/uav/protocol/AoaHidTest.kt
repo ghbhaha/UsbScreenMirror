@@ -81,14 +81,23 @@ class AoaHidTest {
 
     // ------------------------------------------------------------------ 触摸屏描述符
 
+    /** 造一份"指定槽按下/其余空闲"的快照。 */
+    private fun slots(vararg down: Pair<Int, Pair<Int, Int>>): List<TouchSlot> {
+        val map = down.toMap()
+        return (0 until HidTouchPanel.MAX_FINGERS).map { i ->
+            val p = map[i]
+            TouchSlot(i, p?.first ?: 0, p?.second ?: 0, p != null)
+        }
+    }
+
     @Test
-    fun `触摸屏描述符长度与首尾结构固定`() {
+    fun `触摸屏描述符结构固定`() {
         val d = HidTouchPanel.descriptor(1224, 2700)
-        assertEquals("描述符长度变了就要同步检查 report 的字段位宽", 76, d.size)
+        assertEquals("描述符长度变了就要同步检查 report 的字段布局", 334, d.size)
         assertEquals(HidTouchPanel.DESCRIPTOR_SIZE, d.size)
 
         // 宽高只改取值、不改长度：换一组尺寸长度必须一致
-        assertEquals(76, HidTouchPanel.descriptor(1080, 1920).size)
+        assertEquals(334, HidTouchPanel.descriptor(1080, 1920).size)
 
         // Usage Page (Digitizers) / Usage (Touch Screen) / Collection (Application)
         assertEquals(0x05.toByte(), d[0])
@@ -101,9 +110,24 @@ class AoaHidTest {
         assertEquals(0xA1.toByte(), d[4])
         assertEquals(0x01.toByte(), d[5])
 
-        // 两个 End Collection 收尾
-        assertEquals(0xC0.toByte(), d[d.size - 2])
+        // ★ 每个手指是**独立**的 Logical Collection：`09 22 A1 02` 必须出现 N 次
+        val fingerCollection = byteArrayOf(0x09, 0x22, 0xA1.toByte(), 0x02)
+        assertEquals(HidTouchPanel.MAX_FINGERS, countOf(d, fingerCollection))
+
+        // End Collection 共 N+1 个（N 个手指 + 1 个应用），最后一个字节就是它
+        assertEquals(HidTouchPanel.MAX_FINGERS + 1, d.count { it == 0xC0.toByte() })
         assertEquals(0xC0.toByte(), d[d.size - 1])
+    }
+
+    @Test
+    fun `触点数放在所有手指之后`() {
+        val d = HidTouchPanel.descriptor(1224, 2700)
+        val cc = byteArrayOf(0x09, 0x54)                       // Usage (Contact Count)
+        val idx = indexOf(d, cc)
+        assertTrue("没找到 Contact Count", idx >= 0)
+        // 它必须在最后一个手指集合之后（即紧跟的 C0 之后就是集合结尾）
+        val lastFinger = lastIndexOf(d, byteArrayOf(0x09, 0x22, 0xA1.toByte(), 0x02))
+        assertTrue("Contact Count 必须在手指集合之后（放前面实测多点会失效）", idx > lastFinger)
     }
 
     @Test
@@ -112,7 +136,7 @@ class AoaHidTest {
         val h = 2700
         val d = HidTouchPanel.descriptor(w, h)
 
-        // X 的逻辑上限紧跟 Usage(X) 之后的 0x26
+        // X 的逻辑上限紧跟 Usage(X) 之后的 0x26（每个手指集合里各有一份）
         val xIdx = indexOf(d, byteArrayOf(0x09, 0x30, 0x15, 0x00, 0x26.toByte()))
         assertTrue("没找到 Usage(X) 段", xIdx >= 0)
         assertEquals(w, u16At(d, xIdx + 5))
@@ -129,50 +153,126 @@ class AoaHidTest {
         assertThrows(IllegalArgumentException::class.java) { HidTouchPanel.descriptor(1224, 70000) }
     }
 
-    // ------------------------------------------------------------------ 触摸报告
+    // ------------------------------------------------------------------ 多点报告
+
+    /** 第 i 个手指在报告里的起始偏移：1 按下位 + 1 标识 + 2 X + 2 Y。 */
+    private fun slotOffset(i: Int) = i * 6
+
+    private fun tipByte(r: ByteArray, i: Int) = r[slotOffset(i)].toInt() and 0x01
+    private fun idByte(r: ByteArray, i: Int) = r[slotOffset(i) + 1].toInt() and 0xFF
+    private fun xs(r: ByteArray, i: Int) = u16At(r, slotOffset(i) + 2)
+    private fun ys(r: ByteArray, i: Int) = u16At(r, slotOffset(i) + 4)
+    private fun contactCount(r: ByteArray) = r[r.size - 1].toInt() and 0xFF
 
     @Test
-    fun `报告长度固定且与描述符同步`() {
-        assertEquals(7, HidTouchPanel.REPORT_SIZE)
-        assertEquals(HidTouchPanel.REPORT_SIZE, HidTouchPanel.report(0, 0, false).size)
+    fun `报告长度与槽位数一致`() {
+        // N ×(按下位+补齐 1 + 标识 1 + X 2 + Y 2) + 触点数 1
+        assertEquals(31, HidTouchPanel.REPORT_SIZE)
+        assertEquals(HidTouchPanel.REPORT_SIZE, HidTouchPanel.report(slots()).size)
     }
 
     @Test
-    fun `按下与抬起只有触点数与 TipSwitch 不同`() {
-        val down = HidTouchPanel.report(100, 200, tipDown = true)
-        val up = HidTouchPanel.report(100, 200, tipDown = false)
+    fun `单指按下`() {
+        val r = HidTouchPanel.report(slots(0 to (100 to 200)))
+        assertEquals(1, tipByte(r, 0))
+        assertEquals(0, idByte(r, 0))
+        assertEquals(100, xs(r, 0))
+        assertEquals(200, ys(r, 0))
+        // 其余槽都是 Tip=0
+        for (i in 1 until HidTouchPanel.MAX_FINGERS) assertEquals(0, tipByte(r, i))
+    }
 
-        assertEquals(1, down[0].toInt())   // Contact Count
-        assertEquals(1, down[2].toInt() and 0x01) // Tip Switch
-        assertEquals(0, up[0].toInt())
-        assertEquals(0, up[2].toInt() and 0x01)
+    @Test
+    fun `双指同时按下，两个槽各自带坐标`() {
+        val r = HidTouchPanel.report(slots(0 to (100 to 200), 1 to (300 to 400)))
+        assertEquals(1, tipByte(r, 0))
+        assertEquals(1, tipByte(r, 1))
+        assertEquals(100, xs(r, 0)); assertEquals(200, ys(r, 0))
+        assertEquals(300, xs(r, 1)); assertEquals(400, ys(r, 1))
+        assertEquals(0, tipByte(r, 2))
+    }
 
-        // 触点编号固定 0；抬起也要带坐标（稳定 Contact ID 的释放记录）
-        assertEquals(0, down[1].toInt())
-        assertEquals(0, up[1].toInt())
-        assertArrayEquals(down.copyOfRange(3, 5), up.copyOfRange(3, 5))
+    @Test
+    fun `抬起某指只清它自己的位`() {
+        val both = HidTouchPanel.report(slots(0 to (10 to 10), 2 to (20 to 20)))
+        val onlyTwo = HidTouchPanel.report(slots(2 to (20 to 20)))
+        assertEquals(1, tipByte(both, 0))
+        assertEquals(0, tipByte(onlyTwo, 0))          // 槽 0 显式发 Tip=0（不能靠"消失"）
+        assertEquals(1, tipByte(onlyTwo, 2))
+        // 槽 2 的坐标不受影响
+        assertEquals(xs(both, 2), xs(onlyTwo, 2))
+    }
+
+    @Test
+    fun `Contact Identifier 固定等于槽位下标`() {
+        val r = HidTouchPanel.report(slots(3 to (1 to 1)))
+        for (i in 0 until HidTouchPanel.MAX_FINGERS) {
+            assertEquals("槽 $i 的标识必须是 $i", i, idByte(r, i))
+        }
+    }
+
+    @Test
+    fun `触点数填的是帧内记录数而不是按下的触点数`() {
+        // ★ 这是最容易搞错的一条：多点协议按"帧内记录数"重组，未按下的槽也算一条记录
+        assertEquals(HidTouchPanel.MAX_FINGERS, contactCount(HidTouchPanel.report(slots())))
+        assertEquals(HidTouchPanel.MAX_FINGERS, contactCount(HidTouchPanel.report(slots(0 to (1 to 1)))))
+        assertEquals(
+            HidTouchPanel.MAX_FINGERS,
+            contactCount(HidTouchPanel.report(slots(0 to (1 to 1), 1 to (2 to 2)))),
+        )
     }
 
     @Test
     fun `坐标按小端 uint16 编码`() {
-        val r = HidTouchPanel.report(0x1234, 0x00FF, tipDown = true)
-        assertEquals(0x34, r[3].toInt() and 0xFF)
-        assertEquals(0x12, r[4].toInt() and 0xFF)
-        assertEquals(0xFF, r[5].toInt() and 0xFF)
-        assertEquals(0x00, r[6].toInt() and 0xFF)
+        val r = HidTouchPanel.report(slots(0 to (0x1234 to 0x00FF)))
+        assertEquals(0x34, r[2].toInt() and 0xFF)
+        assertEquals(0x12, r[3].toInt() and 0xFF)
+        assertEquals(0xFF, r[4].toInt() and 0xFF)
+        assertEquals(0x00, r[5].toInt() and 0xFF)
     }
 
     @Test
     fun `坐标超范围被夹紧而不是溢出`() {
-        val r = HidTouchPanel.report(-5, 999_999, tipDown = true)
-        assertEquals(0, u16At(r, 3))
-        assertEquals(0xFFFF, u16At(r, 5))
+        val r = HidTouchPanel.report(slots(0 to (-5 to 999_999)))
+        assertEquals(0, xs(r, 0))
+        assertEquals(0xFFFF, ys(r, 0))
+    }
+
+    @Test
+    fun `槽位数不对直接拒绝`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            HidTouchPanel.report(listOf(TouchSlot(0, 0, 0, true)))
+        }
     }
 
     // ------------------------------------------------------------------ 小工具
 
     private fun u16At(b: ByteArray, off: Int): Int =
         (b[off].toInt() and 0xFF) or ((b[off + 1].toInt() and 0xFF) shl 8)
+
+    /** needle 在 hay 里出现的次数。 */
+    private fun countOf(hay: ByteArray, needle: ByteArray): Int {
+        var n = 0
+        var from = 0
+        while (true) {
+            val i = indexOf(hay.copyOfRange(from, hay.size), needle)
+            if (i < 0) return n
+            n++
+            from += i + 1
+        }
+    }
+
+    /** needle 在 hay 里最后一次出现的位置。 */
+    private fun lastIndexOf(hay: ByteArray, needle: ByteArray): Int {
+        var last = -1
+        var from = 0
+        while (true) {
+            val i = indexOf(hay.copyOfRange(from, hay.size), needle)
+            if (i < 0) return last
+            last = from + i
+            from = last + 1
+        }
+    }
 
     private fun indexOf(hay: ByteArray, needle: ByteArray): Int {
         outer@ for (i in 0..hay.size - needle.size) {
