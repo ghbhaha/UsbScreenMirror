@@ -36,7 +36,6 @@ class ProjectionActivity : Activity() {
     private lateinit var statsText: TextView
 
     private var accessory: UsbAccessory? = null
-    private var serviceStarted = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
@@ -64,7 +63,12 @@ class ProjectionActivity : Activity() {
         AndroidLogger.i(TAG, "ProjectionActivity created, accessory=${accessory?.model}")
 
         ensureNotificationPermission()
+
+        // ★ 顺序很重要：**先**把会话跑起来（打开配件 fd、能应答宿主报文），
+        //   **再**弹录屏授权。反过来会出现"授权弹窗期间链路没人应答 CNXN"的空窗。
+        startSessionService()
         requestScreenCapture()
+
         mainHandler.post(ticker)
     }
 
@@ -76,6 +80,22 @@ class ProjectionActivity : Activity() {
             accessory = acc
             AndroidLogger.i(TAG, "new accessory: ${acc.model}/${acc.manufacturer}")
         }
+        // ★ 系统重新派发配件 intent = 配件重新接入 = 旧 fd 已失效，
+        //   必须让服务重建传输会话（forceRestart），否则会一直握着一个死 fd
+        //   表现为宿主侧"等待手机 CNXN 超时"。
+        startSessionService(forceRestart = true)
+    }
+
+    /** 阶段一：拉起采集服务，先建立链路（不需要录屏授权）。 */
+    private fun startSessionService(forceRestart: Boolean = false) {
+        if (accessory == null) {
+            AndroidLogger.w(TAG, "暂无配件，跳过会话服务启动")
+            return
+        }
+        ContextCompat.startForegroundService(
+            this,
+            CaptureService.startIntent(this, accessory, forceRestart),
+        )
     }
 
     override fun onDestroy() {
@@ -116,23 +136,18 @@ class ProjectionActivity : Activity() {
         if (resultCode != RESULT_OK || data == null) {
             AccessoryStatus.set("录屏授权被拒绝 —— 无法投屏")
             AndroidLogger.w(TAG, "MediaProjection consent denied (resultCode=$resultCode)")
+            // 如实告知宿主，别互相干等（计划 4.4）
+            val s = CaptureService.currentSession()
+            s?.failAndClose("用户拒绝了录屏授权")
             return
         }
 
-        if (serviceStarted) {
-            AndroidLogger.i(TAG, "service already started, ignoring duplicate consent")
-            return
-        }
-        serviceStarted = true
-
-        val acc = accessory
-        if (acc == null) {
-            AccessoryStatus.set("已获得录屏授权，但没有 USB 配件 —— 请插线到宿主")
-        }
-
-        val intent = CaptureService.startIntent(this, acc, resultCode, data)
-        ContextCompat.startForegroundService(this, intent)
-        AccessoryStatus.set("已启动采集服务，等待宿主 OPEN")
+        // 阶段二：把授权结果交给已经在跑的采集服务
+        ContextCompat.startForegroundService(
+            this,
+            CaptureService.projectionIntent(this, resultCode, data),
+        )
+        AccessoryStatus.set("录屏授权已交给采集服务")
     }
 
     private fun ensureNotificationPermission() {

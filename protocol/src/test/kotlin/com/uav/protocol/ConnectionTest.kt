@@ -142,6 +142,42 @@ class ConnectionTest {
     }
 
     @Test
+    fun `杂散 payload 被跳过且不影响真流头与帧的接收`() {
+        val (conn, phoneSide, recorder) = startHost()
+        val peer = Transport(phoneSide)
+
+        val videoQueue = FrameQueue(StreamId.VIDEO)
+        conn.registerSink(StreamId.VIDEO, videoQueue)
+
+        // 模拟"上一次会话残留在 FIFO 里的帧数据"抢先到达：它不是合法流头
+        val staleFrame = FrameCodec.encodeFrame(Flags.pack(37_696_994_382L, keyFrame = true), bytes(1, 2, 3, 4))
+        AdbMessage.writeTo(peer, Command.WRTE, StreamId.VIDEO, 0, staleFrame)
+        // 再来一条更离谱的短 payload
+        AdbMessage.writeTo(peer, Command.WRTE, StreamId.VIDEO, 0, byteArrayOf(9, 9))
+
+        // 之后才是真正的流头
+        val header = StreamHeader(CodecId.AVC1, 872, 1920)
+        AdbMessage.writeTo(peer, Command.WRTE, StreamId.VIDEO, 0, header.encode())
+        AdbMessage.writeTo(peer, Command.WRTE, StreamId.VIDEO, 0, FrameCodec.encodeFrame(Flags.pack(777), bytes(7)))
+
+        // 必须能拿到正确流头（而不是被垃圾污染）
+        val deadline = System.currentTimeMillis() + 3_000
+        while (videoQueue.header == null && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        assertEquals("流头必须是真流头，不能被残留字节污染", header, videoQueue.header)
+        assertEquals(872, conn.headerOf(StreamId.VIDEO)!!.width)
+
+        val frame = videoQueue.take(3_000)
+        assertNotNull(frame)
+        assertEquals(777L, frame!!.pts)
+
+        // 杂散计数应被记录下来（便于联调判断链路是否有残留）
+        assertEquals(2L, conn.stats.strayPayloads.get())
+        assertNull(recorder.error)
+
+        conn.close()
+    }
+
+    @Test
     fun `会话级报文被交给 listener`() {
         val (conn, phoneSide, recorder) = startHost()
         val peer = Transport(phoneSide)

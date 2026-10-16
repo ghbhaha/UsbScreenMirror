@@ -175,29 +175,42 @@ class AoaHandshake(
      *
      * ★ 按 **PID 0x2D00/0x2D01** 识别，**绝不能按 interface class**
      *   —— 配件接口与 adb 接口的 class/subclass/protocol 同为 255/66/1，无法区分。
+     *   （实测本机配件接口是 `class=255 sub=255 proto=0`，更说明按 class 判断不可靠。）
+     *
+     * ★ **必须要求 `deviceId != previousDeviceId`**：设备本来就已经是配件模式时
+     *   （强制重握手场景），不过滤会立刻返回**同一个旧设备**，导致拿到的还是旧连接。
+     *
+     * @param previousDeviceId 切换前那台设备的 deviceId
+     * @param allowSameDevice  若 5s 内只看到旧设备，是否允许退而求其次返回它
      */
     fun awaitAccessoryDevice(
         previousDeviceId: Int,
         timeoutMs: Long = 5000,
         intervalMs: Long = 200,
+        allowSameDevice: Boolean = false,
     ): UsbDevice? {
         val deadline = System.currentTimeMillis() + timeoutMs
         var attempts = 0
+        var staleCandidate: UsbDevice? = null
+
         while (System.currentTimeMillis() < deadline) {
             attempts++
-            val found = usbManager.deviceList.values.firstOrNull { dev ->
-                Aoa.isAccessoryPid(dev.productId)
-            }
-            if (found != null) {
+            val accessories = usbManager.deviceList.values.filter { Aoa.isAccessoryPid(it.productId) }
+
+            // 优先取"新出现的那台"
+            val fresh = accessories.firstOrNull { it.deviceId != previousDeviceId }
+            if (fresh != null) {
                 logger.i(
                     TAG,
-                    "re-enumerated as accessory after ${attempts} polls: " +
-                        "VID=0x${Integer.toHexString(found.vendorId).uppercase()} " +
-                        "PID=${Aoa.pidName(found.productId)} deviceId=${found.deviceId} " +
+                    "re-enumerated as accessory after $attempts polls: " +
+                        "VID=0x${Integer.toHexString(fresh.vendorId).uppercase()} " +
+                        "PID=${Aoa.pidName(fresh.productId)} deviceId=${fresh.deviceId} " +
                         "(prev=$previousDeviceId)"
                 )
-                return found
+                return fresh
             }
+            if (accessories.isNotEmpty()) staleCandidate = accessories.first()
+
             try {
                 Thread.sleep(intervalMs)
             } catch (ie: InterruptedException) {
@@ -205,6 +218,16 @@ class AoaHandshake(
                 return null
             }
         }
+
+        if (staleCandidate != null && allowSameDevice) {
+            logger.w(
+                TAG,
+                "5s 内没等到新的配件设备 id（旧 id=$previousDeviceId 仍在），" +
+                    "按 allowSameDevice 复用它 deviceId=${staleCandidate.deviceId}"
+            )
+            return staleCandidate
+        }
+
         logger.e(
             TAG,
             "等待重枚举超时 ${timeoutMs}ms（$attempts 次轮询）；" +

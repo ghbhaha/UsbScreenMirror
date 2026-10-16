@@ -52,6 +52,14 @@
                 android:text="@string/host_btn_scan" />
 
             <Button
+                android:id="@+id/btn_force"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="@string/host_btn_force" />
+
+            <Button
                 android:id="@+id/btn_replay"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"

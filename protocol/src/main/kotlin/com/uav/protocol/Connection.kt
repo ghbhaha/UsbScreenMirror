@@ -236,8 +236,27 @@ class Connection(
         }
 
         if (headers[streamId] == null) {
-            // ★ 该流的首条 WRTE payload 是 12B 流头，只发一次
-            val header = StreamHeader.decode(message.payload, 0, message.payload.size)
+            // ★ 该流的首条 WRTE payload 是 12B 流头，只发一次。
+            //   但实测会遇到"上一次会话残留在 USB FIFO 里的帧数据"被读到 —— 严格校验会把它
+            //   判为非法流头。此时**不能**拿垃圾去 configure 解码器（会静默配错尺寸），
+            //   而应当把它当杂散 payload 丢掉，继续等真正的流头。
+            val header = try {
+                StreamHeader.decode(
+                    message.payload, 0, message.payload.size,
+                    // 只有视频流以宽高作尺寸权威；非视频流这两个字段语义未定义
+                    expectVideoDims = streamId == StreamId.VIDEO,
+                )
+            } catch (pe: ProtocolException) {
+                val n = stats.strayPayloads.incrementAndGet()
+                if (n <= STRAY_WARN_LIMIT || n % 100 == 0L) {
+                    logger.w(
+                        tag,
+                        "stream[${StreamId.name(streamId)}] 首个 payload 不是合法流头" +
+                            "(${message.payload.size}B)，按残留字节丢弃（第 $n 次）: ${pe.message}"
+                    )
+                }
+                return
+            }
             headers[streamId] = header
             stats.headerAt(streamId, header)
             sink.onHeader(header)
@@ -329,6 +348,10 @@ class Connection(
     class Stats {
         val messagesRead = AtomicLong()
         val messagesWritten = AtomicLong()
+
+        /** 被当作"非法流头"丢弃的杂散 payload 数（正常应为 0；非 0 说明链路残留了旧会话数据）。 */
+        val strayPayloads = AtomicLong()
+
         val framesPerStream = ConcurrentHashMap<Int, AtomicLong>()
         val configFramesPerStream = ConcurrentHashMap<Int, AtomicLong>()
         val bytesPerStream = ConcurrentHashMap<Int, AtomicLong>()
@@ -355,6 +378,7 @@ class Connection(
 
         fun snapshot(): String = buildString {
             append("msgs(r/w)=").append(messagesRead.get()).append('/').append(messagesWritten.get())
+            if (strayPayloads.get() > 0) append(" stray=").append(strayPayloads.get())
             for ((id, h) in headersSeen) {
                 append(" | ").append(StreamId.name(id)).append('=')
                     .append(h.codecId).append(' ').append(h.width).append('x').append(h.height)
@@ -367,5 +391,8 @@ class Connection(
 
     private companion object {
         val SHUTDOWN = Outbound(0, 0, 0, AdbMessage.EMPTY, 0, 0)
+
+        /** 杂散 payload 的前若干次逐条告警，之后降频，避免刷屏。 */
+        const val STRAY_WARN_LIMIT = 10L
     }
 }

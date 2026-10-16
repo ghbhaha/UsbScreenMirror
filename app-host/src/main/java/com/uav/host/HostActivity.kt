@@ -52,16 +52,52 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     @Volatile
     private var surfaceReady = false
 
+    /** 最近一次 attach 的设备，供"自愈"重试用。 */
+    @Volatile
+    private var lastDevice: UsbDevice? = null
+
+    /** 本次连接是否走了"跳过握手"的快路径（`aoaVersion == 0` 即表示跳过）。 */
+    @Volatile
+    private var fastPathUnverified = false
+
+    /** 是否已经为本次连接做过一次强制重握手，避免死循环。 */
+    @Volatile
+    private var forceRetried = false
+
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var tickCount = 0L
+
     private val statsTicker = object : Runnable {
         override fun run() {
             val s = session
-            statsText.text = when {
+            val text = when {
                 s != null -> s.stats()
                 bulkChannel != null -> bulkChannel!!.stats()
                 else -> "no active session"
             }
+            statsText.text = text
+            // 每 5 秒把统计打进日志：5 分钟压测（计划 4.10）要靠它读首末对比，
+            // 也避免依赖 UI 取值（画面持续刷新时 uiautomator dump 会拿不到稳定帧）
+            tickCount++
+            if (tickCount % STATS_LOG_EVERY_TICKS == 0L) {
+                logger.i(TAG, "STATS $text")
+            }
             mainHandler.postDelayed(this, STATS_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * 前台轮询兜底：实测宿主设备（BOE P40UCH）在手机重枚举后**只发 DETACHED、不发 ATTACHED**，
+     * 只靠 `USB_DEVICE_ATTACHED` 广播会让"插线即投"彻底失效。
+     * 因此在 Activity 可见期间定时扫一遍设备列表，发现没试过的就自动握手。
+     */
+    private val usbPoller = object : Runnable {
+        override fun run() {
+            if (session == null) {
+                runCatching { router?.pollOnce() }
+                    .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
+            }
+            mainHandler.postDelayed(this, POLL_INTERVAL_MS)
         }
     }
 
@@ -106,12 +142,19 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         findViewById<Button>(R.id.btn_scan).setOnClickListener { router?.scanAndAttach() }
         findViewById<Button>(R.id.btn_replay).setOnClickListener { pickReplayFile() }
+        findViewById<Button>(R.id.btn_force).setOnClickListener {
+            stopSession()
+            forceRetried = true
+            fastPathUnverified = false
+            router?.scanAndAttach(forceHandshake = true)
+        }
 
         router = UsbAttachRouter(this, logger, this).also { it.start() }
 
         registerReceiver(detachReceiver, UsbAttachRouter.detachFilter())
 
         mainHandler.post(statsTicker)
+        mainHandler.postDelayed(usbPoller, POLL_INTERVAL_MS)
 
         handleIntent(intent)
     }
@@ -123,6 +166,40 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     private fun handleIntent(intent: Intent?) {
+        // ★ 供 adb 驱动的调试入口：am start -n com.uav.host/.HostActivity --es replay_path /data/data/com.uav.host/files/replay.uav
+        //   从指定文件回放抓流（计划 4.0），跳过整个 USB 与握手。
+        intent?.getStringExtra(EXTRA_REPLAY_PATH)?.takeIf { it.isNotEmpty() }?.let { path ->
+            logger.i(TAG, "收到回放指令: $path")
+            val file = File(path)
+            if (!file.exists()) {
+                onError("回放文件不存在: $path（可先用 run-as 放进 filesDir）", null)
+                return
+            }
+            startReplay(file)
+            return
+        }
+
+        // ★ 供 adb 驱动的调试入口：am start -n com.uav.host/.HostActivity --ez scan true
+        //   走普通扫描（已是配件则复用直连），等价于点界面上的 Scan / Retry 按钮。
+        if (intent?.getBooleanExtra(EXTRA_SCAN, false) == true) {
+            logger.i(TAG, "收到扫描指令")
+            stopSession()
+            forceRetried = false
+            router?.scanAndAttach(forceHandshake = false)
+            return
+        }
+
+        // ★ 供 adb 驱动的调试入口：am start -n com.uav.host/.HostActivity --ez force_handshake true
+        //   强制走完整 AOA 握手，用于"手机已被别的宿主 App 切成配件模式"的场景。
+        if (intent?.getBooleanExtra(EXTRA_FORCE_HANDSHAKE, false) == true) {
+            logger.i(TAG, "收到强制重握手指令")
+            stopSession()
+            forceRetried = true
+            fastPathUnverified = false
+            router?.scanAndAttach(forceHandshake = true)
+            return
+        }
+
         val action = intent?.action ?: return
         logger.i(TAG, "intent action=$action")
         if (action != UsbManager.ACTION_USB_DEVICE_ATTACHED &&
@@ -136,12 +213,15 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             return
         }
         stopSession()
+        forceRetried = false
         router?.onDeviceAttached(device)
     }
 
     // ------------------------------------------------------------------ router 回调
 
     override fun onStatus(text: String) {
+        // 会话真正建立起来 -> 快路径已验证通过，撤销自愈待办
+        if (text.contains("会话已建立")) fastPathUnverified = false
         runOnUiThread { statusText.text = text }
     }
 
@@ -153,9 +233,17 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     ) {
         logger.i(TAG, "link ready: aoaVersion=$aoaVersion device=${device.deviceId}")
 
+        lastDevice = device
+        // aoaVersion == 0 表示这次是按"已是配件、跳过握手"的快路径连的，
+        // 配件身份未被验证过（可能还是别的宿主 App 留下的）
+        fastPathUnverified = aoaVersion == 0
+
         stopSession()
 
         val channel = BulkByteChannel(connection, pair, logger)
+        // ★ 先把上一次会话残留在 FIFO 里的字节丢掉，再开新会话。
+        //   否则第一个 payload 会被当成流头解析，静默配错解码器（实测踩到过）。
+        channel.drainStaleInput()
         bulkChannel = channel
         val transport = Transport(channel, logger, TAG)
 
@@ -175,6 +263,20 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     override fun onError(message: String, cause: Throwable?) {
         runOnUiThread { statusText.text = "ERROR: $message" }
         logger.e(TAG, message, cause)
+
+        // ★ 自愈：快路径（跳过握手）连上的链路如果没人应答，说明配件身份不是我们的
+        //   —— 手机很可能被"别的宿主 App"切成了配件模式，系统因此没有拉起我们的手机端 App。
+        //   这时强制走一次完整 AOA 握手，把配件身份改写成 UAV/usbscreen。
+        val dev = lastDevice
+        if (fastPathUnverified && !forceRetried && dev != null) {
+            forceRetried = true
+            fastPathUnverified = false
+            logger.w(TAG, "快路径失败（$message）→ 改为强制完整 AOA 握手重试一次")
+            runOnUiThread { statusText.text = "重试：强制 AOA 重握手（改写配件身份）…" }
+            session?.close()
+            session = null
+            router?.onDeviceAttached(dev, forceHandshake = true)
+        }
     }
 
     /** 设备拔出：与读写异常统一走这里（计划 2.10）。 */
@@ -261,6 +363,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(statsTicker)
+        mainHandler.removeCallbacks(usbPoller)
         runCatching { unregisterReceiver(detachReceiver) }
         router?.close()
         router = null
@@ -272,5 +375,16 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         const val TAG = "UAV-Host"
         const val REQ_PICK_UAV = 1001
         const val STATS_INTERVAL_MS = 1000L
+        const val STATS_LOG_EVERY_TICKS = 5L
+        const val POLL_INTERVAL_MS = 2_000L
+
+        /** adb 调试入口用的 extra：`--es replay_path <绝对路径>`。 */
+        const val EXTRA_REPLAY_PATH = "replay_path"
+
+        /** adb 调试入口用的 extra：`--ez force_handshake true`。 */
+        const val EXTRA_FORCE_HANDSHAKE = "force_handshake"
+
+        /** adb 调试入口用的 extra：`--ez scan true`。 */
+        const val EXTRA_SCAN = "scan"
     }
 }

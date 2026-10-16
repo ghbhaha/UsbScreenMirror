@@ -40,6 +40,30 @@ class BulkPair(
         const val READ_CHUNK_TARGET = 16384
 
         /**
+         * 该设备是否含「BULK IN + BULK OUT」端点对。
+         *
+         * 用途：**在"扫描/轮询"时排除掉不是手机的设备**。
+         * 实测宿主内建面板（KASA-TECH CoolTouch）只有 HID 接口（class=3），
+         * 而手机无论普通模式（MTP/mass_storage + vendor 接口）还是配件模式都带 BULK 端点对 ——
+         * 这个判据足够把二者分开，且恰好也是 AOA 通信的硬性前提。
+         */
+        fun hasBulkPair(device: UsbDevice): Boolean {
+            for (i in 0 until device.interfaceCount) {
+                val iface = device.getInterface(i)
+                var hasIn = false
+                var hasOut = false
+                for (e in 0 until iface.endpointCount) {
+                    val ep = iface.getEndpoint(e)
+                    if (ep.type != android.hardware.usb.UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+                    if (ep.direction == android.hardware.usb.UsbConstants.USB_DIR_IN) hasIn = true
+                    else hasOut = true
+                }
+                if (hasIn && hasOut) return true
+            }
+            return false
+        }
+
+        /**
          * 选择接口与端点。
          *
          * AOA 的配件接口是设备上的**第一个接口**（index 0），且只有一个 bulk in + 一个 bulk out。

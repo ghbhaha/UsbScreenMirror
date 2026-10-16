@@ -53,15 +53,25 @@ object AccessoryIdentity {
     /**
      * 把一段 `SEND_STRING` 文本编码为 AOA 要求的字节序列。
      *
-     * ⚠️ **必须是 UTF-16LE 且含结尾 `\0`**（计划红线）。
-     * AOA 的 52 号控制请求对编码错误**只返回失败、不报原因**，
-     * 这是最容易被误判成"握手莫名其妙失败"的坑，因此编码逻辑单独抽出来并可单测。
+     * ⚠️ **实测结论：UTF-8 + 单个结尾 `\0`，不是 UTF-16LE。**
+     *
+     * 计划初稿沿用了"必须 UTF-16LE"的说法，但**真机实测证明那是错的**：
+     * 用 UTF-16LE 编码时，手机上 `dumpsys usb` 里的配件身份会变成
+     * `manufacturer=U model=u version=1`（每个串只剩首字符）。
+     *
+     * 原因是 AOSP 框架 `UsbDeviceManager.getAccessoryStrings()` 读的是内核
+     * `f_accessory` 暴露的 NUL 分隔字节串，并按 `\u0000` 切分：
+     * UTF-16LE 的 `"UAV"` = `55 00 41 00 56 00 00 00`，切分后第一段就是 `"U"`。
+     *
+     * 后果很严重：配件身份对不上手机的 `accessory_filter.xml` → 系统**不派发**
+     * `USB_ACCESSORY_ATTACHED` → 手机端 App 拿不到权限 → `openAccessory` 返回 null
+     * → 宿主永远等不到 CNXN 应答。整条链路就此断掉，且报错点离根因很远。
      */
     fun encodeSendString(value: String): ByteArray {
         require(value.length <= MAX_STRING_LENGTH) {
             "SEND_STRING 超过 $MAX_STRING_LENGTH 字符: ${value.length}"
         }
-        return (value + "\u0000").toByteArray(Charsets.UTF_16LE)
+        return (value + "\u0000").toByteArray(Charsets.UTF_8)
     }
 
     /** 按 AOA 顺序返回 6 段编码后的字节（index 0..5）。 */

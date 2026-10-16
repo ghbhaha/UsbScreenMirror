@@ -73,6 +73,12 @@ class VirtualDisplayEncoder(
     val configFrames = AtomicLong()
     val keyFrames = AtomicLong()
 
+    /** 最近一次产出的 CONFIG payload —— 新会话接入时要重发（宿主的解码器靠它 configure）。 */
+    @Volatile
+    private var lastConfig: ByteArray? = null
+
+    val isRunning: Boolean get() = running.get()
+
     @Volatile
     var outputWidth = 0
         private set
@@ -241,8 +247,31 @@ class VirtualDisplayEncoder(
             pos += p.size
         }
         configFrames.incrementAndGet()
+        lastConfig = payload
         logger.i(TAG, "CONFIG 帧产出：${parts.size} 段拼接，共 $total 字节")
         sink.onConfig(payload)
+    }
+
+    /**
+     * 新会话接入时**复用既有编码器**，只把「流头 + 最近一份 CONFIG」重发一遍。
+     *
+     * ★ 为什么必须这样做，而不能"停掉再重建"：
+     *   `MediaProjection` 的令牌**只允许 `createVirtualDisplay` 一次**，
+     *   重建会直接失败（Android 会抛 "Don't re-use the resultData..." 一类错误），
+     *   而那意味着要重新弹一次录屏授权 —— 对用户是明显的倒退。
+     *
+     * @return true 表示成功重发；false 表示还没有可用的 CONFIG（宿主将无法 configure 解码器）
+     */
+    fun resendStartup(): Boolean {
+        val cfg = lastConfig
+        sink.onStreamHeader(StreamHeader(CodecId.AVC1, outputWidth, outputHeight))
+        if (cfg == null) {
+            logger.w(TAG, "新会话接入但没有缓存的 CONFIG，宿主解码器将无法 configure")
+            return false
+        }
+        sink.onConfig(cfg)
+        logger.i(TAG, "新会话接入：已重发流头 ${outputWidth}x$outputHeight 与 CONFIG(${cfg.size}B)")
+        return true
     }
 
     fun stop() {

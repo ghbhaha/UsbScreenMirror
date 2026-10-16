@@ -36,28 +36,36 @@ class AccessoryIdentityTest {
     }
 
     @Test
-    fun `字符串编码为 UTF-16LE 且含结尾 NUL`() {
+    fun `字符串按 UTF-8 编码且只带一个结尾 NUL`() {
         val bytes = AccessoryIdentity.encodeSendString("UAV")
-        // "UAV" = 3 字符 -> 6 字节 + 结尾 NUL 2 字节 = 8
-        assertEquals(8, bytes.size)
+        // ★ 真机实测：必须是 UTF-8 + 单个 NUL。用 UTF-16LE 会让手机只认出首字符
+        //   （"UAV" -> 55 00 41 00 56 00 00 00，框架按 NUL 切分后只剩 "U"）。
+        assertArrayEquals(byteArrayOf(0x55, 0x41, 0x56, 0x00), bytes)
+        assertEquals(4, bytes.size)
+        // 除结尾外不得出现 NUL 字节 —— 出现就意味着编码方式选错了
+        for (i in 0 until bytes.size - 1) {
+            assertTrue("位置 $i 出现了内嵌 NUL，说明编码不是 UTF-8", bytes[i] != 0.toByte())
+        }
+    }
+
+    @Test
+    fun `非 ASCII 字符按 UTF-8 多字节编码`() {
+        val bytes = AccessoryIdentity.encodeSendString("投屏")
+        // "投" U+6295 -> UTF-8 E6 8A 95；"屏" U+5C4F -> E5 B1 8F；再加 1 个 NUL
+        assertEquals(7, bytes.size)
         assertArrayEquals(
-            byteArrayOf('U'.code.toByte(), 0, 'A'.code.toByte(), 0, 'V'.code.toByte(), 0, 0, 0),
+            byteArrayOf(0xE6.toByte(), 0x8A.toByte(), 0x95.toByte(),
+                0xE5.toByte(), 0xB1.toByte(), 0x8F.toByte(), 0x00),
             bytes,
         )
+        for (i in 0 until bytes.size - 1) {
+            assertTrue("UTF-8 多字节串里不该出现 NUL", bytes[i] != 0.toByte())
+        }
     }
 
     @Test
-    fun `非 ASCII 字符同样按 UTF-16LE 编码`() {
-        val bytes = AccessoryIdentity.encodeSendString("投屏")
-        assertEquals(2 * 2 + 2, bytes.size)
-        // "投" U+6295 -> LE 为 0x95 0x62
-        assertEquals(0x95.toByte(), bytes[0])
-        assertEquals(0x62.toByte(), bytes[1])
-    }
-
-    @Test
-    fun `空字符串也带结尾 NUL`() {
-        assertArrayEquals(byteArrayOf(0, 0), AccessoryIdentity.encodeSendString(""))
+    fun `空字符串只有一个 NUL`() {
+        assertArrayEquals(byteArrayOf(0x00), AccessoryIdentity.encodeSendString(""))
     }
 
     @Test
@@ -72,7 +80,7 @@ class AccessoryIdentityTest {
     fun `恰好 255 字符被接受`() {
         val max = "x".repeat(AccessoryIdentity.MAX_STRING_LENGTH)
         val bytes = AccessoryIdentity.encodeSendString(max)
-        assertEquals(AccessoryIdentity.MAX_STRING_LENGTH * 2 + 2, bytes.size)
+        assertEquals(AccessoryIdentity.MAX_STRING_LENGTH + 1, bytes.size)
     }
 
     @Test

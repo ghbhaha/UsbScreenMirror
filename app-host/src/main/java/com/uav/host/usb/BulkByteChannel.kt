@@ -112,6 +112,45 @@ class BulkByteChannel(
         closed.set(true)
     }
 
+    /**
+     * 丢掉 claim 之后残留在入站端点里的字节 —— **上一次会话的尾巴**。
+     *
+     * 实测踩到的坑：上一次会话结束时手机端可能又写了几帧，这些字节躺在 USB FIFO 里；
+     * 新会话开始时，宿主按"该流首个 `WRTE` 即流头"去解析，就会把一帧数据当成 12B 流头，
+     * 得到 `StreamHeader(乱码 8x466)` 这种结果并**静默配错解码器**。
+     *
+     * 调用时机：claimInterface 成功之后、发第一个 `CNXN` 之前（此刻配件端不应当有正经数据在飞）。
+     *
+     * @return 丢弃的字节数
+     */
+    fun drainStaleInput(maxWaitMs: Long = 300, perReadTimeoutMs: Int = 50): Int {
+        var total = 0
+        val deadline = System.nanoTime() + maxWaitMs * 1_000_000L
+        val buf = ByteArray(pair.readChunkSize)
+        while (System.nanoTime() < deadline) {
+            if (closed.get()) break
+            val n = try {
+                connection.bulkTransfer(pair.inEndpoint, buf, 0, buf.size, perReadTimeoutMs)
+            } catch (t: Throwable) {
+                logger.w(TAG, "$label drain 读取异常（忽略）: ${t.message}")
+                break
+            }
+            if (n > 0) {
+                total += n
+                continue // 还有残留，继续
+            }
+            break // 0 / 负值 = 当前已无更多残留
+        }
+        if (total > 0) {
+            logger.w(
+                TAG,
+                "$label 丢弃 $total 字节入站残留（上一次会话的尾巴）—— " +
+                    "否则会被误当成流头去 configure 解码器"
+            )
+        }
+        return total
+    }
+
     fun stats(): String =
         "$label rx=${bytesReceived.get()}B tx=${bytesSent.get()}B " +
             "readTimeouts=${readTimeouts.get()} writeFailures=${writeFailures.get()} " +

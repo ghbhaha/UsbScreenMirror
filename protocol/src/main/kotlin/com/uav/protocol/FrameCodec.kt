@@ -37,15 +37,54 @@ data class StreamHeader(
     companion object {
         const val SIZE = 12
 
-        fun decode(buf: ByteArray, off: Int = 0, len: Int = buf.size - off): StreamHeader {
+        /** 合法尺寸下界：小于此值的 "宽/高" 只可能是把帧数据误当流头解析出来的垃圾。 */
+        const val MIN_DIM = 16
+
+        /** 合法尺寸上界（8K 级别已远超本项目需求）。 */
+        const val MAX_DIM = 8192
+
+        /**
+         * 解析 12B 流头。
+         *
+         * ★ 这里做**严格校验**，原因是实测踩过的坑：上一次会话在 USB FIFO 里留下的帧数据，
+         *   会被"该流首个 `WRTE` 就是流头"这条约定误当成流头解析，
+         *   得出 `StreamHeader(乱码 8x466)` 这种荒谬结果，然后**静默地把解码器配错**。
+         *   严格校验让这种情况变成可识别的错误，上层据此把它当"杂散 payload"丢弃并继续等待真流头。
+         *
+         * @param expectVideoDims `width/height` 是否应当是"视频像素尺寸"。
+         *   只有视频流才以宽高作尺寸权威；音频流的这两个字段语义未定义（MVP 不启用音频），
+         *   因此对非视频流只校验 `codecId`，不校验数值范围。
+         */
+        fun decode(
+            buf: ByteArray,
+            off: Int = 0,
+            len: Int = buf.size - off,
+            expectVideoDims: Boolean = true,
+        ): StreamHeader {
             if (len < SIZE) {
                 throw ProtocolException("stream header too short: $len < $SIZE")
             }
+
+            // codecId 必须是 4 个可打印 ASCII 字符（补位空格合法，控制字符/高位字节不合法）。
+            // 帧数据的头 4 字节是 PTS 低位，几乎必然含非可打印字节 —— 这一条就能挡掉大部分误解析。
+            for (i in 0 until CodecId.SIZE) {
+                val b = buf[off + i].toInt() and 0xFF
+                if (b < 0x20 || b > 0x7E) {
+                    throw ProtocolException(
+                        "stream header codecId 含非可打印字节 0x${Integer.toHexString(b)} " +
+                            "(${Hex.toHexString(buf, off, SIZE)}) —— 多半是把帧数据误当流头"
+                    )
+                }
+            }
             val codecId = CodecId.decode(buf, off)
+
             val width = Bytes.getIntLE(buf, off + 4)
             val height = Bytes.getIntLE(buf, off + 8)
-            if (width <= 0 || height <= 0) {
-                throw ProtocolException("bad stream header dimensions: ${width}x$height")
+            if (expectVideoDims && (width !in MIN_DIM..MAX_DIM || height !in MIN_DIM..MAX_DIM)) {
+                throw ProtocolException(
+                    "stream header 尺寸不合理: ${width}x$height (合法范围 $MIN_DIM..$MAX_DIM) " +
+                        "—— 多半是把帧数据误当流头"
+                )
             }
             return StreamHeader(codecId, width, height)
         }

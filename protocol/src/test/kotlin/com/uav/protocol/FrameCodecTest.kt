@@ -53,6 +53,67 @@ class FrameCodecTest {
         assertThrows(ProtocolException::class.java) { StreamHeader.decode(b) }
     }
 
+    // ---------------------------------------------------------------- 流头严格校验
+    // 背景（真机实测）：上一次会话残留在 USB FIFO 里的帧数据会被"首个 WRTE 即流头"
+    // 这条约定误解析，得到 StreamHeader(乱码 8x466) 并静默配错解码器。以下用例把这类误解析钉死。
+
+    @Test
+    fun `真实帧数据被误当流头时会被拒绝`() {
+        // 用真机抓流里的真实 PTS，其低 32 位含非可打印字节
+        val ptsAndFlags = Flags.pack(37_696_994_382L, keyFrame = true)
+        val framePayload = FrameCodec.encodeFrame(ptsAndFlags, bytes(0x67, 0x42, 0x00, 0x1E, 0x95))
+
+        val e = assertThrows(ProtocolException::class.java) { StreamHeader.decode(framePayload) }
+        assertTrue("应在 codecId 上失败: ${e.message}", e.message!!.contains("codecId"))
+    }
+
+    @Test
+    fun `codecId 全可打印但尺寸荒谬时也会被拒绝`() {
+        // 构造 12B：codecId 恰好是 "avc1"，但宽高是被误读出来的垃圾值
+        val bad = ByteArray(12)
+        System.arraycopy(CodecId.encode(CodecId.AVC1), 0, bad, 0, 4)
+        Bytes.putIntLE(bad, 4, 8)
+        Bytes.putIntLE(bad, 8, 466)
+
+        val e = assertThrows(ProtocolException::class.java) { StreamHeader.decode(bad) }
+        assertTrue(e.message!!.contains("尺寸不合理"))
+    }
+
+    @Test
+    fun `尺寸下限与上限被强制执行`() {
+        val below = StreamHeader(CodecId.AVC1, 720, 1600).encode().also { Bytes.putIntLE(it, 4, 15) }
+        assertThrows(ProtocolException::class.java) { StreamHeader.decode(below) }
+
+        val above = StreamHeader(CodecId.AVC1, 720, 1600).encode().also { Bytes.putIntLE(it, 8, 8193) }
+        assertThrows(ProtocolException::class.java) { StreamHeader.decode(above) }
+
+        // 边界内应通过
+        assertEquals(16, StreamHeader.decode(StreamHeader(CodecId.AVC1, 16, 16).encode()).width)
+        assertEquals(8192, StreamHeader.decode(StreamHeader(CodecId.AVC1, 8192, 8192).encode()).width)
+    }
+
+    @Test
+    fun `非视频流只校验 codecId 不校验数值范围`() {
+        // 音频流的宽高字段语义未定义（MVP 不启用音频），不能因为 48000x2 这种值被拒
+        val audio = StreamHeader(CodecId.OPUS, 48000, 2).encode()
+        val decoded = StreamHeader.decode(audio, expectVideoDims = false)
+        assertEquals(48_000, decoded.width)
+        assertEquals(2, decoded.height)
+        // 但 codecId 依然要合法
+        val garbage = ByteArray(12) { 0xFF.toByte() }
+        assertThrows(ProtocolException::class.java) {
+            StreamHeader.decode(garbage, expectVideoDims = false)
+        }
+    }
+
+    @Test
+    fun `合法流头仍能通过严格校验`() {
+        for (size in listOf(720 to 1600, 872 to 1920, 1080 to 2400, 1224 to 2700)) {
+            val h = StreamHeader(CodecId.AVC1, size.first, size.second)
+            assertEquals(h, StreamHeader.decode(h.encode()))
+        }
+    }
+
     // ------------------------------------------------------------------ 帧
 
     @Test
