@@ -91,7 +91,7 @@
 | Android SDK | `compileSdk=36` / `buildTools=36.0.0` | `minSdk=24`、`targetSdk=36` |
 | Gradle | 8.14.5（wrapper 已配） | 走腾讯云镜像，无需手动装 |
 | `local.properties` | **必须**有 `sdk.dir=<你的 SDK 路径>` | ⚠️ 本机 `ANDROID_HOME` 为空，不能靠环境变量 |
-| `GRADLE_USER_HOME`（本机） | 建议指向 `D:\Develop\.gradle` | 该目录已有约 5 GB 依赖缓存，复用可基本零下载；不设则会从零拉一遍 |
+| `GRADLE_USER_HOME` | 建议显式设成一个固定目录 | 依赖缓存按此目录复用；不设则用默认的 `~/.gradle`。另外**锁 JDK 建议写在 `$GRADLE_USER_HOME/gradle.properties`（用户级）**，别写进项目文件——绝对路径一旦入库，别的机器会构建失败 |
 
 ---
 
