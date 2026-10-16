@@ -83,6 +83,14 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     private var replayChannel: FileByteChannel? = null
 
     /**
+     * 像素模式：`true` = 1:1 像素映射（省算力），`false` = 高清旧口径（宿主端缩放更锐）。
+     *
+     * 决定 `OPEN` 协商的 `max_size`，所以**改了必须重开会话**才生效（见 [toggleOneToOne]）。
+     * 初值从 [HostPrefs] 读，切换后写回。
+     */
+    private var oneToOne = true
+
+    /**
      * 触摸注入控制器（路线图 P1「输入通道」）：把**宿主屏幕上的触摸**转发成手机上的触摸。
      *
      * 坐标换算在 `:protocol/TouchMapper`（纯逻辑 + 单测），本类只负责
@@ -266,6 +274,12 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             }
         }
 
+        // 像素模式是**用户可见的画质选择**（不是调试入口）—— release 也保留。
+        //   1:1 = 按宿主显示区编码（省算力，但无超采样）；高清 = 按面板长边编高分辨率、宿主端缩下去。
+        oneToOne = HostPrefs.oneToOne(this)
+        updatePixelButton()
+        findViewById<Button>(R.id.btn_pixel).setOnClickListener { toggleOneToOne() }
+
         router = UsbAttachRouter(this, logger, this).also { it.start() }
 
         registerReceiver(detachReceiver, UsbAttachRouter.detachFilter())
@@ -329,6 +343,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
      * 重启走的是已验过的自动重连路径（约 1.5s、不重新弹录屏授权），代价可控。
      */
     private fun renegotiateForDisplayArea() {
+        // 高清模式（1:1 关）下尺寸不依赖显示区，显示区变化无需重建
+        if (!oneToOne) return
         val s = session ?: return
         val area = rootArea() ?: return
         val pw = s.peerWidth
@@ -349,6 +365,32 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         statusText.text = "显示区变了，按新尺寸重建会话…"
         stopSession()
         // 交给轮询/直接扫描接管；新会话会按当前显示区重新算尺寸
+        router?.scanAndAttach()
+    }
+
+    // ------------------------------------------------------------------ 像素模式开关（10.17）
+
+    /** 把按钮文字刷成"当前模式"。 */
+    private fun updatePixelButton() {
+        findViewById<Button>(R.id.btn_pixel).text =
+            getString(if (oneToOne) R.string.host_btn_pixel_11 else R.string.host_btn_pixel_hd)
+    }
+
+    /**
+     * 切换 1:1 / 高清像素模式，并**重开会话**让新口径生效。
+     *
+     * 为什么必须重开会话：`max_size` 只在 `OPEN` 时协商一次，手机端拿到后才配编码器；
+     * 没有"改尺寸"的独立消息。重启走已验过的自动重连路径（≈1.5s，不重新弹录屏授权）。
+     */
+    private fun toggleOneToOne() {
+        oneToOne = !oneToOne
+        HostPrefs.setOneToOne(this, oneToOne)
+        updatePixelButton()
+        logger.i(TAG, "像素模式切换 → ${if (oneToOne) "1:1（按显示区编码）" else "高清（按面板长边编码）"}，重开会话")
+        statusText.text = getString(
+            if (oneToOne) R.string.host_status_switch_11 else R.string.host_status_switch_hd
+        )
+        stopSession()
         router?.scanAndAttach()
     }
 
@@ -745,6 +787,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             audioDelayMs = audioDelayMs,
             // ★ 1:1 像素映射：把"视频显示区的可用区"交给会话去算编码尺寸（取当前值）
             displayArea = { rootArea() },
+            // ★ 像素模式开关（10.17）：关掉则退回旧口径、不下发显示区
+            oneToOne = oneToOne,
         )
         session = s
         s.start()

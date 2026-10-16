@@ -69,6 +69,14 @@
                 android:text="@string/host_btn_replay" />
         </LinearLayout>
 
+        <!-- 像素模式开关：1:1（省算力）↔ 高清（宿主端缩放更锐）。改后需重开会话生效。 -->
+        <Button
+            android:id="@+id/btn_pixel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/host_btn_pixel_11" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

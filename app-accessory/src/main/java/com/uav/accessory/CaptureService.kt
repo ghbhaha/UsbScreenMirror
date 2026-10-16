@@ -370,6 +370,22 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         //   重建会失败并要求用户重新授权。这里只重发流头 + 缓存的 CONFIG。
         val existing = encoder
         if (existing != null && existing.isRunning) {
+            // ★ 10.17：宿主可以切换「1:1 / 高清」像素模式并重开会话 —— 复用前先比一下
+            //   "按新参数该编多大"。不一样就重建（复用虚拟屏），否则 max_size 改了却照旧编码，
+            //   开关等于没生效（真机实测踩到）。
+            if (existing.applyOptions(options)) {
+                // 已按新尺寸重建：新输出线程**已重发视频流头 + CONFIG**，这里只补音频。
+                //   ⚠️ 此时绝不能再 resendStartup —— 会多发一份流头，把宿主解码器搞乱。
+                val audioResumed = resumeAudio()
+                AccessoryStatus.set(
+                    when {
+                        audioResumed == null -> "像素模式变更：已按新尺寸重建编码器（宿主未要音频）"
+                        audioResumed -> "像素模式变更：已按新尺寸重建编码器，视频/音频流头均已重发"
+                        else -> "像素模式变更：已重建编码器（音频重发失败：还没有音频 CONFIG）"
+                    }
+                )
+                return
+            }
             val ok = existing.resendStartup()
             // 音频同样只重发流头 + CONFIG —— 宿主的音频解码器也是按连接新建的
             val audioResumed = resumeAudio()

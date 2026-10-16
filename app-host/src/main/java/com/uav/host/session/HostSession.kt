@@ -78,6 +78,16 @@ class HostSession(
      * 必须在发 `OPEN` 的那一刻取**当前值**。
      */
     private val displayArea: () -> IntArray? = { null },
+
+    /**
+     * 是否按 **1:1 像素映射**协商编码尺寸（10.15 的默认行为；10.17 起可关）。
+     *
+     * - `true`：编码尺寸 = 画面在 [displayArea] 里适配后的大小，并把显示区下发（手机旋转自算）。
+     * - `false`：退回旧口径 `align8(min(手机长边, 宿主面板长边))`，**不下发显示区** ——
+     *   手机端 `ParsedOpen.encodeMaxSize` 因为拿不到显示区会自动回退到 `max_size`，
+     *   于是按高分辨率编码、由宿主端缩下去（效果上等于超采样，观感更锐）。
+     */
+    private val oneToOne: Boolean = true,
 ) {
 
     interface Listener {
@@ -264,26 +274,35 @@ class HostSession(
             // ★ max_size 由宿主计算后下发（计划 4.3）：CNXN 交换后两边尺寸都已知。
             //   10.15 起按**视频显示区**算（1:1 像素映射），并把显示区一并下发 ——
             //   这样手机端旋转时能自己重算（见 ParsedOpen.encodeMaxSize），不必重新协商。
-            val area = runCatching { displayArea() }.getOrNull()
+            //   10.17 起可用开关退回旧口径（按面板长边编高分辨率、宿主端缩放更锐）——
+            //   关掉时**不下发显示区**，手机端 encodeMaxSize 自动回退到 max_size。
+            val area = if (oneToOne) runCatching { displayArea() }.getOrNull() else null
             val availW = area?.getOrNull(0) ?: 0
             val availH = area?.getOrNull(1) ?: 0
-            val maxSize = Scale.oneToOneMaxSize(
-                phoneW = phoneWidth,
-                phoneH = phoneHeight,
-                availW = availW,
-                availH = availH,
-                hostPanelW = localWidth,
-                hostPanelH = localHeight,
-            )
+            val maxSize = if (oneToOne) {
+                Scale.oneToOneMaxSize(
+                    phoneW = phoneWidth,
+                    phoneH = phoneHeight,
+                    availW = availW,
+                    availH = availH,
+                    hostPanelW = localWidth,
+                    hostPanelH = localHeight,
+                )
+            } else {
+                Scale.computeMaxSize(phoneWidth, phoneHeight, localWidth, localHeight)
+            }
             negotiatedMaxSize = maxSize
             negotiatedDisplayArea = if (availW > 0 && availH > 0) "${availW}x$availH" else ""
             val options = Options.defaultOptions(maxSize, availW, availH).apply { audio = audioEnabled }
 
             connection?.send(Command.OPEN, StreamId.CONTROL, 0, Options.buildPayload(options))
-            val sizeSrc = if (availW > 0 && availH > 0) {
-                "显示区 ${availW}x$availH（1:1 → max_size=$maxSize）"
-            } else {
-                "按面板长边 ${localWidth}x$localHeight 回退（显示区未知 → max_size=$maxSize）"
+            val sizeSrc = when {
+                availW > 0 && availH > 0 ->
+                    "显示区 ${availW}x$availH（1:1 → max_size=$maxSize）"
+                oneToOne ->
+                    "按面板长边 ${localWidth}x$localHeight 回退（显示区未知 → max_size=$maxSize）"
+                else ->
+                    "高清模式（1:1 关）按面板长边 ${localWidth}x$localHeight → max_size=$maxSize"
             }
             listener.onStatus(
                 "OPEN 已发送：手机 ${phoneWidth}x$phoneHeight / $sizeSrc，等待 OKAY…"

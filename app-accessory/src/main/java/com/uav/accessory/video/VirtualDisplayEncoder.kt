@@ -295,7 +295,7 @@ class VirtualDisplayEncoder(
      *
      * @return true 表示确实重建了（尺寸有变化且成功）
      */
-    private fun rebuildForSizeChange(newSrcW: Int, newSrcH: Int): Boolean {
+    private fun rebuildForSizeChange(newSrcW: Int, newSrcH: Int, reason: String = "旋转"): Boolean {
         val opts = negotiatedOptions ?: return false
 
         synchronized(lifecycleLock) {
@@ -314,7 +314,7 @@ class VirtualDisplayEncoder(
             if (scaled[0] == outputWidth && scaled[1] == outputHeight) {
                 // 源尺寸变了但缩放后编码尺寸相同（例如变化在 max_size 阈值以内）：
                 // 不必重建，但要把源尺寸记下来，否则会每次轮询都重新算一遍
-                logger.i(TAG, "源尺寸 ${newSrcW}x$newSrcH 变化但编码尺寸不变，跳过重建")
+                logger.i(TAG, "$reason：源 ${newSrcW}x$newSrcH 下编码尺寸不变，跳过重建")
                 srcWidth = newSrcW
                 srcHeight = newSrcH
                 return false
@@ -322,7 +322,7 @@ class VirtualDisplayEncoder(
 
             logger.i(
                 TAG,
-                "旋转：源 ${srcWidth}x$srcHeight -> ${newSrcW}x$newSrcH，" +
+                "$reason：源 ${srcWidth}x$srcHeight -> ${newSrcW}x$newSrcH，" +
                     "max_size $oldMaxSize -> $newMaxSize（${describeSizeSource(opts)}），" +
                     "编码 ${outputWidth}x$outputHeight -> ${scaled[0]}x${scaled[1]}"
             )
@@ -367,10 +367,27 @@ class VirtualDisplayEncoder(
             rebuilds.incrementAndGet()
             logger.i(
                 TAG,
-                "旋转完成：编码 ${outputWidth}x$outputHeight，已重发流头等待宿主重配解码器"
+                "${reason}完成：编码 ${outputWidth}x$outputHeight，已重发流头等待宿主重配解码器"
             )
             return true
         }
+    }
+
+    /**
+     * 新会话接入时**套用宿主这次下发的参数**（10.17）。
+     *
+     * 为什么需要它：宿主可切换「1:1 / 高清」像素模式并重开会话，但手机端为"重连快"会复用既有
+     * 编码器（见 [resendStartup]，因为投影令牌只允许 `createVirtualDisplay` 一次）——
+     * 于是 `max_size` 变了却照旧编码，**开关等于没生效**（真机实测踩到）。
+     * 这里在复用前先比一下"按新参数该编多大"，不一样就重建（复用虚拟屏与投影令牌，代价小）。
+     *
+     * @return `true` = 尺寸变了且已按新尺寸重建（此时新输出线程**已重发流头 + CONFIG**，
+     *         调用方**不要**再调 [resendStartup]，否则会多出一份流头）；
+     *         `false` = 尺寸没变，沿用既有编码器（调用方仍需 [resendStartup] 重发流头/CONFIG）。
+     */
+    fun applyOptions(newOptions: ParsedOpen): Boolean {
+        negotiatedOptions = newOptions
+        return rebuildForSizeChange(srcWidth, srcHeight, reason = "像素模式变更")
     }
 
     /**
