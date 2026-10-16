@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">UAV Host</string>
-    <string name="host_status_idle">Stage 0 - idle, waiting for cable</string>
+    <string name="host_status_idle">Stage 2 - idle, plug in the accessory phone</string>
+    <string name="host_btn_scan">Scan / Retry</string>
+    <string name="host_btn_replay">Replay .uav dump</string>
+    <!-- 计划 0.1：首期不支持旋转，必须让用户看得见，避免把"方向不对"误判成 bug -->
+    <string name="host_rotation_notice">Note: rotation is not supported in MVP. Lock the phone orientation before mirroring.</string>
 </resources>

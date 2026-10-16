@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">UAV Accessory</string>
-    <string name="acc_status_idle">Stage 0 - idle, not attached</string>
+    <string name="acc_status_idle">Stage 3 - not attached. Plug this phone into the host.</string>
+    <string name="acc_btn_grant">Grant screen capture</string>
+    <string name="acc_btn_stop">Stop</string>
+    <string name="acc_hint">Note: Android 14+ asks for screen-capture consent every session. Lock orientation before mirroring.</string>
+    <string name="notif_channel">Screen capture</string>
+    <string name="notif_title">UAV Accessory</string>
+    <string name="notif_text">Mirroring screen to the USB host</string>
 </resources>

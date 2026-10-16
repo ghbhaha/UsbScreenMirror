@@ -1,0 +1,225 @@
+package com.uav.accessory.session
+
+import com.uav.accessory.AndroidLogger
+import com.uav.protocol.AdbMessage
+import com.uav.protocol.Bytes
+import com.uav.protocol.Command
+import com.uav.protocol.Connection
+import com.uav.protocol.ConnectionListener
+import com.uav.protocol.FrameCodec
+import com.uav.protocol.Logger
+import com.uav.protocol.Options
+import com.uav.protocol.ParsedOpen
+import com.uav.protocol.Protocol
+import com.uav.protocol.StreamHeader
+import com.uav.protocol.StreamId
+import com.uav.protocol.Transport
+import com.uav.protocol.d
+import com.uav.protocol.e
+import com.uav.protocol.i
+import com.uav.protocol.w
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * 手机端会话（计划 3.2 / 4.2）。
+ *
+ * 报文流：
+ * ```
+ * 手机 <--CNXN(宿主 w/h)------------- 宿主
+ * 手机  --CNXN(本机 w/h)------------> 宿主
+ * 手机 <--OPEN(newScreen1:2 ...)----- 宿主
+ * 手机  --OKAY---------------------> 宿主      ← 收到即回，不等采集就绪
+ * 手机  --WRTE[1](12B 流头)--------> 宿主
+ * 手机  --WRTE[2](CONFIG 帧)-------> 宿主
+ * 手机  --WRTE[3..](普通帧)--------> 宿主
+ * ```
+ *
+ * **OKAY 立即回**：采集授权是异步的（用户要点一次系统弹窗），
+ * 若等采集就绪再回 OKAY，宿主的 5s 应答超时会先到。授权被拒时改发
+ * `CLSE(含原因串)` 让宿主走正常断连流程（计划 4.4：禁止静默干等）。
+ */
+class AccessorySession(
+    private val transport: Transport,
+    private val localWidth: Int,
+    private val localHeight: Int,
+    private val capture: CaptureController,
+    private val logger: Logger = AndroidLogger,
+    private val listener: Listener,
+) {
+
+    interface Listener {
+        fun onStatus(text: String) {}
+        fun onError(message: String, cause: Throwable?)
+        fun onClosed(reason: String) {}
+    }
+
+    /** 由 App 侧实现（`CaptureService`），负责虚拟屏 + 编码器。 */
+    interface CaptureController {
+        /**
+         * 按协商参数启动采集与编码。
+         *
+         * 实现必须是**非阻塞**的；真正的授权/编码在后台完成，出帧后调用
+         * [AccessorySession.sendStreamHeader] / [AccessorySession.sendFrame]。
+         * 若确定无法启动（例如录屏权限被拒），应调用 [AccessorySession.failAndClose]。
+         */
+        fun startCapture(options: ParsedOpen, session: AccessorySession)
+
+        fun stopCapture()
+    }
+
+    private val closed = AtomicBoolean(false)
+    private var connection: Connection? = null
+
+    @Volatile
+    var negotiatedOptions: ParsedOpen? = null
+        private set
+
+    @Volatile
+    var hostWidth = 0
+        private set
+
+    @Volatile
+    var hostHeight = 0
+        private set
+
+    fun start() {
+        if (connection != null) return
+        val conn = Connection(transport, logger, TAG, connectionListener)
+        connection = conn
+        conn.start()
+        logger.i(TAG, "accessory session started on ${transport.label} (本机 ${localWidth}x$localHeight)")
+    }
+
+    // ------------------------------------------------------------------ 发送
+
+    /** 发送某条流的流头（该流**首条** `WRTE` 的 payload）。 */
+    fun sendStreamHeader(header: StreamHeader, streamId: Int = StreamId.VIDEO) {
+        val conn = connection ?: return
+        conn.send(Command.WRTE, streamId, 0, header.encode())
+    }
+
+    /** 发送一帧（合并成一条 `WRTE`，接收端一报一帧、无需重组）。 */
+    fun sendFrame(ptsAndFlags: Long, data: ByteArray, streamId: Int = StreamId.VIDEO) {
+        val conn = connection ?: return
+        conn.send(
+            Command.WRTE, streamId, 0,
+            FrameCodec.encodeFrame(ptsAndFlags, data, 0, data.size),
+        )
+    }
+
+    /** 出错时如实告知宿主并收敛，而不是静默干等（计划 4.4）。 */
+    fun failAndClose(reason: String) {
+        logger.e(TAG, "failing session: $reason")
+        listener.onError(reason, null)
+        connection?.sendClose(StreamId.CLOSE_ALL, reason)
+        // 给写线程一点时间把 CLSE 送出去，再关闭
+        try {
+            Thread.sleep(150)
+        } catch (ie: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        close()
+    }
+
+    // ------------------------------------------------------------------ 收报文
+
+    private val connectionListener = object : ConnectionListener {
+
+        override fun onMessage(message: AdbMessage) {
+            when (message.commandType) {
+                Command.CNXN -> handleCnxn(message)
+                Command.OPEN -> handleOpen(message)
+                Command.OKAY -> logger.i(TAG, "OKAY received (host acks stream ${StreamId.name(message.arg0)})")
+                Command.CLSE -> {
+                    logger.i(TAG, "CLSE from host: ${message.payload.toString(Charsets.UTF_8)}")
+                    stopCaptureQuietly()
+                    listener.onClosed("host CLSE: ${message.payload.toString(Charsets.UTF_8)}")
+                }
+                else -> logger.d(TAG, "message ${message.commandName} ignored")
+            }
+        }
+
+        override fun onError(cause: Throwable) {
+            if (closed.get()) return
+            logger.e(TAG, "链路错误: ${cause.message}", cause)
+            listener.onError("链路错误: ${cause.message}", cause)
+            stopCaptureQuietly()
+        }
+
+        override fun onClosed(reason: String) {
+            if (closed.get()) return
+            stopCaptureQuietly()
+            listener.onClosed(reason)
+        }
+    }
+
+    private fun handleCnxn(message: AdbMessage) {
+        if (message.payload.size >= 8) {
+            hostWidth = Bytes.getIntLE(message.payload, 0)
+            hostHeight = Bytes.getIntLE(message.payload, 4)
+        }
+        logger.i(
+            TAG,
+            "host CNXN: version=${message.arg0} 宿主屏幕 ${hostWidth}x$hostHeight"
+        )
+        // 回复本机尺寸；版本取两者较小值
+        val version = minOf(message.arg0, Protocol.VERSION)
+        val payload = Bytes.intLE(localWidth) + Bytes.intLE(localHeight)
+        connection?.send(Command.CNXN, version, 0, payload)
+        listener.onStatus("已回 CNXN（本机 ${localWidth}x$localHeight）")
+    }
+
+    private fun handleOpen(message: AdbMessage) {
+        val parsed = try {
+            Options.parsePayload(message.payload)
+        } catch (t: Throwable) {
+            failAndClose("OPEN 服务串解析失败: ${t.message}")
+            return
+        }
+        negotiatedOptions = parsed
+        logger.i(
+            TAG,
+            "OPEN: service='${parsed.service}' max_size=${parsed.maxSize} " +
+                "bitrate=${parsed.videoBitRate} max_fps=${parsed.maxFps} audio=${parsed.audio}"
+        )
+
+        if (parsed.audio) {
+            // MVP 不建音频管线（计划 3.11）；明确告知而不是假装在发
+            logger.w(TAG, "宿主请求了音频，但 MVP 不启用音频流，本次忽略")
+        }
+
+        // ★ 先回 OKAY 再启动采集：采集授权是异步的，等它就绪会超过宿主的 5s 超时
+        connection?.sendOkay(StreamId.CONTROL)
+        listener.onStatus("已回 OKAY，启动屏幕采集…")
+
+        try {
+            capture.startCapture(parsed, this)
+        } catch (t: Throwable) {
+            failAndClose("启动采集失败: ${t.message}")
+        }
+    }
+
+    private fun stopCaptureQuietly() {
+        runCatching { capture.stopCapture() }
+            .onFailure { logger.w(TAG, "stopCapture 抛异常: ${it.message}") }
+    }
+
+    fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        stopCaptureQuietly()
+        connection?.close()
+        connection = null
+        logger.i(TAG, "accessory session closed")
+    }
+
+    val isClosed: Boolean get() = closed.get()
+
+    fun stats(): String =
+        "host=${if (hostWidth > 0) "${hostWidth}x$hostHeight" else "-"} " +
+            "options=${negotiatedOptions?.options ?: "-"} | " +
+            (connection?.stats?.snapshot() ?: "-")
+
+    companion object {
+        const val TAG = "UAV-Accessory"
+    }
+}

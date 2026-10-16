@@ -135,6 +135,14 @@ class MemoryPipeChannel(
     }
 }
 
+/**
+ * 构造含 `> 0x7F` 字节的测试数据。
+ *
+ * `byteArrayOf(...)` 的参数类型是 `Byte`，而 `0x95`、`0xCE` 这类字面量在 Kotlin 里是 `Int`
+ * 且超出 Byte 范围，直接写会编译不过。这个辅助函数统一按"字节的数值"来理解入参。
+ */
+fun bytes(vararg values: Int): ByteArray = ByteArray(values.size) { values[it].toByte() }
+
 /** 组装一条未校验的原始报文（用于构造"坏 magic / 坏 checksum"等非法输入）。 */
 fun rawMessage(
     command: Int,

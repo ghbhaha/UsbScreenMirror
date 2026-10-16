@@ -46,4 +46,24 @@ object AccessoryIdentity {
         URI,
         SERIAL,
     )
+
+    /** 单段字符串长度上限（AOA 规范限制 255 字符）。 */
+    const val MAX_STRING_LENGTH: Int = 255
+
+    /**
+     * 把一段 `SEND_STRING` 文本编码为 AOA 要求的字节序列。
+     *
+     * ⚠️ **必须是 UTF-16LE 且含结尾 `\0`**（计划红线）。
+     * AOA 的 52 号控制请求对编码错误**只返回失败、不报原因**，
+     * 这是最容易被误判成"握手莫名其妙失败"的坑，因此编码逻辑单独抽出来并可单测。
+     */
+    fun encodeSendString(value: String): ByteArray {
+        require(value.length <= MAX_STRING_LENGTH) {
+            "SEND_STRING 超过 $MAX_STRING_LENGTH 字符: ${value.length}"
+        }
+        return (value + "\u0000").toByteArray(Charsets.UTF_16LE)
+    }
+
+    /** 按 AOA 顺序返回 6 段编码后的字节（index 0..5）。 */
+    fun encodeSendStrings(): List<ByteArray> = SEND_STRING_ORDER.map { encodeSendString(it) }
 }

@@ -320,25 +320,37 @@ class Connection(
 
     /**
      * 累计统计（计划 1.9），两端定期打印以判断链路健康。
+     *
+     * 口径刻意分开，理由：
+     *  - [frames] 只统计**媒体帧**，CONFIG 帧不计入 —— 否则阶段 4.10 的帧率压测会系统性偏大
+     *    （旋转重发 CONFIG 时偏差更明显）。
+     *  - [bytes] 统计该流 payload 的**全部字节**，含 CONFIG —— 它是链路带宽口径。
      */
     class Stats {
         val messagesRead = AtomicLong()
         val messagesWritten = AtomicLong()
         val framesPerStream = ConcurrentHashMap<Int, AtomicLong>()
+        val configFramesPerStream = ConcurrentHashMap<Int, AtomicLong>()
         val bytesPerStream = ConcurrentHashMap<Int, AtomicLong>()
         val headersSeen = ConcurrentHashMap<Int, StreamHeader>()
 
         internal fun frameAt(streamId: Int, frame: Frame) {
-            framesPerStream.computeIfAbsent(streamId) { AtomicLong() }.incrementAndGet()
             bytesPerStream.computeIfAbsent(streamId) { AtomicLong() }.addAndGet(frame.size.toLong())
+            val map = if (frame.isConfig) configFramesPerStream else framesPerStream
+            map.computeIfAbsent(streamId) { AtomicLong() }.incrementAndGet()
         }
 
         internal fun headerAt(streamId: Int, header: StreamHeader) {
             headersSeen[streamId] = header
         }
 
+        /** 媒体帧数（**不含** CONFIG 帧）。 */
         fun frames(streamId: Int): Long = framesPerStream[streamId]?.get() ?: 0L
 
+        /** CONFIG 帧数（每次 configure/重配置 +1）。 */
+        fun configFrames(streamId: Int): Long = configFramesPerStream[streamId]?.get() ?: 0L
+
+        /** 该流 payload 的总字节数（含 CONFIG）。 */
         fun bytes(streamId: Int): Long = bytesPerStream[streamId]?.get() ?: 0L
 
         fun snapshot(): String = buildString {
@@ -347,6 +359,7 @@ class Connection(
                 append(" | ").append(StreamId.name(id)).append('=')
                     .append(h.codecId).append(' ').append(h.width).append('x').append(h.height)
                     .append(" frames=").append(frames(id))
+                    .append(" config=").append(configFrames(id))
                     .append(" bytes=").append(bytes(id))
             }
         }
