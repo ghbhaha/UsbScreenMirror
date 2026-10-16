@@ -328,7 +328,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     private fun startReplay(file: File) {
         stopSession()
-        val channel = FileByteChannel(file, logger, loop = true)
+        // 不回环：抓流里的"流头"只在该流首条 WRTE 有效，循环第二遍时这 12B 会被当成
+        // 一帧解析而报错。要看第二遍就再触发一次回放。
+        // 配速默认开启（按帧 PTS 还原真实速度），否则会把深度 4 的队列冲爆。
+        val channel = FileByteChannel(file, logger, paceByPts = true)
         replayChannel = channel
         val transport = Transport(channel, logger, TAG)
         val screen = DisplaySize.of(this)

@@ -245,15 +245,26 @@ class HostSession(
         }
     }
 
+    /**
+     * 回放配速**不在这里做**。
+     *
+     * 真机实测教训：把配速放在消费线程上完全无效 —— 读线程是全速把文件灌进深度为 4 的
+     * 有界队列，4316 帧里丢掉 4310 帧（连关键帧一起丢），解码器随即报错。
+     * 配速只能做在**字节进入管线的地方**，即 `FileByteChannel` 按帧 PTS 节流。
+     */
+
     private fun handleConfigFrame(frame: Frame) {
         val header = videoQueue.header ?: connection?.headerOf(StreamId.VIDEO)
         if (header == null) {
             logger.w(TAG, "CONFIG 帧到达但尚无流头，忽略（正常不应发生）")
             return
         }
-        val surface = surfaceProvider()
+        // ★ 等 Surface 就绪：回放是磁盘速度，CONFIG 可能比 surfaceCreated 先到。
+        //   SurfaceView 的回调通常几十毫秒内就到，这里给一个短的等待窗口，
+        //   超时才算真失败（避免白白报错打断一次回放）。
+        val surface = awaitSurface(SURFACE_WAIT_MS)
         if (surface == null) {
-            fail("Surface 尚未就绪，无法配置解码器")
+            fail("Surface 在 ${SURFACE_WAIT_MS}ms 内仍未就绪，无法配置解码器")
             return
         }
 
@@ -281,6 +292,22 @@ class HostSession(
     }
 
     // ------------------------------------------------------------------ 生命周期
+
+    /** 在 [timeoutMs] 内轮询等待 Surface 就绪。 */
+    private fun awaitSurface(timeoutMs: Long): Surface? {
+        surfaceProvider()?.let { return it }
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
+        while (System.nanoTime() < deadline && running.get() && !closed.get()) {
+            try {
+                Thread.sleep(50)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+            surfaceProvider()?.let { return it }
+        }
+        return null
+    }
 
     private fun fail(message: String, cause: Throwable? = null) {
         if (closed.get()) return
@@ -320,5 +347,8 @@ class HostSession(
 
         /** 消费线程轮询间隔。 */
         const val POLL_MS = 500L
+
+        /** 等待 Surface 就绪的上限（回放场景下 CONFIG 可能比 surfaceCreated 先到）。 */
+        const val SURFACE_WAIT_MS = 3_000L
     }
 }

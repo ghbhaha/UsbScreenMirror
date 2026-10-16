@@ -70,6 +70,19 @@ class AccessorySession(
     private val closed = AtomicBoolean(false)
     private var connection: Connection? = null
 
+    /**
+     * 本会话内哪些流已经发过流头。
+     *
+     * ★ 必须用它把帧"关"在流头后面：复用编码器时（配件重新接入），
+     *   编码器在 OPEN 到达、`resendStartup()` 执行之前就已经在推帧了；
+     *   这些帧会抢在流头之前发出去，宿主把第一帧当 12B 流头解析 → 得到荒谬尺寸。
+     *   （宿主侧虽有"杂散 payload 丢弃"兜底，但那是补救；源头必须堵住。）
+     */
+    private val headerSent = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()
+
+    /** 因"本会话还没发流头"而被丢弃的帧数（正常只会在重连瞬间出现少量）。 */
+    val framesDroppedBeforeHeader = java.util.concurrent.atomic.AtomicLong()
+
     @Volatile
     var negotiatedOptions: ParsedOpen? = null
         private set
@@ -96,11 +109,24 @@ class AccessorySession(
     fun sendStreamHeader(header: StreamHeader, streamId: Int = StreamId.VIDEO) {
         val conn = connection ?: return
         conn.send(Command.WRTE, streamId, 0, header.encode())
+        headerSent[streamId] = true
     }
 
     /** 发送一帧（合并成一条 `WRTE`，接收端一报一帧、无需重组）。 */
     fun sendFrame(ptsAndFlags: Long, data: ByteArray, streamId: Int = StreamId.VIDEO) {
         val conn = connection ?: return
+        // ★ 流头必须先行：否则宿主会把这一帧的头部字节当 12B 流头解析
+        if (headerSent[streamId] != true) {
+            val n = framesDroppedBeforeHeader.incrementAndGet()
+            if (n <= 3 || n % 100 == 0L) {
+                logger.w(
+                    TAG,
+                    "流[${StreamId.name(streamId)}] 尚未发送流头，丢弃该帧（第 $n 帧）" +
+                        "—— 防止宿主把帧误当流头"
+                )
+            }
+            return
+        }
         conn.send(
             Command.WRTE, streamId, 0,
             FrameCodec.encodeFrame(ptsAndFlags, data, 0, data.size),
