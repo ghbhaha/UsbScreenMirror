@@ -1,9 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  宿主界面（深色，投屏优先）。
+
+  布局分三层，顺序即叠放顺序：
+    1. `surface`  —— 视频（match_parent + center，信箱适配由它自己算；不要改成 wrap_content）
+    2. `status_chip` —— 常驻状态药丸（左上角）。面板收起后仍能看到链路状态，
+       它同时也是"再次打开面板"的显式入口（收起后不做成"无路可回"）。
+    3. `overlay` —— 控制面板，**贴左侧的竖栏**（首帧到达自动收起；点空白处 / 点药丸可再打开）。
+
+  ★ 为什么面板在左侧而不是顶部：手机竖屏镜像在横屏宿主上只占中间一条（实测视频视图
+    448x987，两侧各留 ~735px 信箱边），侧栏正好落在黑边里 —— **完全不挡画面**。
+
+  ⚠️ 除 `surface` 外不要加**不透明且铺满**的背景，否则会把画面盖住。
+
+  ⚠️ `overlay` 自己会吃掉触摸（见 HostActivity.setUpMenuToggle 的说明），
+     所以面板上的空白点击不会误关面板。
+-->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#FF000000">
+    android:background="@color/host_bg">
 
     <!-- 尺寸策略：按视频宽高比自适应，由系统做最终缩放；不调 setFixedSize（计划 4.7） -->
     <com.uav.host.video.AspectRatioSurfaceView
@@ -12,89 +29,228 @@
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
+    <!-- 常驻状态药丸：链路状态 + 重新打开面板的入口 -->
+    <LinearLayout
+        android:id="@+id/status_chip"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="14dp"
+        android:layout_marginTop="14dp"
+        android:background="@drawable/bg_chip"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingTop="7dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="7dp">
+
+        <View
+            android:id="@+id/chip_dot"
+            android:layout_width="9dp"
+            android:layout_height="9dp"
+            android:background="@drawable/dot"
+            android:backgroundTint="@color/host_idle" />
+
+        <TextView
+            android:id="@+id/chip_state"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:includeFontPadding="false"
+            android:maxLines="1"
+            android:text="@string/host_chip_idle"
+            android:textColor="@color/host_text"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 控制面板：左侧竖栏（宽度 300dp ≈ 450px，落在 448px 视频左侧的信箱边之内） -->
     <LinearLayout
         android:id="@+id/overlay"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="top"
-        android:background="#99000000"
+        android:layout_width="300dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:background="@drawable/bg_panel"
         android:orientation="vertical"
-        android:padding="12dp">
+        android:paddingStart="18dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="16dp">
+
+        <!-- 标题栏：强调竖条 + 标题 + 收起 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <View
+                android:layout_width="4dp"
+                android:layout_height="22dp"
+                android:background="@drawable/accent_bar" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:layout_weight="1"
+                android:includeFontPadding="false"
+                android:text="@string/host_title"
+                android:textColor="@color/host_text"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <ImageView
+                android:id="@+id/btn_collapse"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:background="@drawable/bg_tile"
+                android:clickable="true"
+                android:contentDescription="@string/host_btn_collapse"
+                android:focusable="true"
+                android:padding="6dp"
+                android:src="@drawable/ic_arrow_left"
+                android:tint="@color/host_text_dim" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:lineSpacingExtra="2dp"
             android:text="@string/host_status_idle"
-            android:textColor="#FFFFFFFF"
-            android:textSize="14sp"
-            android:textStyle="bold" />
+            android:textColor="@color/host_text"
+            android:textSize="14sp" />
 
-        <TextView
-            android:id="@+id/stats"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:fontFamily="monospace"
-            android:textColor="#FFB0BEC5"
-            android:textSize="11sp" />
-
+        <!-- 链路统计（内嵌卡片，层次比面板再暗一档） -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:orientation="horizontal">
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_card"
+            android:orientation="vertical"
+            android:paddingStart="12dp"
+            android:paddingTop="9dp"
+            android:paddingEnd="12dp"
+            android:paddingBottom="10dp">
 
-            <Button
-                android:id="@+id/btn_scan"
-                android:layout_width="0dp"
+            <TextView
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/host_btn_scan" />
+                android:includeFontPadding="false"
+                android:letterSpacing="0.10"
+                android:text="@string/host_section_link"
+                android:textColor="@color/host_text_faint"
+                android:textSize="10sp" />
 
-            <Button
-                android:id="@+id/btn_force"
-                android:layout_width="0dp"
+            <TextView
+                android:id="@+id/stats"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_weight="1"
-                android:text="@string/host_btn_force" />
-
-            <Button
-                android:id="@+id/btn_replay"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_weight="1"
-                android:text="@string/host_btn_replay" />
+                android:layout_marginTop="5dp"
+                android:fontFamily="monospace"
+                android:lineSpacingExtra="3dp"
+                android:textColor="@color/host_text_dim"
+                android:textSize="11sp" />
         </LinearLayout>
 
-        <!-- 像素模式开关：1:1（省算力）↔ 高清（宿主端缩放更锐）。改后需重开会话生效。 -->
+        <!-- 操作：竖排三行（图标在左、文字在右） -->
         <Button
-            android:id="@+id/btn_pixel"
+            android:id="@+id/btn_scan"
+            style="@style/HostTileRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:drawableStart="@drawable/ic_refresh"
+            android:text="@string/host_btn_scan" />
+
+        <Button
+            android:id="@+id/btn_force"
+            style="@style/HostTileRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="@string/host_btn_pixel_11" />
+            android:drawableStart="@drawable/ic_sync"
+            android:text="@string/host_btn_force" />
+
+        <Button
+            android:id="@+id/btn_replay"
+            style="@style/HostTileRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:drawableStart="@drawable/ic_play"
+            android:text="@string/host_btn_replay" />
+
+        <!-- 画质：分段控件（当前模式一眼可见；点"已选中"的那段是 no-op，不触发重协商） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:includeFontPadding="false"
+                android:text="@string/host_section_quality"
+                android:textColor="@color/host_text_dim"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/btn_pixel_11"
+                    style="@style/HostSegment"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/host_seg_11" />
+
+                <TextView
+                    android:id="@+id/btn_pixel_hd"
+                    style="@style/HostSegment"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="@string/host_seg_hd" />
+            </LinearLayout>
+        </LinearLayout>
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="@string/host_rotation_notice"
-            android:textColor="#FFFFB74D"
+            android:layout_marginTop="8dp"
+            android:lineSpacingExtra="2dp"
+            android:text="@string/host_quality_note"
+            android:textColor="@color/host_text_faint"
             android:textSize="11sp" />
 
-        <!--
-          发现性提示：菜单会被自动隐藏（首帧到达时），得让用户知道怎么叫回来，
-          否则"界面很干净但再也点不出按钮"会被当成 bug。
-        -->
+        <!-- 弹簧：把底部提示推到底，侧栏才像侧栏 -->
+        <Space
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/host_card_stroke" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="@string/host_menu_hint"
-            android:textColor="#FF90A4AE"
+            android:layout_marginTop="10dp"
+            android:lineSpacingExtra="2dp"
+            android:text="@string/host_hint"
+            android:textColor="@color/host_text_faint"
             android:textSize="11sp" />
     </LinearLayout>
 

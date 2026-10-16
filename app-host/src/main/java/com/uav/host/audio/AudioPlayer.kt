@@ -84,6 +84,13 @@ class AudioPlayer(
     @Volatile
     private var lastRmsDbfs = AudioLevel.SILENCE_DBFS
 
+    /** 最近一段 PCM 的电平（dBFS）—— 界面上的"电平"读数用它（内录静默失败时恒为静音值）。 */
+    val lastRms: Float get() = lastRmsDbfs
+
+    /** 解码器实际配置的采样率 / 声道数（界面显示用）。 */
+    val configuredSampleRate: Int get() = sampleRate
+    val configuredChannels: Int get() = channels
+
     private var scratch = ByteArray(0)
 
     /**

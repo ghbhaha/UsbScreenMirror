@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.ColorStateList
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Bundle
@@ -85,10 +86,18 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     /**
      * 像素模式：`true` = 1:1 像素映射（省算力），`false` = 高清旧口径（宿主端缩放更锐）。
      *
-     * 决定 `OPEN` 协商的 `max_size`，所以**改了必须重开会话**才生效（见 [toggleOneToOne]）。
+     * 决定 `OPEN` 协商的 `max_size`，改了要让新参数生效（见 [setPixelMode]）。
      * 初值从 [HostPrefs] 读，切换后写回。
      */
     private var oneToOne = true
+
+    /** 常驻状态药丸的状态（决定圆点颜色）。 */
+    private enum class ChipState { IDLE, CONNECTING, ACTIVE, ERROR }
+
+    private lateinit var chipDot: View
+    private lateinit var chipText: TextView
+    private lateinit var segOneToOne: TextView
+    private lateinit var segHighQuality: TextView
 
     /**
      * 「用户主动切换画质、正在重开会话」标志（10.17）。
@@ -152,18 +161,20 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     private val statsTicker = object : Runnable {
         override fun run() {
             val s = session
-            val text = when {
-                s != null -> s.stats()
+            // ★ 界面与日志刻意用**两种形状**：面板要"一眼看懂"（紧凑分行，见 statsCompact），
+            //   日志要"什么都别漏"（一整行，压测读首末对比）。
+            val uiText = when {
+                s != null -> s.statsCompact()
                 bulkChannel != null -> bulkChannel!!.stats()
-                else -> "no active session"
+                else -> "无活动会话"
             }
-            statsText.text = text
+            statsText.text = uiText
             // 每 5 秒把统计打进日志：5 分钟压测（计划 4.10）要靠它读首末对比，
             // 也避免依赖 UI 取值（画面持续刷新时 uiautomator dump 会拿不到稳定帧）。
             // release 下关掉：发布包每 5 秒刷一条 logcat 没有意义（计划 5.2）。
             tickCount++
             if (DebugTools.ENABLED && tickCount % STATS_LOG_EVERY_TICKS == 0L) {
-                logger.i(TAG, "STATS $text")
+                logger.i(TAG, "STATS ${s?.stats() ?: uiText}")
             }
             mainHandler.postDelayed(this, STATS_INTERVAL_MS)
         }
@@ -257,6 +268,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         statusText = findViewById(R.id.status)
         statsText = findViewById(R.id.stats)
         overlayView = findViewById(R.id.overlay)
+        chipDot = findViewById(R.id.chip_dot)
+        chipText = findViewById(R.id.chip_state)
+        segOneToOne = findViewById(R.id.btn_pixel_11)
+        segHighQuality = findViewById(R.id.btn_pixel_hd)
         rootView = findViewById(R.id.root)
 
         surfaceView.holder.addCallback(surfaceCallback)
@@ -272,11 +287,15 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         // Scan / Retry 与 Force handshake 是**功能**而非调试入口
         // （手机被别的宿主 App 切成配件模式时，用户需要它们自救），release 保留。
-        findViewById<Button>(R.id.btn_scan).setOnClickListener { router?.scanAndAttach() }
+        findViewById<Button>(R.id.btn_scan).setOnClickListener {
+            setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
+            router?.scanAndAttach()
+        }
         findViewById<Button>(R.id.btn_force).setOnClickListener {
             stopSession()
             forceRetried = true
             fastPathUnverified = false
+            setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
             router?.scanAndAttach(forceHandshake = true)
         }
 
@@ -292,8 +311,16 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // 像素模式是**用户可见的画质选择**（不是调试入口）—— release 也保留。
         //   1:1 = 按宿主显示区编码（省算力，但无超采样）；高清 = 按面板长边编高分辨率、宿主端缩下去。
         oneToOne = HostPrefs.oneToOne(this)
-        updatePixelButton()
-        findViewById<Button>(R.id.btn_pixel).setOnClickListener { toggleOneToOne() }
+        applyPixelModeUi()
+        segOneToOne.setOnClickListener { setPixelMode(true) }
+        segHighQuality.setOnClickListener { setPixelMode(false) }
+
+        // 常驻状态药丸：面板收起后仍能看到链路状态；点它 = 打开面板（收起后不会"无路可回"）
+        findViewById<View>(R.id.status_chip).setOnClickListener { setMenuVisible(!menuShown) }
+        // 面板右上角：收起
+        findViewById<View>(R.id.btn_collapse).setOnClickListener { setMenuVisible(false) }
+
+        setChip(ChipState.IDLE, getString(R.string.host_chip_idle))
 
         router = UsbAttachRouter(this, logger, this).also { it.start() }
 
@@ -380,29 +407,62 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         requestRenegotiate()
     }
 
-    // ------------------------------------------------------------------ 像素模式开关（10.17）
+    // ------------------------------------------------------------------ 像素模式（10.17 / 10.18）
 
-    /** 把按钮文字刷成"当前模式"。 */
-    private fun updatePixelButton() {
-        findViewById<Button>(R.id.btn_pixel).text =
-            getString(if (oneToOne) R.string.host_btn_pixel_11 else R.string.host_btn_pixel_hd)
+    /** 把分段控件刷成"当前模式"：选中段用强调色实底，另一段留描边。 */
+    private fun applyPixelModeUi() {
+        val onBg = getDrawable(R.drawable.bg_segment_on)
+        val offBg = getDrawable(R.drawable.bg_segment_off)
+        segOneToOne.background = if (oneToOne) onBg else offBg
+        segHighQuality.background = if (oneToOne) offBg else onBg
+        segOneToOne.setTextColor(getColor(if (oneToOne) R.color.host_text else R.color.host_text_dim))
+        segHighQuality.setTextColor(getColor(if (oneToOne) R.color.host_text_dim else R.color.host_text))
     }
 
     /**
-     * 切换 1:1 / 高清像素模式。
+     * 切到指定像素模式。
      *
-     * `max_size` 只在 `OPEN` 时协商一次，所以改完必须让新参数生效 —— 走 [requestRenegotiate]：
-     * **优先原地重发 OPEN**（10.18，<1s、不重连、不会撞上推流字节），失败才回退断开重连。
+     * ⚠️ **已经是该模式就直接返回** —— 点"已选中"的那一段必须是无副作用的 no-op，
+     * 否则手滑点一下就会白白触发一次重协商（画面闪一下）。
+     *
+     * `max_size` 只在 `OPEN` 时协商一次，所以改完要让新参数生效 —— 走 [requestRenegotiate]：
+     * **优先原地重发 OPEN**（10.18，约 2~3s、不重连），失败才回退断开重连。
      */
-    private fun toggleOneToOne() {
-        oneToOne = !oneToOne
+    private fun setPixelMode(enabled: Boolean) {
+        if (oneToOne == enabled) return
+        oneToOne = enabled
         HostPrefs.setOneToOne(this, oneToOne)
-        updatePixelButton()
-        logger.i(TAG, "像素模式切换 → ${if (oneToOne) "1:1（按显示区编码）" else "高清（按面板长边编码）"}")
+        applyPixelModeUi()
+        logger.i(TAG, "像素模式切换 → ${if (enabled) "1:1（按显示区编码）" else "高清（按面板长边编码）"}")
         statusText.text = getString(
-            if (oneToOne) R.string.host_status_switch_11 else R.string.host_status_switch_hd
+            if (enabled) R.string.host_status_switch_11 else R.string.host_status_switch_hd
         )
+        setChip(ChipState.CONNECTING, getString(R.string.host_chip_renegotiating))
         requestRenegotiate()
+    }
+
+    /**
+     * 刷新左上角常驻状态药丸（圆点颜色 + 短文案）。
+     *
+     * 线程安全：会话回调来自 worker 线程，这里自己判线程再转 UI 线程
+     * （与 [setMenuVisible] 同一约定，免得每个调用点都包一层 `runOnUiThread`）。
+     */
+    private fun setChip(state: ChipState, text: String) {
+        if (!::chipText.isInitialized) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { setChip(state, text) }
+            return
+        }
+        chipText.text = text
+        val color = getColor(
+            when (state) {
+                ChipState.IDLE -> R.color.host_idle
+                ChipState.CONNECTING -> R.color.host_warn
+                ChipState.ACTIVE -> R.color.host_ok
+                ChipState.ERROR -> R.color.host_err
+            }
+        )
+        chipDot.backgroundTintList = ColorStateList.valueOf(color)
     }
 
     /**
@@ -487,25 +547,34 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             return
         }
         menuShown = visible
+        // 面板是**左侧竖栏**，所以从左边"滑入 / 滑回"一点距离（比纯淡入淡出更像一块抽屉）。
+        // 位移取固定 16dp，不依赖测量宽度 —— 首次展开时 width 还是 0。
+        val slidePx = 16f * resources.displayMetrics.density
 
         if (visible) {
             overlayView.animate().cancel()
             overlayView.visibility = View.VISIBLE
             if (animate) {
                 overlayView.alpha = 0f
-                overlayView.animate().alpha(1f).setDuration(MENU_ANIM_MS).start()
+                overlayView.translationX = -slidePx
+                overlayView.animate().alpha(1f).translationX(0f).setDuration(MENU_ANIM_MS).start()
             } else {
                 overlayView.alpha = 1f
+                overlayView.translationX = 0f
             }
         } else if (animate) {
             overlayView.animate().cancel()
-            overlayView.animate().alpha(0f).setDuration(MENU_ANIM_MS).withEndAction {
+            overlayView.animate().alpha(0f).translationX(-slidePx).setDuration(MENU_ANIM_MS).withEndAction {
                 // 收起动画期间可能又被叫回来（连着点两下），收尾时再确认一次
-                if (!menuShown) overlayView.visibility = View.GONE
+                if (!menuShown) {
+                    overlayView.visibility = View.GONE
+                    overlayView.translationX = 0f
+                }
             }.start()
         } else {
             overlayView.animate().cancel()
             overlayView.visibility = View.GONE
+            overlayView.translationX = 0f
         }
     }
 
@@ -787,7 +856,11 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     override fun onStatus(text: String) {
         // 会话真正建立起来 -> 快路径已验证通过，撤销自愈待办
-        if (text.contains("会话已建立")) fastPathUnverified = false
+        if (text.contains("会话已建立")) {
+            fastPathUnverified = false
+            // 已握手、等画面 —— 药丸先显示"连接中"，首帧/尺寸就绪后再转"投屏中"
+            setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
+        }
         runOnUiThread { statusText.text = text }
     }
 
@@ -816,6 +889,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         //   这里清零 id，等拿到视频尺寸（= 手机屏幕尺寸 + 视频方向都已知）时重新注册。
         //   （触点状态**不清** —— 重连后要按它补发"还按着的那些手指"。）
         hidTouch?.onLinkReady(connection)
+        setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
 
         val raw = BulkByteChannel(connection, pair, logger)
         // ★ 先把上一次会话残留在 FIFO 里的字节丢掉，再开新会话。
@@ -866,6 +940,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // ★ 出错必须把菜单叫回来：面板收起时错误信息是看不见的，
         //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
         runOnUiThread { statusText.text = "ERROR: $message" }
+        setChip(ChipState.ERROR, getString(R.string.host_chip_error))
         setMenuVisible(true)
         logger.e(TAG, message, cause)
 
@@ -898,6 +973,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     private fun onDetached(device: UsbDevice?) {
         stopSession()
         statusText.text = "USB 已拔出，请重新插线或点 Scan/Retry"
+        setChip(ChipState.IDLE, getString(R.string.host_chip_idle))
         // 这条提示藏在收起的菜单里就等于没提示
         setMenuVisible(true)
     }
@@ -908,6 +984,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // 尺寸（重）配置成功 = 重协商已见效 → 立刻清掉"切换中"标志，
         // 免得它一直挂到 45s 兜底、把这段窗口里的真错误也吞掉。
         expectingRestart = false
+        setChip(ChipState.ACTIVE, getString(R.string.host_chip_mirroring))
         runOnUiThread { surfaceView.setVideoSize(width, height) }
         // ★ 视频尺寸是**触摸坐标空间**的权威线索：手机屏幕的物理尺寸只在 CNXN 报一次，
         //   旋转后不会重报，只能靠视频方向推出它当前的长宽（见 TouchMapper）。
@@ -919,6 +996,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     override fun onFirstFrame() {
         // 重开会话成功（画面出来了）→ 清掉"切换中"标志
         expectingRestart = false
+        setChip(ChipState.ACTIVE, getString(R.string.host_chip_mirroring))
         runOnUiThread { statusText.text = "投屏中（首帧已输出）" }
         // 画面出来了就把菜单收起来，让视频干净地占满整屏（只自动收一次，见 menuAutoCollapsed）。
         // 想调参数时点一下画面外的空白处即可叫回来。
@@ -929,6 +1007,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     override fun onClosed(reason: String) {
+        setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
         runOnUiThread { statusText.text = "已断开：$reason" }
         setMenuVisible(true)
     }

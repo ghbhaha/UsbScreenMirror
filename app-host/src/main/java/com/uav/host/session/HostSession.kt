@@ -24,6 +24,7 @@ import com.uav.protocol.d
 import com.uav.protocol.e
 import com.uav.protocol.i
 import com.uav.protocol.w
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -805,11 +806,75 @@ class HostSession(
             "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | " +
             "audioQueue=$audioQueue | ${audio?.stats() ?: "no audio"} | ${latencyLine()}"
 
+    /**
+     * **界面用**的紧凑统计：几行短句，而不是日志那一整行。
+     *
+     * 日志（[stats]）要的是"什么都别漏"，界面要的是"一眼看懂"—— 两者分开，
+     * 面板上的统计卡片用这个，logcat 与压测仍读 [stats]。
+     *
+     * 形状（最多 4 行，**刻意控制在 300dp 侧栏不折行**）：
+     * ```
+     * 编码 456x992 · 1:1 @1920x987
+     * 帧 544 · 丢帧 0 · 队列 0/4
+     * 延迟 p50 64ms · skew ±2ms
+     * 音频 48k/2ch · 电平 -12.3dBFS
+     * ```
+     */
+    fun statsCompact(): String {
+        if (replay) return "回放模式（非实时链路）"
+        val sb = StringBuilder()
+
+        // 1) 编码尺寸与画质口径（手机屏尺寸不在这儿重复 —— CNXN 那行已经有）
+        sb.append("编码 ").append(decoder?.size?.let { "${it.first}x${it.second}" } ?: "-")
+            .append(" · ")
+            .append(if (negotiatedDisplayArea.isEmpty()) "高清(面板长边)" else "1:1 @$negotiatedDisplayArea")
+
+        // 2) 帧 / 丢帧 / 队列
+        sb.append('\n').append("帧 ").append(decoder?.framesDecoded?.get() ?: 0L)
+            .append(" · 丢帧 ").append(videoQueue.droppedTotal)
+            .append(" · 队列 ").append(videoQueue.size).append('/').append(videoQueue.capacity)
+
+        // 3) 延迟。
+        //    ⚠️ 标定本身可能很糟：CNXN 交换若撞上"手机端正在启动会话"（实测等 2.8s），
+        //    时钟偏移的不确定度就有 ±1.4s —— 这时 p50 是个**假数**，宁可如实说"不可靠"，
+        //    也不要让人以为 1.4s 是真延迟（真值只能用 skew 小的会话量，见 10.6 口径）。
+        sb.append('\n').append("延迟 ")
+        val off = clockOffset
+        when {
+            off == null -> sb.append("未标定")
+            off.uncertaintyNanos > CLOCK_TRUSTWORTHY_NANOS ->
+                sb.append("标定不可靠（skew ±").append(off.uncertaintyNanos / 1_000_000).append("ms）")
+            else -> sb.append("p50 ").append(ms(latencyFresh.percentileNanos(0.50)))
+                .append(" · skew ±").append(off.uncertaintyNanos / 1_000_000).append("ms")
+        }
+
+        // 4) 音频（电平是判断"内录真在录"的唯一可靠读数）
+        sb.append('\n').append("音频 ")
+        val a = audio
+        when {
+            a == null -> sb.append(if (audioEnabled) "未起（等待中）" else "未启用")
+            else -> sb.append(a.configuredSampleRate / 1000).append("k/").append(a.configuredChannels)
+                .append("ch · 电平 ").append(String.format(Locale.US, "%.1f", a.lastRms)).append("dBFS")
+        }
+        return sb.toString()
+    }
+
+    private fun ms(nanos: Long): String = "${nanos / 1_000_000}ms"
+
     companion object {
         const val TAG = "UAV-Host"
 
         /** 握手各阶段等待上限（计划 4.6：OPEN 应答 5s）。 */
         const val TIMEOUT_MS = 5_000L
+
+        /**
+         * 时钟标定的"可信"阈值（不确定度）。
+         *
+         * CNXN 交换的往返时间就是偏移估计的不确定度来源 —— 实测撞上"手机端正在启动会话"时
+         * 往返可达 2.8s（skew ±1.4s），此时延迟读数是假数。超过这个阈值就**不显示 p50**，
+         * 只显示"标定不可靠"，免得把 1.4s 当成真延迟（真值见 docs 10.6 口径：fresh p50 64ms）。
+         */
+        const val CLOCK_TRUSTWORTHY_NANOS = 200_000_000L
 
         /** 消费线程轮询间隔。 */
         const val POLL_MS = 500L

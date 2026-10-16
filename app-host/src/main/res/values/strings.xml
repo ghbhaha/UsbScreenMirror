@@ -13,17 +13,43 @@
 -->
 <resources>
     <string name="app_name">UAV Host</string>
+
+    <!-- 面板标题栏 -->
+    <string name="host_title">USB 投屏</string>
+    <string name="host_btn_collapse">收起面板</string>
+
+    <!-- 常驻状态药丸（短词，显示在画面左上角） -->
+    <string name="host_chip_idle">空闲</string>
+    <string name="host_chip_connecting">连接中</string>
+    <string name="host_chip_mirroring">投屏中</string>
+    <string name="host_chip_renegotiating">重协商</string>
+    <string name="host_chip_error">出错</string>
+
+    <!-- 状态行 -->
     <string name="host_status_idle">空闲中 —— 请把配件手机插上来</string>
+
+    <!-- 操作（磁贴：图标在上、文字在下，文案尽量短） -->
     <string name="host_btn_scan">扫描 / 重试</string>
     <string name="host_btn_force">强制重握手</string>
-    <string name="host_btn_replay">回放 .uav 抓流</string>
-    <string name="host_btn_pixel_11">画质：1:1 像素（点此切高清）</string>
-    <string name="host_btn_pixel_hd">画质：高清（点此切 1:1）</string>
+    <string name="host_btn_replay">回放抓流</string>
+
+    <!-- 画质分段控件 -->
+    <string name="host_section_quality">画质</string>
+    <string name="host_seg_11">1:1 像素</string>
+    <string name="host_seg_hd">高清</string>
+    <string name="host_quality_note">1:1 按宿主显示区编码（省算力）；高清按面板长边编码、由宿主端缩放，观感更锐。</string>
+
+    <!-- 统计卡片标题 -->
+    <string name="host_section_link">链路状态</string>
+
+    <!-- 切换画质时的状态行（见 docs/实施计划.md 10.17 / 10.18） -->
     <string name="host_status_switch_11">已切到 1:1 像素模式，正在重协商…</string>
     <string name="host_status_switch_hd">已切到高清模式（按面板长边编码），正在重协商…</string>
     <string name="host_status_restarting">正在重协商…（原地重发 OPEN，手机重建编码器）</string>
-    <!-- 旋转已支持（见 docs/实施计划.md 10.7）；这里提示的是前提条件，避免"转不动"被误判成 bug -->
-    <string name="host_rotation_notice">已支持旋转 —— 请在手机上开启自动旋转。</string>
-    <!-- 菜单切换方式的提示（菜单会在首帧到达时自动隐藏） -->
-    <string name="host_menu_hint">点画面外的空白处 显示 / 隐藏本菜单</string>
+
+    <!--
+      底部提示：面板会在首帧到达时自动收起，得让用户知道怎么叫回来；
+      "自动旋转"是已支持功能（计划 10.7）的前提条件，写出来避免"转不动"被当成 bug。
+    -->
+    <string name="host_hint">点画面外的空白处显示 / 隐藏此面板 · 手机上需开启自动旋转</string>
 </resources>
