@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#FF000000">
@@ -74,6 +75,18 @@
             android:layout_marginTop="4dp"
             android:text="@string/host_rotation_notice"
             android:textColor="#FFFFB74D"
+            android:textSize="11sp" />
+
+        <!--
+          发现性提示：菜单会被自动隐藏（首帧到达时），得让用户知道怎么叫回来，
+          否则"界面很干净但再也点不出按钮"会被当成 bug。
+        -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/host_menu_hint"
+            android:textColor="#FF90A4AE"
             android:textSize="11sp" />
     </LinearLayout>
 

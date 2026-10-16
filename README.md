@@ -155,6 +155,11 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
   别再靠拔插去"确认"问题，用 `docs/实施计划.md` 10.8 的 fd 计数法。
 - **供电与 OTG 常互斥**：手机当宿主时一边给配件供电、一边自己掉电。
   长时使用建议用 **OTG + 充电二合一线（带 PD 口）**。
+- ⚠️ **宿主设备可能自己 kernel panic 重启**（实测环境 BOE P40UCH / MT8781V / 内核 5.10.226）：
+  一天内连续三次启动的原因都是 `kernel_panic,bug`（其中一次只活了 111 秒），
+  而同一时刻手机端启动原因完全正常 —— 是**宿主设备的固件/内核问题，App 层解决不了**。
+  宿主突然重启时先读 `persist.sys.boot.reason.history` 再谈排查，
+  **别误判成我们的 bug**。见 `docs/排错手册.md` 3.9。
 - **别随手 `am force-stop` 手机端 App**：App 会进入 stopped 状态，系统此后不再用隐式 intent
   （配件 attach）拉起它，很容易把「链路不通」误判成软件 bug。
 - **Git Bash 下操作 adb 要设 `export MSYS_NO_PATHCONV=1`**：否则 Android 绝对路径会被改写成 Windows 路径。
@@ -224,6 +229,9 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
   `docs/实施计划.md` **10.13**。⚠️ 只能捕获 `USAGE_MEDIA`/`USAGE_GAME`/`USAGE_UNKNOWN`；
   通话、通知、铃声，以及声明了 `allowAudioPlaybackCapture="false"` 的应用（银行/DRM）
   **按设计录不到**。精细 A/V 同步尚未做。
+- **点画面外的空白处可显示/隐藏宿主菜单**：视频区内的触摸全部留给"反向控制手机"，
+  左/右黑边（信箱边）上的点击才是菜单开关；首帧到达时菜单自动收起一次，
+  出错/断开时自动展开。见 `docs/实施计划.md` **10.14**。
 - 无鼠标/键盘输入。
 
 - 无传输加密——安全性完全依赖**物理接触**。

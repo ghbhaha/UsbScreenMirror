@@ -19,4 +19,6 @@
     <string name="host_btn_replay">回放 .uav 抓流</string>
     <!-- 旋转已支持（见 docs/实施计划.md 10.7）；这里提示的是前提条件，避免"转不动"被误判成 bug -->
     <string name="host_rotation_notice">已支持旋转 —— 请在手机上开启自动旋转。</string>
+    <!-- 菜单切换方式的提示（菜单会在首帧到达时自动隐藏） -->
+    <string name="host_menu_hint">点画面外的空白处 显示 / 隐藏本菜单</string>
 </resources>

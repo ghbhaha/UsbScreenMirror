@@ -14,6 +14,7 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.Surface
 import android.view.View
+import android.view.ViewConfiguration
 import android.widget.Button
 import android.widget.TextView
 import androidx.core.content.IntentCompat
@@ -48,6 +49,27 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     private lateinit var surfaceView: AspectRatioSurfaceView
     private lateinit var statusText: TextView
     private lateinit var statsText: TextView
+
+    /** 顶部的整块界面（状态 + 统计 + 按钮）；可以整体收起，让画面干净地占满。 */
+    private lateinit var overlayView: View
+
+    /** 菜单当前是否展开。 */
+    private var menuShown = true
+
+    /**
+     * 「首帧到达时自动收起一次」是否已经做过。
+     *
+     * 只做**一次**而不是每次首帧都收：重连后画面恢复同样会触发首帧，
+     * 那时用户若正开着菜单看统计，被强行收掉会很恼人。
+     */
+    private var menuAutoCollapsed = false
+
+    /** 空白区触摸的按下点，用来判断"这是点击"还是"从空白区划出去"。 */
+    private var menuDownX = 0f
+    private var menuDownY = 0f
+
+    /** 判定"点击"的最大位移平方（`ViewConfiguration` 的 touchSlop 平方，免开方）。 */
+    private var menuSlopSq = 0f
 
     private var router: UsbAttachRouter? = null
     private var session: HostSession? = null
@@ -205,8 +227,11 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         surfaceView = findViewById(R.id.surface)
         statusText = findViewById(R.id.status)
         statsText = findViewById(R.id.stats)
+        overlayView = findViewById(R.id.overlay)
 
         surfaceView.holder.addCallback(surfaceCallback)
+
+        setUpMenuToggle()
 
         // 触摸注入：把宿主屏幕上的触摸转发成手机上的触摸（路线图 P1）。
         hidTouch = HidTouchController(logger)
@@ -242,6 +267,98 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         mainHandler.postDelayed(usbPoller, POLL_INTERVAL_MS)
 
         handleIntent(intent)
+    }
+
+    // ------------------------------------------------------------------ 菜单显隐（点空白处切换）
+
+    /**
+     * 接上「点空白处显示 / 隐藏菜单」。
+     *
+     * ## 为什么"空白处"就是信箱边，且这里不会和触摸转发打架
+     *
+     * 触摸事件的派发是**自上而下命中**的：某个位置的触摸只有**没有任何子 View 消费**时
+     * 才会落到根容器的 `OnTouchListener` 上。而这块屏幕上的分工恰好是干净的：
+     *
+     * | 区域 | 谁消费 | 效果 |
+     * | --- | --- | --- |
+     * | 视频显示区 | `SurfaceView`（已在 `onCreate` 里挂了转发 listener） | 转发成手机上的触摸 |
+     * | 顶部菜单面板 | 面板自己（见下） | 按钮可点；面板上的空白点击**不会**误关菜单 |
+     * | 其余（信箱边） | 根容器 ← 本方法 | 切换菜单 |
+     *
+     * 信箱边**本来就不转发**（`TouchMapper` 会把显示区之外的触点判为忽略），
+     * 所以拿它当开关不会牺牲任何已有功能。
+     *
+     * ⚠️ 已知边界：当视频宽高比与宿主屏幕**完全一致**时不存在信箱边，
+     *    也就没有空白处可点 —— 但那种情况下画面本来就占满整屏、无需收起菜单。
+     */
+    private fun setUpMenuToggle() {
+        menuSlopSq = ViewConfiguration.get(this).scaledTouchSlop.toFloat().let { it * it }
+
+        // 菜单面板自己吃掉触摸：否则点在面板的空白处会被根容器当成"点空白处"而把菜单关掉
+        overlayView.setOnTouchListener { _, _ -> true }
+
+        findViewById<View>(R.id.root).setOnTouchListener { _, event -> handleBlankAreaTouch(event) }
+    }
+
+    /**
+     * 空白区的触摸 → 切换菜单。
+     *
+     * 只在"按下与抬起基本落在同一处"时才算点击 —— 否则从空白区划出去也会误触发。
+     * 一律返回 true：这块区域没有别的用途，吃掉事件可避免继续上抛。
+     */
+    private fun handleBlankAreaTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                menuDownX = event.x
+                menuDownY = event.y
+            }
+
+            MotionEvent.ACTION_UP -> {
+                val dx = event.x - menuDownX
+                val dy = event.y - menuDownY
+                if (dx * dx + dy * dy <= menuSlopSq) toggleMenu()
+            }
+        }
+        return true
+    }
+
+    private fun toggleMenu() {
+        setMenuVisible(!menuShown)
+        logger.i(TAG, "菜单已${if (menuShown) "展开" else "收起"}（点了画面外的空白处）")
+    }
+
+    /**
+     * 显示 / 隐藏菜单（状态 + 统计 + 按钮那一整块）。
+     *
+     * 线程安全：`onError` / `onClosed` 这些会话回调来自 worker 线程，
+     * 所以这里自己判线程再转 UI 线程，免得每个调用点都包一层 `runOnUiThread`。
+     */
+    private fun setMenuVisible(visible: Boolean, animate: Boolean = true) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { setMenuVisible(visible, animate) }
+            return
+        }
+        menuShown = visible
+
+        if (visible) {
+            overlayView.animate().cancel()
+            overlayView.visibility = View.VISIBLE
+            if (animate) {
+                overlayView.alpha = 0f
+                overlayView.animate().alpha(1f).setDuration(MENU_ANIM_MS).start()
+            } else {
+                overlayView.alpha = 1f
+            }
+        } else if (animate) {
+            overlayView.animate().cancel()
+            overlayView.animate().alpha(0f).setDuration(MENU_ANIM_MS).withEndAction {
+                // 收起动画期间可能又被叫回来（连着点两下），收尾时再确认一次
+                if (!menuShown) overlayView.visibility = View.GONE
+            }.start()
+        } else {
+            overlayView.animate().cancel()
+            overlayView.visibility = View.GONE
+        }
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -575,7 +692,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     override fun onError(message: String, cause: Throwable?) {
+        // ★ 出错必须把菜单叫回来：面板收起时错误信息是看不见的，
+        //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
         runOnUiThread { statusText.text = "ERROR: $message" }
+        setMenuVisible(true)
         logger.e(TAG, message, cause)
 
         // ★ 自动重连（P0）：链路错误后**必须**把会话清掉 ——
@@ -607,6 +727,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     private fun onDetached(device: UsbDevice?) {
         stopSession()
         statusText.text = "USB 已拔出，请重新插线或点 Scan/Retry"
+        // 这条提示藏在收起的菜单里就等于没提示
+        setMenuVisible(true)
     }
 
     // ------------------------------------------------------------------ session 回调
@@ -622,10 +744,17 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     override fun onFirstFrame() {
         runOnUiThread { statusText.text = "投屏中（首帧已输出）" }
+        // 画面出来了就把菜单收起来，让视频干净地占满整屏（只自动收一次，见 menuAutoCollapsed）。
+        // 想调参数时点一下画面外的空白处即可叫回来。
+        if (!menuAutoCollapsed) {
+            menuAutoCollapsed = true
+            setMenuVisible(false)
+        }
     }
 
     override fun onClosed(reason: String) {
         runOnUiThread { statusText.text = "已断开：$reason" }
+        setMenuVisible(true)
     }
 
     // ------------------------------------------------------------------ 回放
@@ -754,6 +883,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         /** 排障点按的默认按住时长：够手机侧产生明确的按下/抬起两条事件。 */
         const val DEFAULT_TAP_HOLD_MS = 80
+
+        /** 菜单展开/收起的动画时长。够快（不拖沓）又够慢（不是硬闪）。 */
+        const val MENU_ANIM_MS = 160L
 
         /** adb 调试入口用的 extra：`--ez no_audio true`（关掉音频，A/B 对比用）。 */
         const val EXTRA_NO_AUDIO = "no_audio"

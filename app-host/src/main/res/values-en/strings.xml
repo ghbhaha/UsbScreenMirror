@@ -7,4 +7,5 @@
     <string name="host_btn_force">Force rehandshake</string>
     <string name="host_btn_replay">Replay .uav dump</string>
     <string name="host_rotation_notice">Rotation supported — enable auto-rotate on the phone.</string>
+    <string name="host_menu_hint">Tap outside the video to show / hide this menu</string>
 </resources>
