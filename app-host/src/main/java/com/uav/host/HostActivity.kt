@@ -102,6 +102,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     /** 切换重开的兜底清理：即使一直没出画面，也不能让标志永久挂着掩盖真错误。 */
     private val clearExpectingRestartDelayed = Runnable { expectingRestart = false }
 
+    /** 同一时刻只允许一次"尺寸重协商"在飞（布局回调可能连发）。 */
+    private val renegotiating = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /**
      * 触摸注入控制器（路线图 P1「输入通道」）：把**宿主屏幕上的触摸**转发成手机上的触摸。
      *
@@ -350,9 +353,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     /**
      * 显示区变了 → 该编的尺寸也变 → 重启会话让新尺寸生效。
      *
-     * 为什么是"重启会话"而不是"发个新参数"：尺寸是在 `OPEN` 里协商的，手机端拿到新参数后会
-     * 重建编码器 —— 而重建的入口只有两条（首次 OPEN、本机旋转），没有"改尺寸"的独立消息。
-     * 重启走的是已验过的自动重连路径（约 1.5s、不重新弹录屏授权），代价可控。
+     * 为什么是"重协商"而不是"改个状态"：尺寸是在 `OPEN` 里协商的，手机端拿到新参数后才配编码器。
+     * 10.18 起优先**原地重发 OPEN**（<1s、不重连）；失败才回退断开重连（约 1.5s，不重新弹录屏授权）。
      */
     private fun renegotiateForDisplayArea() {
         // 高清模式（1:1 关）下尺寸不依赖显示区，显示区变化无需重建
@@ -372,12 +374,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         logger.i(
             TAG,
-            "宿主显示区 ${area[0]}x${area[1]} 变化 -> 1:1 目标 max_size $have -> $want（差 ${(diff * 100).toInt()}%），重建会话"
+            "宿主显示区 ${area[0]}x${area[1]} 变化 -> 1:1 目标 max_size $have -> $want（差 ${(diff * 100).toInt()}%），重协商"
         )
-        statusText.text = "显示区变了，按新尺寸重建会话…"
-        stopSession()
-        // 交给轮询/直接扫描接管；新会话会按当前显示区重新算尺寸
-        router?.scanAndAttach()
+        statusText.text = "显示区变了，按新尺寸重协商…"
+        requestRenegotiate()
     }
 
     // ------------------------------------------------------------------ 像素模式开关（10.17）
@@ -389,25 +389,63 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     /**
-     * 切换 1:1 / 高清像素模式，并**重开会话**让新口径生效。
+     * 切换 1:1 / 高清像素模式。
      *
-     * 为什么必须重开会话：`max_size` 只在 `OPEN` 时协商一次，手机端拿到后才配编码器；
-     * 没有"改尺寸"的独立消息。重启走已验过的自动重连路径（≈1.5s，不重新弹录屏授权）。
+     * `max_size` 只在 `OPEN` 时协商一次，所以改完必须让新参数生效 —— 走 [requestRenegotiate]：
+     * **优先原地重发 OPEN**（10.18，<1s、不重连、不会撞上推流字节），失败才回退断开重连。
      */
     private fun toggleOneToOne() {
         oneToOne = !oneToOne
         HostPrefs.setOneToOne(this, oneToOne)
         updatePixelButton()
-        logger.i(TAG, "像素模式切换 → ${if (oneToOne) "1:1（按显示区编码）" else "高清（按面板长边编码）"}，重开会话")
+        logger.i(TAG, "像素模式切换 → ${if (oneToOne) "1:1（按显示区编码）" else "高清（按面板长边编码）"}")
         statusText.text = getString(
             if (oneToOne) R.string.host_status_switch_11 else R.string.host_status_switch_hd
         )
-        // 标记"预期内重开"：期间瞬时握手失败不弹 ERROR（见 onError），45s 兜底清除
+        requestRenegotiate()
+    }
+
+    /**
+     * 请求一次"尺寸重协商"：优先**原地重发 OPEN**（10.18），失败再回退"断开 + 重连"。
+     *
+     * ⚠️ 不能在主线程做 `renegotiate()` —— 它会等手机回 `OKAY`（最长 `TIMEOUT_MS`）。
+     * 统一丢到后台线程；回退路径里的 `stopSession()` 有 UI 调用，再 post 回主线程。
+     */
+    private fun requestRenegotiate() {
+        val s = session
+        if (s == null) {
+            // 没有活动会话（还没连上）→ 直接走扫描/重连
+            stopSession()
+            router?.scanAndAttach()
+            return
+        }
+        // 同一时刻只允许一次重协商，避免布局回调连发把手机端反复重建
+        if (!renegotiating.compareAndSet(false, true)) {
+            logger.i(TAG, "已有重协商在进行，忽略这次请求")
+            return
+        }
+        // 标记"预期内重开"：期间瞬时失败不弹 ERROR（见 onError），45s 兜底清除
         expectingRestart = true
         mainHandler.removeCallbacks(clearExpectingRestartDelayed)
         mainHandler.postDelayed(clearExpectingRestartDelayed, RESTART_FLAG_TIMEOUT_MS)
-        stopSession()
-        router?.scanAndAttach()
+
+        Thread({
+            val ok = try {
+                s.renegotiate()
+            } catch (t: Throwable) {
+                logger.w(TAG, "原地重协商异常: ${t.message}", t)
+                false
+            } finally {
+                renegotiating.set(false)
+            }
+            if (!ok) {
+                logger.w(TAG, "原地重协商未成功 → 回退到断开重连")
+                runOnUiThread {
+                    stopSession()
+                    router?.scanAndAttach()
+                }
+            }
+        }, "uav-renegotiate").apply { isDaemon = true }.start()
     }
 
     /**
@@ -803,8 +841,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             audioDelayMs = audioDelayMs,
             // ★ 1:1 像素映射：把"视频显示区的可用区"交给会话去算编码尺寸（取当前值）
             displayArea = { rootArea() },
-            // ★ 像素模式开关（10.17）：关掉则退回旧口径、不下发显示区
-            oneToOne = oneToOne,
+            // ★ 像素模式：传**回调**而非当前值 —— 原地重协商要在同一会话里取"此刻"的模式
+            oneToOne = { oneToOne },
         )
         session = s
         s.start()
@@ -867,6 +905,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     // ------------------------------------------------------------------ session 回调
 
     override fun onVideoSize(width: Int, height: Int) {
+        // 尺寸（重）配置成功 = 重协商已见效 → 立刻清掉"切换中"标志，
+        // 免得它一直挂到 45s 兜底、把这段窗口里的真错误也吞掉。
+        expectingRestart = false
         runOnUiThread { surfaceView.setVideoSize(width, height) }
         // ★ 视频尺寸是**触摸坐标空间**的权威线索：手机屏幕的物理尺寸只在 CNXN 报一次，
         //   旋转后不会重报，只能靠视频方向推出它当前的长宽（见 TouchMapper）。

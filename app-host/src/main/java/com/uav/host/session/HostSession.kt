@@ -80,14 +80,13 @@ class HostSession(
     private val displayArea: () -> IntArray? = { null },
 
     /**
-     * 是否按 **1:1 像素映射**协商编码尺寸（10.15 的默认行为；10.17 起可关）。
+     * **当前**是否按 1:1 像素映射协商编码尺寸（10.17 起可切；10.18 起可原地重协商）。
      *
-     * - `true`：编码尺寸 = 画面在 [displayArea] 里适配后的大小，并把显示区下发（手机旋转自算）。
-     * - `false`：退回旧口径 `align8(min(手机长边, 宿主面板长边))`，**不下发显示区** ——
-     *   手机端 `ParsedOpen.encodeMaxSize` 因为拿不到显示区会自动回退到 `max_size`，
-     *   于是按高分辨率编码、由宿主端缩下去（效果上等于超采样，观感更锐）。
+     * 做成**回调**而不是构造时捕获的布尔值：原地重协商会在**同一条会话**里重新下发 OPEN，
+     * 必须取"此刻"的模式 —— 用捕获值会一直按会话创建时的口径算（真机踩到：
+     * 用户切到 1:1 后重协商仍下发 `max_size=1920 display_area=-`）。
      */
-    private val oneToOne: Boolean = true,
+    private val oneToOne: () -> Boolean = { true },
 ) {
 
     interface Listener {
@@ -124,7 +123,16 @@ class HostSession(
     private var audioConfigured = AtomicBoolean(false)
 
     private val peerCnxnLatch = CountDownLatch(1)
-    private val openAckLatch = CountDownLatch(1)
+
+    /**
+     * 等待手机 `OKAY`（OPEN 应答）。
+     *
+     * ⚠️ 是 `var` 而不是 `val`：**原地重协商**（10.18）要在同一条连接上重发 OPEN，
+     * 每次都得换一只新闩（`CountDownLatch` 是一次性的）。`sendOpen()` 里先换闩再发，
+     * 并用**局部引用**等待，避免与下一次重协商互相干扰。
+     */
+    @Volatile
+    private var openAckLatch = CountDownLatch(1)
 
     private val closed = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
@@ -271,55 +279,105 @@ class HostSession(
                 return
             }
 
-            // ★ max_size 由宿主计算后下发（计划 4.3）：CNXN 交换后两边尺寸都已知。
-            //   10.15 起按**视频显示区**算（1:1 像素映射），并把显示区一并下发 ——
-            //   这样手机端旋转时能自己重算（见 ParsedOpen.encodeMaxSize），不必重新协商。
-            //   10.17 起可用开关退回旧口径（按面板长边编高分辨率、宿主端缩放更锐）——
-            //   关掉时**不下发显示区**，手机端 encodeMaxSize 自动回退到 max_size。
-            val area = if (oneToOne) runCatching { displayArea() }.getOrNull() else null
-            val availW = area?.getOrNull(0) ?: 0
-            val availH = area?.getOrNull(1) ?: 0
-            val maxSize = if (oneToOne) {
-                Scale.oneToOneMaxSize(
-                    phoneW = phoneWidth,
-                    phoneH = phoneHeight,
-                    availW = availW,
-                    availH = availH,
-                    hostPanelW = localWidth,
-                    hostPanelH = localHeight,
-                )
-            } else {
-                Scale.computeMaxSize(phoneWidth, phoneHeight, localWidth, localHeight)
-            }
-            negotiatedMaxSize = maxSize
-            negotiatedDisplayArea = if (availW > 0 && availH > 0) "${availW}x$availH" else ""
-            val options = Options.defaultOptions(maxSize, availW, availH).apply { audio = audioEnabled }
-
-            connection?.send(Command.OPEN, StreamId.CONTROL, 0, Options.buildPayload(options))
-            val sizeSrc = when {
-                availW > 0 && availH > 0 ->
-                    "显示区 ${availW}x$availH（1:1 → max_size=$maxSize）"
-                oneToOne ->
-                    "按面板长边 ${localWidth}x$localHeight 回退（显示区未知 → max_size=$maxSize）"
-                else ->
-                    "高清模式（1:1 关）按面板长边 ${localWidth}x$localHeight → max_size=$maxSize"
-            }
-            listener.onStatus(
-                "OPEN 已发送：手机 ${phoneWidth}x$phoneHeight / $sizeSrc，等待 OKAY…"
-            )
-            logger.i(
-                TAG,
-                "OPEN options: max_size=$maxSize display_area=${if (availW > 0) "${availW}x$availH" else "-"} " +
-                    "phone=${phoneWidth}x$phoneHeight panel=${localWidth}x$localHeight"
-            )
-
-            if (!openAckLatch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            if (!sendOpen()) {
                 fail("等待 OPEN 应答超时（${TIMEOUT_MS}ms）")
                 return
             }
-            listener.onStatus("会话已建立，等待视频流…")
         } catch (t: Throwable) {
             fail("会话握手异常: ${t.message}", t)
+        }
+    }
+
+    /**
+     * 计算并下发 OPEN，等待手机 `OKAY`。
+     *
+     * 握手（[sessionFlow]）与**原地重协商**（[renegotiate]）共用 —— 两者唯一的区别只是
+     * 前者已先发过 CNXN，后者直接复用现有连接。
+     *
+     * @return true = 收到 OKAY；false = 超时（由调用方决定报错还是回退）
+     */
+    private fun sendOpen(): Boolean {
+        // ★ max_size 由宿主计算后下发（计划 4.3）：CNXN 交换后两边尺寸都已知。
+        //   10.15 起按**视频显示区**算（1:1 像素映射），并把显示区一并下发 ——
+        //   这样手机端旋转时能自己重算（见 ParsedOpen.encodeMaxSize），不必重新协商。
+        //   10.17 起可用开关退回旧口径（按面板长边编高分辨率、宿主端缩放更锐）——
+        //   关掉时**不下发显示区**，手机端 encodeMaxSize 自动回退到 max_size。
+        // ★ 取**此刻**的像素模式（原地重协商时用户可能刚切过；见 [oneToOne] 的说明）
+        val enabled = runCatching { oneToOne() }.getOrDefault(true)
+        val area = if (enabled) runCatching { displayArea() }.getOrNull() else null
+        val availW = area?.getOrNull(0) ?: 0
+        val availH = area?.getOrNull(1) ?: 0
+        val maxSize = if (enabled) {
+            Scale.oneToOneMaxSize(
+                phoneW = phoneWidth,
+                phoneH = phoneHeight,
+                availW = availW,
+                availH = availH,
+                hostPanelW = localWidth,
+                hostPanelH = localHeight,
+            )
+        } else {
+            Scale.computeMaxSize(phoneWidth, phoneHeight, localWidth, localHeight)
+        }
+        negotiatedMaxSize = maxSize
+        negotiatedDisplayArea = if (availW > 0 && availH > 0) "${availW}x$availH" else ""
+        val options = Options.defaultOptions(maxSize, availW, availH).apply { audio = audioEnabled }
+
+        // ★ 换一只新闩再发：重协商时上一只可能已经被用掉/等待中
+        val latch = CountDownLatch(1)
+        openAckLatch = latch
+        connection?.send(Command.OPEN, StreamId.CONTROL, 0, Options.buildPayload(options))
+        val sizeSrc = when {
+            availW > 0 && availH > 0 ->
+                "显示区 ${availW}x$availH（1:1 → max_size=$maxSize）"
+            enabled ->
+                "按面板长边 ${localWidth}x$localHeight 回退（显示区未知 → max_size=$maxSize）"
+            else ->
+                "高清模式（1:1 关）按面板长边 ${localWidth}x$localHeight → max_size=$maxSize"
+        }
+        listener.onStatus(
+            "OPEN 已发送：手机 ${phoneWidth}x$phoneHeight / $sizeSrc，等待 OKAY…"
+        )
+        logger.i(
+            TAG,
+            "OPEN options: max_size=$maxSize display_area=${if (availW > 0) "${availW}x$availH" else "-"} " +
+                "phone=${phoneWidth}x$phoneHeight panel=${localWidth}x$localHeight"
+        )
+
+        if (!latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) return false
+        listener.onStatus("会话已建立，等待视频流…")
+        return true
+    }
+
+    /**
+     * **原地重协商**：不重连，在同一条连接上重发 `OPEN`（10.18）。
+     *
+     * 为什么不需要"先停推流"、也不需要断开重连：
+     * - **手机端**：`AccessorySession` 的命令循环**无状态门槛**，`OPEN` 任何时候都处理 ——
+     *   `handleOpen` → `capture.startCapture` → `VirtualDisplayEncoder.applyOptions`（10.17），
+     *   其内部顺序正是"先停旧输出线程 → 复用虚拟屏按新尺寸重建 → 新输出线程重发流头+CONFIG"。
+     * - **宿主端**：`Connection` 已支持**会话中途的新流头**（`updated != headers[id]` 会更新并回调），
+     *   `FrameQueue.header` 更新后 `handleConfigFrame` 会释放旧解码器、按新尺寸新建 ——
+     *   这正是"手机旋转重建"在线上跑的机制。
+     *
+     * 因为全程用的是**同一个已同步的解析器**，不会出现"重连时撞上推流中字节"的
+     * `bad magic` / 握手超时 / 自动重试，切换耗时从 15~25s 降到约 <1s。
+     *
+     * @return true = 新参数已生效（收到 OKAY）；false = 不可用/超时，**调用方应回退到断开重连**
+     */
+    fun renegotiate(): Boolean {
+        if (replay) return false
+        if (closed.get() || !running.get()) return false
+        if (connection == null) return false
+        if (phoneWidth <= 0 || phoneHeight <= 0) return false
+        return try {
+            logger.i(TAG, "原地重协商：在同一条连接上重发 OPEN")
+            val ok = sendOpen()
+            if (!ok) logger.w(TAG, "原地重协商未收到 OKAY，调用方应回退到断开重连")
+            ok
+        } catch (t: Throwable) {
+            logger.w(TAG, "原地重协商异常（回退断开重连）: ${t.message}", t)
+            false
         }
     }
 
