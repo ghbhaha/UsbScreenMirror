@@ -1,0 +1,16 @@
+[versions]
+# 版本选择依据：本机 GRADLE_USER_HOME=D:\Develop\.gradle 已有 5GB 依赖缓存，
+# 下列组合均已在缓存中命中，首次构建基本零下载。
+agp = "8.13.0"
+kotlin = "2.1.20"
+coreKtx = "1.13.1"
+junit = "4.13.2"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

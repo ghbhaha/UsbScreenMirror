@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  宿主侧 USB 配件匹配过滤器（计划 2.1）。
+
+  ★ 故意使用【空匹配】：手机以「仅充电」模式插线时没有 MTP 接口，
+    USB_DEVICE_ATTACHED 带任何 class/vendor 条件的过滤器都匹配不到，
+    只有空 <usb-device /> 才能做到名副其实的「插线即达」。
+-->
+<resources>
+    <usb-device />
+</resources>

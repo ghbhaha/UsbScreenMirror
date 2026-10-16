@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 宿主必须具备 USB Host / OTG 能力（计划 0.6） -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="true" />
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <!--
+          计划 2.1 / 0.7：
+          - exported=true 必须显式声明（带 intent-filter 的组件在 API 31+ 否则安装即失败）
+          - launchMode=singleTask + onNewIntent：插线复用同一实例
+          - configChanges：投屏期间避免旋转重建 Activity
+        -->
+        <activity
+            android:name=".HostActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:exported="true"
+            android:launchMode="singleTask">
+
+            <!-- 插线即达：用【空匹配】过滤器，覆盖手机「仅充电、无 MTP 接口」的场景（计划 2.1） -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

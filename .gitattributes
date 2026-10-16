@@ -1,0 +1,7 @@
+# 统一换行符，避免 Windows 上 CRLF 污染 shell 脚本
+* text=auto eol=lf
+*.bat text eol=crlf
+*.jar binary
+*.png binary
+*.apk binary
+*.uav binary

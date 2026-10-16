@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">UAV Host</string>
+    <string name="host_status_idle">Stage 0 - idle, waiting for cable</string>
+</resources>

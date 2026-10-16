@@ -1,0 +1,14 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+build/
+/captures
+.externalNativeBuild
+.cxx
+.kotlin/
+.workbuddy/
+
+# 离线回放抓流文件（第 7 节），体积大、不入库
+*.uav

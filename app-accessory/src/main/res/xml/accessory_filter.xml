@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  手机端配件匹配过滤器（计划 3.1）。
+
+  ★ 这里的 manufacturer / model / version 三个值，必须与宿主在 AOA 握手时
+    通过 SEND_STRING(52) 上报的值【逐字一致】，否则系统不会把
+    USB_ACCESSORY_ATTACHED 派发给本 App。
+
+  权威来源：`:protocol` 模块的 `com.uav.protocol.AccessoryIdentity`
+            （XML 无法引用 Kotlin 常量，此处为手工镜像，改动务必同步）
+-->
+<resources>
+    <usb-accessory
+        manufacturer="UAV"
+        model="usbscreen"
+        version="1.0" />
+</resources>

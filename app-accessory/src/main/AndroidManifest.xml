@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      手机端（配件侧）不需要 usb.host feature，也不需要任何 USB 权限：
+      配件模式下的 USB 访问权由 intent 附带的 fd 授予（计划 3.2）。
+    -->
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <activity
+            android:name=".ProjectionActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:exported="true"
+            android:launchMode="singleTask">
+
+            <!-- 被宿主切换到配件模式后，系统据此拉起本 App（计划 3.1） -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
+                android:resource="@xml/accessory_filter" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
