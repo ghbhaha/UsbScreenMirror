@@ -190,7 +190,12 @@ class AccessorySession(
         )
         // 回复本机尺寸；版本取两者较小值
         val version = minOf(message.arg0, Protocol.VERSION)
-        val payload = Bytes.intLE(localWidth) + Bytes.intLE(localHeight)
+        // ★ payload 追加本机单调时钟读数（8B -> 16B）：宿主用它标定两端时钟，
+        //   进而把每帧的 pts 换算到宿主时钟，算出端到端延迟（计划 4.10）。
+        //   ⚠️ 这个读数的时基必须与帧 pts 一致 —— MediaCodec 在 surface 输入模式下
+        //   用 System.nanoTime() 作为帧时间戳，所以这里也用 System.nanoTime()。
+        val payload = Bytes.intLE(localWidth) + Bytes.intLE(localHeight) +
+            Bytes.longLE(System.nanoTime())
         connection?.send(Command.CNXN, version, 0, payload)
         listener.onStatus("已回 CNXN（本机 ${localWidth}x$localHeight）")
     }

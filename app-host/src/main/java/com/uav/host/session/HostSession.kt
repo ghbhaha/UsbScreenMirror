@@ -5,11 +5,14 @@ import com.uav.host.AndroidLogger
 import com.uav.host.video.VideoDecoder
 import com.uav.protocol.AdbMessage
 import com.uav.protocol.Bytes
+import com.uav.protocol.ClockOffset
+import com.uav.protocol.ClockSync
 import com.uav.protocol.Command
 import com.uav.protocol.Connection
 import com.uav.protocol.ConnectionListener
 import com.uav.protocol.Frame
 import com.uav.protocol.FrameQueue
+import com.uav.protocol.LatencyStats
 import com.uav.protocol.Logger
 import com.uav.protocol.Options
 import com.uav.protocol.Protocol
@@ -97,6 +100,33 @@ class HostSession(
     private var warnedMissingConfig = false
     private var reportedFirstFrame = false
 
+    // ---- 端到端延迟测量（计划 4.10）----
+
+    /** 延迟样本统计（滚动窗口 + 分位数）。 */
+    private val latency = LatencyStats()
+
+    /**
+     * **只统计"新内容帧"**的延迟。
+     *
+     * 为什么要分两份：静止画面下编码器会按 `repeat-previous-frame-after = 100ms`
+     * 反复送出**上一帧**（这是刻意的设计，让链路不空转），而这些重复帧的 pts
+     * 停在旧值上 —— 实测静止时 p50 ≈ 143ms，而画面连续变化时 p50 ≈ 61ms，
+     * 差了约一个 repeat 周期。**观感只由"内容真的变了"的那些帧决定**，
+     * 所以这一份才是有意义的口径，全量那份用于观察与对照。
+     */
+    private val latencyFresh = LatencyStats()
+
+    /** 上一帧被解码输出时的 pts（微秒，手机侧时基）；-1 = 尚无。 */
+    private var lastDecodedPtsUs = -1L
+
+    /** CNXN 发出时刻（本机单调时钟，纳秒）；-1 = 未发出（回放模式）。 */
+    @Volatile
+    private var cnxnSentNanos = -1L
+
+    /** 两端时钟标定结果；null = 未标定（回放模式，或对端不带时钟读数）。 */
+    @Volatile
+    private var clockOffset: ClockOffset? = null
+
     /** 会话实际协商出来的参数，供 UI 显示。 */
     @Volatile
     var negotiatedMaxSize: Int = 0
@@ -131,7 +161,14 @@ class HostSession(
             return
         }
         try {
-            val payload = Bytes.intLE(localWidth) + Bytes.intLE(localHeight)
+            // ★ payload 追加本机单调时钟读数（8B -> 16B）。手机在应答里回它自己的读数，
+            //   本机据此标定两端时钟 —— 这是测端到端延迟的前提（计划 4.10）：
+            //   两台设备的单调时钟起点不同，不标定就只能量到"延迟 + 未知偏移"。
+            //   两端都只读前 8 字节，所以这个扩展是**向后兼容**的。
+            val sentNanos = System.nanoTime()
+            val payload = Bytes.intLE(localWidth) + Bytes.intLE(localHeight) +
+                Bytes.longLE(sentNanos)
+            cnxnSentNanos = sentNanos
             connection?.send(Command.CNXN, Protocol.VERSION, 0, payload)
             listener.onStatus("CNXN 已发送（本机 ${localWidth}x$localHeight），等待手机尺寸…")
 
@@ -166,6 +203,7 @@ class HostSession(
         override fun onMessage(message: AdbMessage) {
             when (message.commandType) {
                 Command.CNXN -> {
+                    val recvNanos = System.nanoTime()
                     if (message.payload.size >= 8) {
                         phoneWidth = Bytes.getIntLE(message.payload, 0)
                         phoneHeight = Bytes.getIntLE(message.payload, 4)
@@ -173,6 +211,7 @@ class HostSession(
                     } else {
                         logger.w(TAG, "CNXN payload 只有 ${message.payload.size} 字节，期望 8")
                     }
+                    estimateClockOffset(recvNanos, message.payload)
                     peerCnxnLatch.countDown()
                 }
 
@@ -275,6 +314,8 @@ class HostSession(
             onConfigured = { w, h -> listener.onVideoSize(w, h) },
             onError = { t -> logger.e(TAG, "decoder error: ${t.message}", t) },
         )
+        // 端到端延迟采样点：每解出一帧就记一次（计划 4.10）
+        d.onFrameDecoded = ::onFrameDecoded
         val ok = d.configure(header.width, header.height, frame.data)
         if (!ok) {
             fail(
@@ -334,10 +375,82 @@ class HostSession(
         logger.i(TAG, "host session stopped")
     }
 
+    // ------------------------------------------------------------------ 端到端延迟（计划 4.10）
+
+    /**
+     * 用 CNXN 的这一次往返标定两端时钟。
+     *
+     * 手机在 CNXN payload 的第 8~16 字节带回它**发出该报文那一刻**的单调时钟读数，
+     * 配合本机的发送 / 接收时刻即可算出偏移（原理见 [ClockSync]）。
+     *
+     * 拿不到读数时**宁可不标定** —— 没有数据好过报一个偏移未知的假数字。
+     */
+    private fun estimateClockOffset(recvNanos: Long, payload: ByteArray) {
+        val sentNanos = cnxnSentNanos
+        if (sentNanos < 0L) {
+            logger.w(TAG, "未记录 CNXN 发出时刻，跳过时钟标定")
+            return
+        }
+        if (payload.size < CNXN_PAYLOAD_WITH_CLOCK) {
+            logger.w(
+                TAG,
+                "CNXN payload 无时钟读数（${payload.size}B < ${CNXN_PAYLOAD_WITH_CLOCK}B）" +
+                    "—— 对端可能是旧版本，本轮不测端到端延迟"
+            )
+            return
+        }
+        val remoteNanos = Bytes.getLongLE(payload, 8)
+        if (remoteNanos <= 0L) {
+            logger.w(TAG, "对端时钟读数为 $remoteNanos，跳过标定")
+            return
+        }
+        val off = ClockSync.estimate(sentNanos, recvNanos, remoteNanos)
+        clockOffset = off
+        logger.i(
+            TAG,
+            "时钟已标定: $off —— 延迟测量不确定度 ±${off.uncertaintyNanos / 1_000_000}ms"
+        )
+    }
+
+    /**
+     * 每解出一帧记一次端到端延迟。
+     *
+     * `延迟 = 本机提交合成的时刻 − 手机采集该帧的时刻`
+     *
+     * 手机侧的采集时刻就是帧的 PTS（MediaCodec 在 surface 输入模式下把帧进入编码器的
+     * 时间写进 pts，时基同 `System.nanoTime()`），经 [ClockOffset] 换算到本机时钟后
+     * 才能与本地时刻相减。
+     *
+     * 未标定时直接跳过 —— 不产生任何样本，[latencyLine] 会如实说明原因。
+     */
+    private fun onFrameDecoded(ptsUs: Long, atNanos: Long) {
+        val off = clockOffset ?: return
+        if (ptsUs <= 0L) return
+        val capturedLocalNanos = off.toLocalNanos(ptsUs * 1_000L)
+        val d = atNanos - capturedLocalNanos
+        latency.add(d)
+
+        // 分离"新内容帧"：pts 与上一帧的间隔若明显小于 repeat 周期，说明中间没有停顿，
+        // 这一帧承载的是新内容 —— 它的延迟才代表用户真正的观感。
+        val gapUs = ptsUs - lastDecodedPtsUs
+        if (lastDecodedPtsUs > 0L && gapUs in 1 until FRESH_GAP_US) {
+            latencyFresh.add(d)
+        }
+        lastDecodedPtsUs = ptsUs
+    }
+
+    /** 延迟那一行的文本；把"没有数据"和"测得 0"区分开，避免误读。 */
+    private fun latencyLine(): String {
+        if (replay) return "delay=(回放，非实时链路)"
+        val off = clockOffset ?: return "delay=(未标定：对端未带时钟读数)"
+        return "${latency.snapshot()} | ${latencyFresh.snapshot("fresh")} " +
+            "skew=±${off.uncertaintyNanos / 1_000_000}ms"
+    }
+
     fun stats(): String =
         "phone=${if (phoneWidth > 0) "${phoneWidth}x$phoneHeight" else "-"} " +
             "maxSize=$negotiatedMaxSize | ${connection?.stats?.snapshot() ?: "-"} | " +
-            "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"}"
+            "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | ${latencyLine()}"
 
     companion object {
         const val TAG = "UAV-Host"
@@ -350,5 +463,17 @@ class HostSession(
 
         /** 等待 Surface 就绪的上限（回放场景下 CONFIG 可能比 surfaceCreated 先到）。 */
         const val SURFACE_WAIT_MS = 3_000L
+
+        /** 带时钟读数的 CNXN payload 长度：4B width + 4B height + 8B 单调时钟（计划 4.10）。 */
+        const val CNXN_PAYLOAD_WITH_CLOCK = 16
+
+        /**
+         * 判定"新内容帧"的 pts 间隔上界（微秒）。
+         *
+         * `repeat-previous-frame-after = 100ms` 是重复帧的周期，所以间隔明显小于它的
+         * 才算连续新内容。取 50ms 以同时容纳 30fps(33ms) 与 60fps(16ms) 两种刷新率，
+         * 又不至于把 100ms 的重复帧算进来。
+         */
+        const val FRESH_GAP_US = 50_000L
     }
 }

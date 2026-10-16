@@ -52,6 +52,18 @@ class VideoDecoder(
     private val bufferInfo = MediaCodec.BufferInfo()
 
     /**
+     * 每解出一帧、即将交给 Surface 合成时回调 —— 端到端延迟测量用（计划 4.10）。
+     *
+     * @param ptsUs   该输出帧的 PTS（微秒，**手机侧时基**），用来反查它的采集时刻
+     * @param atNanos 本机把这一帧提交给 SurfaceFlinger 的时刻（本机单调时钟）
+     *
+     * ⚠️ **口径**：这里量到的是「解码输出 → 提交合成」，**不含最后的上屏延迟**
+     * —— SurfaceFlinger 要等下一个 vsync 才真正点亮像素（60Hz 下约 8~16ms）。
+     * 所以"真实上屏延迟"≈ 本值 + 一个 vsync 周期，验收时按这个上界理解。
+     */
+    var onFrameDecoded: ((ptsUs: Long, atNanos: Long) -> Unit)? = null
+
+    /**
      * 用 CONFIG 帧驱动的 configure。**已配置时也会先释放再重建**（CONFIG 永不吞掉）。
      *
      * @return 是否成功
@@ -162,9 +174,13 @@ class VideoDecoder(
                 return
             }
             if (outIndex < 0) return // INFO_TRY_AGAIN_LATER / FORMAT_CHANGED / BUFFERS_CHANGED
+            // 先取时间戳与时刻，再提交 —— 取在 release 之前更接近"交给 SF"的真实时刻
+            val ptsUs = bufferInfo.presentationTimeUs
+            val atNanos = System.nanoTime()
             // 直渲：releaseOutputBuffer(index, true) 把这一帧交给 SurfaceFlinger 合成
             c.releaseOutputBuffer(outIndex, true)
             framesDecoded.incrementAndGet()
+            onFrameDecoded?.invoke(ptsUs, atNanos)
         }
     }
 
