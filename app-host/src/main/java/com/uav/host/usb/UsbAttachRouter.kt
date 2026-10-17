@@ -8,7 +8,6 @@ import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
-import android.os.Build
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import com.uav.host.AndroidLogger
@@ -368,9 +367,9 @@ class UsbAttachRouter(
         fun detachFilter(): IntentFilter =
             IntentFilter().apply {
                 addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
-                }
+                // 配件方向的拔出。`ACTION_USB_ACCESSORY_DETACHED` 是 API 21 常量，
+                // 而 minSdk = 23 ⇒ 恒可用，不必再判 SDK_INT（10.28 降 minSdk 时顺手清掉的）。
+                addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
             }
     }
 }

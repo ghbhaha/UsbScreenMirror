@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "com.uav.host"
-        minSdk = 24
+        minSdk = 23
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"

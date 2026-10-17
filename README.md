@@ -312,6 +312,11 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
   `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`），边缘一划仍能临时调出系统栏。
   ⚠️ 必须**在 `onWindowFocusChanged` 里重新隐藏** —— 切后台回来 / 划出系统栏后它们会赖着不走，
   只在 `onCreate` 设一次是不够的。面板与药丸按 insets 避让刘海/手势条（视频区不避让，画面延伸才正确）。
+- **宿主支持到 Android 6.0**（10.28）：`app-host` 的 `minSdk` 从 24 降到 **23**，一行改动、零代码修改
+  —— 因为当初选 24 时用到的最高 API 恰好是 23（`AudioTrack.Builder`、`WRITE_BLOCKING`、
+  `Context.getColor`、`drawableTint` 都是 23；Material 主题 / MediaCodec 新 buffer API / VectorDrawable 是 21）。
+  Android **4.4 则要改 34 处**（lint 实测），Material 主题在 4.4 根本不存在，不建议。
+  手机端保持 24（它依赖 `MediaProjection`(21+) 与前台服务类型(29+)，跑在 A16 上）。
 - 无鼠标/键盘输入。
 
 - 无传输加密——安全性完全依赖**物理接触**。
@@ -330,6 +335,7 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
 | ✅ 10.25 | 宿主前台保持亮屏（`FLAG_KEEP_SCREEN_ON`，切后台自动失效） |
 | ✅ 10.26 | 面板菜单显隐幂等（消除启动时反复重播动画）+ 系统展开的菜单恢复后自动收回 |
 | ✅ 10.27 | 宿主全屏（隐藏状态栏/导航栏，`onWindowFocusChanged` 重新隐藏，面板避让刘海） |
+| ✅ 10.28 | 宿主 `minSdk` 24 → 23（支持 Android 6.0，一行改动） |
 | 待补验 | 宿主旋转/分屏触发的原地重协商；10.16 修复的**长跑复验**（判据：ramoops 无新增）；原地重协商的**回退路径**（从未触发过）；码率按面积缩放的**带宽 A/B**（需播放视频类内容才能受控测量）；10.21 的**多次/长时间切后台压力复验**（单次已闭环） |
 | P2 | 流健康监测、编码器死亡上报、低延迟调优、HID 鼠标、宿主真双指手势的硬件验收（见 10.12 末） |
 | P3 | 传输加密 |
