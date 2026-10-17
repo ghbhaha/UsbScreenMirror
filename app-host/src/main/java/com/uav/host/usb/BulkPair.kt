@@ -23,7 +23,20 @@ class BulkPair(
 
     val maxPacketSize: Int get() = maxOf(inEndpoint.maxPacketSize, outEndpoint.maxPacketSize)
 
-    /** 一次 bulkTransfer 的读长度：16 KB 且必须是 maxPacketSize 的整数倍（计划 4.6）。 */
+    /**
+     * 一次 bulkTransfer 的读长度：64 KB 且必须是 maxPacketSize 的整数倍（计划 4.6）。
+     *
+     * ★ 10.34 从 16 KB 提到 64 KB：真机实测一帧 30~50 KB（1080p 静止画面也有 ~1.3 KB），
+     *   16 KB 意味着**一帧要 3 次 `bulkTransfer`**，每次都是一次 syscall + 一次从 URB 缓冲
+     *   到用户态的拷贝 + 一次调度。64 KB 通常一帧一次拿完。
+     *
+     * ⚠️ 与 10.16 的内核 panic **不冲突**：那条红线是"向内核申请的读长度**不得小于端点包长
+     *   512B**"（MTK 主机栈不截 `actual_length`），而这里是取 `maxPacketSize` 的整数倍、
+     *   只会更大。改大不会重新踩坑，但仍需复验 ramoops 无新增。
+     *
+     * ⚠️ 不能用「刚好一帧」这种精确尺寸：bulkTransfer 在端点有数据时就返回（允许短读），
+     *   大缓冲不会增加延迟，只会让"多到的字节"进 `BufferedByteChannel` 的残留缓冲续读。
+     */
     val readChunkSize: Int =
         (READ_CHUNK_TARGET / maxPacketSize.coerceAtLeast(1)) * maxPacketSize.coerceAtLeast(1)
 
@@ -36,8 +49,8 @@ class BulkPair(
     companion object {
         const val TAG = "UAV-Host"
 
-        /** 读 chunk 目标值 16 KB（计划 4.6）。 */
-        const val READ_CHUNK_TARGET = 16384
+        /** 读 chunk 目标值 64 KB（计划 4.6；10.34 由 16 KB 调大，见 [readChunkSize]）。 */
+        const val READ_CHUNK_TARGET = 65536
 
         /**
          * 该设备是否含「BULK IN + BULK OUT」端点对。

@@ -53,6 +53,14 @@ class Connection(
     private val sinks = ConcurrentHashMap<Int, StreamSink>()
     private val headers = ConcurrentHashMap<Int, StreamHeader>()
 
+    /**
+     * 帧感知读用的 12B 元数据缓冲（10.34）。
+     *
+     * 只被**读线程**使用（[readerLoop]），所以不需要加锁；一个 Connection 一份，
+     * 不跨连接共享。
+     */
+    private val frameMetaBuf = ByteArray(FrameCodec.META_SIZE)
+
     private val writeQueue = LinkedBlockingQueue<Outbound>()
 
     private val closing = AtomicBoolean(false)
@@ -176,7 +184,7 @@ class Connection(
     private fun readerLoop() {
         try {
             while (running && !closing.get()) {
-                val message = AdbMessage.readFrom(transport)
+                val message = AdbMessage.readFrom(transport, frameMetaBuf)
                 stats.messagesRead.incrementAndGet()
                 dispatch(message)
             }
@@ -251,6 +259,20 @@ class Connection(
         }
 
         if (headers[streamId] == null) {
+            // ★ 帧感知读到的帧在**没有流头**时不能喂给解码器（10.34）：它跟"上一次会话残留在
+            //   USB FIFO 里的字节"是同一类东西 —— 尺寸未知，配错解码器比丢掉更糟。
+            //   这里按杂散 payload 丢弃，语义与下面那段通用路径完全一致。
+            message.frame?.let { f ->
+                val n = stats.strayPayloads.incrementAndGet()
+                if (n <= STRAY_WARN_LIMIT || n % 100 == 0L) {
+                    logger.w(
+                        tag,
+                        "stream[${StreamId.name(streamId)}] 收到帧但还没有流头" +
+                            "(${f.size}B)，按残留字节丢弃（第 $n 次）"
+                    )
+                }
+                return
+            }
             // ★ 该流的首条 WRTE payload 是 12B 流头，只发一次。
             //   但实测会遇到"上一次会话残留在 USB FIFO 里的帧数据"被读到 —— 严格校验会把它
             //   判为非法流头。此时**不能**拿垃圾去 configure 解码器（会静默配错尺寸），
@@ -303,7 +325,9 @@ class Connection(
             return
         }
 
-        val frame = FrameCodec.decodeFrame(message.payload, 0, message.payload.size)
+        // ★ 帧感知读（10.34）：帧已经在读的时候切好了，这里**不再**解析/拷贝 payload。
+        //   通用路径（回放、单测、非 Connection 的调用方）仍走 decodeFrame。
+        val frame = message.frame ?: FrameCodec.decodeFrame(message.payload, 0, message.payload.size)
         stats.frameAt(streamId, frame)
         sink.onFrame(frame)
     }

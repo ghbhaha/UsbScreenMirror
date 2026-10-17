@@ -23,6 +23,14 @@ class AdbMessage(
     val arg0: Int,
     val arg1: Int,
     val payload: ByteArray,
+    /**
+     * 帧感知读（10.34）时，`WRTE` 帧已经在这里了 —— 此时 [payload] 为**空**
+     * （码流被直接读进了 `frame.data`，没有中转缓冲）。
+     *
+     * 为 `null` 表示走通用路径：`payload` 是该报文的完整载荷（含 12B 帧元数据），
+     * 由调用方自己 `FrameCodec.decodeFrame` 解出来。
+     */
+    val frame: Frame? = null,
 ) {
 
     val commandType: Command? get() = Command.fromWire(command)
@@ -118,10 +126,20 @@ class AdbMessage(
         /**
          * 从流里读一条完整报文。
          *
+         * @param frameMeta **帧感知读**（10.34）。传一个长度 ≥ [FrameCodec.META_SIZE] 的
+         *   可复用缓冲，则 `WRTE` 帧会被拆成「12B 元数据 + 码流」两段读：元数据进这个缓冲、
+         *   码流**直接读进它自己的数组**，结果放在 [AdbMessage.frame] 里（[AdbMessage.payload] 为空）。
+         *   省掉原来「整包 ByteArray → decodeFrame 再 arraycopy 一份」的那次拷贝和一次分配。
+         *
+         *   ⚠️ 只有 `WRTE` 且 `data_length > 12` 才拆：载荷恰为 12B 的 `WRTE` 是**流头**，
+         *   必须留在 `payload` 里走通用的流头解析。传 `null` = 老行为，单测/回放不受影响。
+         *
+         *   ⚠️ 这个缓冲**由调用方持有**（每连接一个），因为只有读线程用它 —— 不要跨连接共享。
+         *
          * @throws EOFException     对端关闭（读头或读 payload 时）
          * @throws ProtocolException magic 不符 / 长度超限 / checksum 不符 / 收到已裁剪命令
          */
-        fun readFrom(transport: Transport): AdbMessage {
+        fun readFrom(transport: Transport, frameMeta: ByteArray? = null): AdbMessage {
             val header = ByteArray(HEADER_SIZE)
             try {
                 transport.readFully(header, 0, HEADER_SIZE)
@@ -157,6 +175,31 @@ class AdbMessage(
             // 3) 已裁剪命令（AUTH / STLS）—— 收到即协议错误
             Command.removedName(command)?.let { name ->
                 throw ProtocolException("removed command '$name' received (command=0x${Integer.toHexString(command)})")
+            }
+
+            // ★ 4) 帧感知快路径（10.34）：见 [readFrom] 的 frameMeta 说明。
+            if (frameMeta != null && command == Command.WRTE.wire && dataLength > FrameCodec.META_SIZE) {
+                transport.readFully(frameMeta, 0, FrameCodec.META_SIZE)
+                val ptsAndFlags = Bytes.getLongLE(frameMeta, 0)
+                val size = Bytes.getIntLE(frameMeta, 8)
+                if (size < 0 || size > Protocol.MAX_FRAME_SIZE) {
+                    throw ProtocolException("frame size out of range: $size (max ${Protocol.MAX_FRAME_SIZE})")
+                }
+                val declared = dataLength - FrameCodec.META_SIZE
+                if (size != declared) {
+                    throw ProtocolException("frame size mismatch: declared $size, actual $declared")
+                }
+                val data = ByteArray(size)
+                transport.readFully(data, 0, size)
+                // checksum 是逐字节累加 ⇒ 可以分段相加（8 MiB 上限不会溢出 Int）
+                val actual = checksumOf(frameMeta, 0, FrameCodec.META_SIZE) + checksumOf(data, 0, size)
+                if (actual != dataCheck) {
+                    throw ProtocolException(
+                        "bad checksum for WRTE: got 0x${Integer.toHexString(actual)} " +
+                            "expected 0x${Integer.toHexString(dataCheck)}"
+                    )
+                }
+                return AdbMessage(command, arg0, arg1, EMPTY, Frame(ptsAndFlags, data))
             }
 
             val payload = if (dataLength > 0) ByteArray(dataLength) else EMPTY
