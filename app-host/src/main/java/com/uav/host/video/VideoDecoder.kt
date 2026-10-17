@@ -41,6 +41,18 @@ class VideoDecoder(
     val framesQueued = AtomicLong()
     val framesDecoded = AtomicLong()
     val inputStalls = AtomicLong()
+
+    /**
+     * 渲染门（A/V 同步用，10.20③）：在 `releaseOutputBuffer(index, true)` **之前**调用，
+     * 返回 `false` 表示这一帧不渲染（直接丢弃，不交给 SurfaceFlinger）。
+     *
+     * ⚠️ 门内**允许阻塞一小会儿**（等待对齐）—— 它跑在解码线程里，所以只应做几十毫秒量级的等待。
+     * 为 null 时行为与从前完全一样（逐帧直渲）。
+     */
+    var frameGate: ((ptsUs: Long, atNanos: Long) -> Boolean)? = null
+
+    /** 被渲染门丢弃的帧数（诊断用）。 */
+    val gateDropped = AtomicLong()
     val configureFailures = AtomicLong()
 
     /** 是否已完成 configure。 */
@@ -192,6 +204,13 @@ class VideoDecoder(
             // 先取时间戳与时刻，再提交 —— 取在 release 之前更接近"交给 SF"的真实时刻
             val ptsUs = bufferInfo.presentationTimeUs
             val atNanos = System.nanoTime()
+            // ★ 渲染门（10.20③）：不通过就不渲染，直接归还缓冲（不碰 Surface，天然安全）
+            val gate = frameGate
+            if (gate != null && !gate(ptsUs, atNanos)) {
+                gateDropped.incrementAndGet()
+                runCatching { c.releaseOutputBuffer(outIndex, false) }
+                continue
+            }
             // 直渲：releaseOutputBuffer(index, true) 把这一帧交给 SurfaceFlinger 合成
             try {
                 c.releaseOutputBuffer(outIndex, true)
@@ -237,6 +256,7 @@ class VideoDecoder(
     fun stats(): String =
         "decoded=${framesDecoded.get()} queued=${framesQueued.get()} " +
             "inputStalls=${inputStalls.get()} cfgFailures=${configureFailures.get()} " +
+            "gateDropped=${gateDropped.get()} " +
             "size=${configuredSize?.let { "${it.first}x${it.second}" } ?: "-"}"
 
     companion object {

@@ -5,6 +5,7 @@ import com.uav.host.AndroidLogger
 import com.uav.host.audio.AudioPlayer
 import com.uav.host.video.VideoDecoder
 import com.uav.protocol.AdbMessage
+import com.uav.protocol.AvSyncGate
 import com.uav.protocol.Bytes
 import com.uav.protocol.ClockOffset
 import com.uav.protocol.ClockSync
@@ -107,6 +108,23 @@ class HostSession(
     }
 
     private val videoQueue = FrameQueue(StreamId.VIDEO, logger = logger)
+
+    /**
+     * A/V 同步门（10.20③）：以**音频播放头**为基准，决定每一帧是"渲染 / 等一下再渲染 / 丢掉"。
+     *
+     * 决策逻辑在 `:protocol/AvSyncGate`（纯逻辑、有单测），本类只负责把两个时钟喂进去。
+     */
+    private val avSync = AvSyncGate()
+
+    /** 上一次读到的音频播放位置；用来发现"音频卡住了"（此时必须放弃同步，否则会把视频全丢掉）。 */
+    @Volatile
+    private var lastAudioPlayedNanos = 0L
+
+    /** 音频播放头连续不前进的次数（超过阈值就临时关闭 A/V 同步）。 */
+    private val audioStallFrames = java.util.concurrent.atomic.AtomicInteger()
+
+    @Volatile
+    private var avSyncDisabled = false
 
     /**
      * 音频队列（10.13）。
@@ -240,6 +258,11 @@ class HostSession(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+
+        avSync.reset()
+        lastAudioPlayedNanos = 0L
+        audioStallFrames.set(0)
+        avSyncDisabled = false
 
         val conn = Connection(transport, logger, TAG, connectionListener)
         conn.registerSink(StreamId.VIDEO, videoQueue)
@@ -628,6 +651,8 @@ class HostSession(
             onError = ::onDecoderError,
         )
         d.onFrameDecoded = ::onFrameDecoded
+        // ★ A/V 同步：渲染门（10.20③）
+        d.frameGate = ::avSyncFrame
         if (!d.configure(size.first, size.second, config)) {
             fail("Surface 恢复后 decoder 重新 configure 失败（${size.first}x${size.second}）")
             return false
@@ -690,6 +715,8 @@ class HostSession(
         )
         // 端到端延迟采样点：每解出一帧就记一次（计划 4.10）
         d.onFrameDecoded = ::onFrameDecoded
+        // ★ A/V 同步：渲染门（10.20③）
+        d.frameGate = ::avSyncFrame
         val ok = d.configure(header.width, header.height, frame.data)
         if (!ok) {
             fail(
@@ -802,6 +829,64 @@ class HostSession(
      *
      * 未标定时直接跳过 —— 不产生任何样本，[latencyLine] 会如实说明原因。
      */
+    /**
+     * 渲染门（跑在解码线程里，每帧一次）：把"帧的采集时刻"与"音频已播到的时刻"交给
+     * [avSync] 决策，按结果丢帧 / 等待 / 照常渲染。
+     *
+     * ## 什么时候**放弃**同步（返回 true = 一切照旧）
+     * - 没有音频（`audioEnabled=false` 或还没起播）→ 没有音频时钟可依据；
+     * - 时钟没标定（拿不到 `clockOffset`，无法把帧 pts 换算到宿主时钟）；
+     * - **音频播放头连续不前进**（上游没数据 / AudioTrack 异常）—— 这种情况下每一帧都会
+     *   被判成"晚几十毫秒以上"，不关掉就会把视频**全丢光**（画面直接黑）。这是最危险的边界，
+     *   所以单独计数兜底，并只告警一次。
+     */
+    private fun avSyncFrame(ptsUs: Long, atNanos: Long): Boolean {
+        val player = audio ?: return true
+        if (!audioEnabled) return true
+        val off = clockOffset ?: return true
+        if (ptsUs <= 0L) return true
+        // ⚠️ 标定不可靠时**不能拿它做同步决策**：帧 pts 换算到宿主时钟本身就带着
+        //   ±1.4s 的不确定度（CNXN 撞上手机端启动会话时实测），此时"偏移"是噪声，
+        //   拿噪声去纠正偏移只会疯狂丢帧/等待。宁可不同步。
+        if (off.uncertaintyNanos > CLOCK_TRUSTWORTHY_NANOS) return true
+
+        val played = player.playedUntilNanos() ?: return true
+        val last = lastAudioPlayedNanos
+        if (played <= last) {
+            if (audioStallFrames.incrementAndGet() > AUDIO_STALL_LIMIT_FRAMES) {
+                if (!avSyncDisabled) {
+                    avSyncDisabled = true
+                    logger.w(
+                        TAG,
+                        "音频播放头连续 ${AUDIO_STALL_LIMIT_FRAMES} 帧不前进 —— 暂时关闭 A/V 同步" +
+                            "（否则每一帧都会被判为偏晚而丢弃，画面会黑）",
+                    )
+                }
+                return true
+            }
+        } else {
+            if (avSyncDisabled) {
+                logger.i(TAG, "音频播放头恢复前进，重新启用 A/V 同步")
+                avSyncDisabled = false
+                avSync.reset()
+            }
+            audioStallFrames.set(0)
+            lastAudioPlayedNanos = played
+        }
+        if (avSyncDisabled) return true
+
+        // 帧 pts（手机时钟）→ 宿主时钟
+        val frameLocalNanos = off.toLocalNanos(ptsUs * 1_000L)
+        val decision = avSync.decide(frameLocalNanos, played)
+        if (!decision.render) return false
+        if (decision.waitNanos > 0) {
+            // 有界等待：跑在解码线程里，必须睡得短（门控内部已封顶 40ms）
+            runCatching { Thread.sleep(decision.waitNanos / 1_000_000L) }
+                .onFailure { /* 被中断就算了 */ }
+        }
+        return true
+    }
+
     private fun onFrameDecoded(ptsUs: Long, atNanos: Long) {
         val off = clockOffset ?: return
         if (ptsUs <= 0L) return
@@ -831,7 +916,7 @@ class HostSession(
             "maxSize=$negotiatedMaxSize bitrate=${negotiatedBitRate / 1000}k" +
             (if (negotiatedDisplayArea.isEmpty()) "" else "(显示区 $negotiatedDisplayArea)") +
             " | ${connection?.stats?.snapshot() ?: "-"} | " +
-            "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | " +
+            "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | avsync=${avSync.stats()} | " +
             "audioQueue=$audioQueue | ${audio?.stats() ?: "no audio"} | ${latencyLine()}"
 
     /**
@@ -904,6 +989,13 @@ class HostSession(
          * 只显示"标定不可靠"，免得把 1.4s 当成真延迟（真值见 docs 10.6 口径：fresh p50 64ms）。
          */
         const val CLOCK_TRUSTWORTHY_NANOS = 200_000_000L
+
+        /**
+         * 音频播放头连续多少帧不前进就临时关闭 A/V 同步（30fps 下约 2 秒）。
+         *
+         * 音频一停，视频每一帧都会被判成"偏晚"⇒ 全丢 ⇒ 画面黑。这是必须有的兜底。
+         */
+        const val AUDIO_STALL_LIMIT_FRAMES = 60
 
         /** 消费线程轮询间隔。 */
         const val POLL_MS = 500L

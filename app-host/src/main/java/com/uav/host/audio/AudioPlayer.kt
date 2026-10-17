@@ -70,6 +70,33 @@ class AudioPlayer(
 
     private var delayApplied = false
 
+    /**
+     * `play()` 的时刻（宿主单调时钟）。
+     *
+     * ★ A/V 同步的**音频时钟基准**（10.20③）：[playedUntilNanos] 要靠它把"播放头帧数"换算成时间。
+     */
+    @Volatile
+    private var playbackStartedAtNanos = 0L
+
+    /**
+     * 音频**已经播出**到的时刻（宿主单调时钟域，nanos）。
+     *
+     * 用 `AudioTrack.getPlaybackHeadPosition()`（已渲染到输出的帧数）而不是"已写入"——
+     * 后者含 AudioTrack 的缓冲，会把音频位置算得比实际**靠前**好几帧。
+     *
+     * @return 还没开始播 / 没有 track / 采样率未知 → `null`（调用方据此放弃 A/V 同步）
+     */
+    fun playedUntilNanos(): Long? {
+        val t = track ?: return null
+        val start = playbackStartedAtNanos
+        if (start <= 0L) return null
+        val sr = sampleRate
+        if (sr <= 0) return null
+        // 播放头是无符号 32 位帧计数，约 12 小时会绕回；按标准做法屏蔽符号位
+        val frames = runCatching { t.playbackHeadPosition.toLong() and 0xFFFFFFFFL }.getOrNull() ?: return null
+        return start + frames * 1_000_000_000L / sr
+    }
+
     // ---- 统计 ----
 
     val framesDecoded = AtomicLong()
@@ -145,6 +172,8 @@ class AudioPlayer(
             runCatching { t.setVolume(volume) }
             t.play()
             track = t
+            // 音频时钟起点：必须在 play() 之后取，否则会把建轨的时间算进去
+            playbackStartedAtNanos = System.nanoTime()
 
             isRunning = true
             started = true
