@@ -79,6 +79,14 @@ class AccessorySession(
          */
         fun startCapture(options: ParsedOpen, session: AccessorySession)
 
+        /**
+         * 停止采集。
+         *
+         * ⚠️ **会话层现在不调它**（10.33）：编码器与虚拟屏的生死由 `CaptureService` 独占，
+         * 会话断了要留着给重连复用（`MediaProjection` 令牌只能 `createVirtualDisplay` 一次）。
+         * 从会话层停采集会让下一条 `OPEN` 建不出虚拟屏、逼用户重新授权。
+         * 只留作契约声明 —— 真要停，走 `CaptureService.stopEverything()`。
+         */
         fun stopCapture()
 
         /**
@@ -260,7 +268,6 @@ class AccessorySession(
                 }
                 Command.CLSE -> {
                     logger.i(TAG, "CLSE from host: ${message.payload.toString(Charsets.UTF_8)}")
-                    stopCaptureQuietly()
                     listener.onClosed("host CLSE: ${message.payload.toString(Charsets.UTF_8)}")
                 }
                 else -> logger.d(TAG, "message ${message.commandName} ignored")
@@ -271,12 +278,10 @@ class AccessorySession(
             if (closed.get()) return
             logger.e(TAG, "链路错误: ${cause.message}", cause)
             listener.onError("链路错误: ${cause.message}", cause)
-            stopCaptureQuietly()
         }
 
         override fun onClosed(reason: String) {
             if (closed.get()) return
-            stopCaptureQuietly()
             listener.onClosed(reason)
         }
     }
@@ -332,16 +337,23 @@ class AccessorySession(
         }
     }
 
-    private fun stopCaptureQuietly() {
-        runCatching { capture.stopCapture() }
-            .onFailure { logger.w(TAG, "stopCapture 抛异常: ${it.message}") }
-    }
-
+    /**
+     * 关会话。
+     *
+     * ★ **不碰采集**（10.33）：编码器与虚拟屏的生命周期由 `CaptureService` 独占，
+     *   会话断了要**留着**给重连复用 —— 因为 `MediaProjection` 令牌只允许
+     *   `createVirtualDisplay` 一次，编码器一旦销毁，下一条 `OPEN` 再建虚拟屏必然失败，
+     *   用户就得重新点一次录屏授权（对用户是明显倒退）。
+     *
+     *   以前这里调了 `stopCaptureQuietly()`，但它其实**从来没生效过**：
+     *   那个 override 写成了 `stopCapture()`（调自己）⇒ 无限递归 ⇒ StackOverflowError
+     *   被 `runCatching` 吞掉。也就是说"重连能复用编码器"一直是靠这个 bug 侥幸成立的，
+     *   修掉递归后反而暴露成"重连后永远没有画面"。现在把这条约定写进文档与代码。
+     */
     fun close() {
         if (!closed.compareAndSet(false, true)) return
         idleWatchdog?.interrupt()
         idleWatchdog = null
-        stopCaptureQuietly()
         connection?.close()
         connection = null
         logger.i(TAG, "accessory session closed")

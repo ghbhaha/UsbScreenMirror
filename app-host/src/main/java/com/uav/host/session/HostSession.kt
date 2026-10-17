@@ -877,22 +877,42 @@ class HostSession(
         stopInternal()
     }
 
+    /**
+     * 收尾。**每一步都必须独立兜住异常**（10.33）。
+     *
+     * 原来是一串裸调用：`MediaCodec.release()` 抛一次（例如解码器已进入 error 状态、
+     * 或已被停止渲染那条路径释放过），后面的 `connection.close()` 就**永远不执行** ——
+     * USB 连接的 fd 就这么漏掉。而 `/dev/usb_accessory` 是独占的，漏一个就再也
+     * 连不回配件模式（10.8 踩过同样的坑，代价是"只能拔插"）。
+     *
+     * 现在每一步各自 `runCatching`，最后一步 `connection.close()` 无论如何都会跑到。
+     */
     private fun stopInternal() {
         running.set(false)
-        videoQueue.close()
-        audioQueue.close()
-        decoder?.release()
+        quiet("videoQueue.close") { videoQueue.close() }
+        quiet("audioQueue.close") { audioQueue.close() }
+        quiet("decoder.release") { decoder?.release() }
         decoder = null
-        audio?.release()
+        quiet("audio(解码).release") { audio?.release() }
         audio = null
-        connection?.close()
+        // ★ 排在最关键的释放之前，保证它一定被执行
         consumerThread?.interrupt()
         audioThread?.interrupt()
         sessionThread?.interrupt()
+        quiet("connection.close") { connection?.close() }
         consumerThread = null
         audioThread = null
         sessionThread = null
         logger.i(TAG, "host session stopped")
+    }
+
+    /** 收尾专用：单步失败只记一条 W，绝不中断后续释放。 */
+    private inline fun quiet(what: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            logger.w(TAG, "收尾时 $what 失败（忽略）: ${t.javaClass.simpleName}: ${t.message}")
+        }
     }
 
     // ------------------------------------------------------------------ 端到端延迟（计划 4.10）

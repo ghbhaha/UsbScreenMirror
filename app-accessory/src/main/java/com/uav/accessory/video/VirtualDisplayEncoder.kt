@@ -487,7 +487,12 @@ class VirtualDisplayEncoder(
             }
 
             when {
-                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> emitConfig(encoder.outputFormat)
+                // ★ 与音频侧同款（10.33）：`encoder.outputFormat` 在编码器已 stop/release
+                //   之后会抛 IllegalStateException，而这个分支在下面的 try **之外**，
+                //   漏了就是 `uav-encode` 线程顶层 FATAL。
+                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
+                    runCatching { emitConfig(encoder.outputFormat) }
+                        .onFailure { logger.w(TAG, "读取输出格式失败: ${it.message}") }
 
                 index == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     // ★ 编码器"活着但不产帧"（10.30）：链路、虚拟屏都正常，

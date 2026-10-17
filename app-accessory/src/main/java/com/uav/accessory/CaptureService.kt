@@ -146,6 +146,25 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     @Volatile
     private var stopping = false
 
+    /**
+     * 「启动采集」与「停止一切」的互斥锁（10.33）。
+     *
+     * ★ 这两件事**天生跨线程**：`startCaptureInternal` 由宿主的 `OPEN` 驱动，
+     *   跑在协议读线程上；`stopEverything` 由用户点「停止投屏」驱动，跑在主线程上。
+     *   两者都会读写 `projection` / `encoder` 两个字段。
+     *
+     * 以前没锁，靠"用户点停止时宿主还没连回来"这个时间差侥幸不出事。
+     * 10.32 之后宿主收到 `CLSE` **0.4 秒**就开始重连并发 `OPEN`，正好撞进停止的窗口：
+     * ```
+     * 主线程: projection.stop(); projection = null      （拆解）
+     * 协议线程: projection.createVirtualDisplay(...)    （新建）
+     * → IllegalStateException: Must register a callback before starting capture
+     * ```
+     * 后果是 `session.failAndClose("启动编码器失败")` —— 手机把刚建立的链路自己掐掉，
+     * 表现为"点了授权还是没画面，fd=0"（真机复现：连点 3 轮，第 3 轮必现）。
+     */
+    private val captureLock = Any()
+
     /** 收到 OPEN 但录屏授权还没到时的挂起参数。 */
     @Volatile
     private var pendingOptions: ParsedOpen? = null
@@ -371,7 +390,14 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
                 }
 
                 override fun stopCapture() {
-                    stopCapture()
+                    // ★ 必须带 `this@CaptureService`（10.33）：不带限定符时，
+                    //   Kotlin 会解析到**本匿名对象的这个 override 自己**，
+                    //   于是 `stopCapture()` 无限递归 → StackOverflowError。
+                    //   它被调用方的 `runCatching`（AccessorySession.stopCaptureQuietly）
+                    //   吞掉，只在日志里留一条 `stopCapture 抛异常: stack size 1037KB`。
+                    //   后果：链路一出错，编码器和内录**从来没被真正停掉**，
+                    //   它们继续往一条已死的会话里推帧（真机复现：强制重握手后两端卡死）。
+                    this@CaptureService.stopCapture()
                 }
 
                 override fun requestKeyFrame() {
@@ -397,6 +423,19 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     // ------------------------------------------------------------------ 采集
 
     private fun startCaptureInternal(options: ParsedOpen, session: AccessorySession) {
+        // 与 stopEverything() 互斥（见 [captureLock] 的说明）
+        synchronized(captureLock) {
+            startCaptureLocked(options, session)
+        }
+    }
+
+    private fun startCaptureLocked(options: ParsedOpen, session: AccessorySession) {
+        // ★ 正在停止就**直接放弃**：这次 OPEN 属于"马上就要被拆掉的那条链路"，
+        //   继续往下走只会拿着已被 stop() 的 projection 去 createVirtualDisplay。
+        if (stopping) {
+            AndroidLogger.i(TAG, "正在停止投屏，忽略这次启动采集的请求")
+            return
+        }
         audioRequested = options.audio
 
         // ★ 配件重新接入时复用既有编码器：投影令牌只允许 createVirtualDisplay 一次，
@@ -550,11 +589,14 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     }
 
     private fun stopCapture() {
-        unregisterRotationWatcher()
-        encoder?.stop()
-        encoder = null
-        audio?.stop()
-        audio = null
+        // 同一把锁（见 [captureLock]）：`projectionCallback.onStop()` 还可能从系统线程进来
+        synchronized(captureLock) {
+            unregisterRotationWatcher()
+            encoder?.stop()
+            encoder = null
+            audio?.stop()
+            audio = null
+        }
     }
 
     // ------------------------------------------------------------------ 旋转监听（P0）
@@ -855,20 +897,27 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         // 用户主动停止 ⇒ 空闲重开的配额也归零，下次启动是干净的 N 次机会
         idleRetries.set(0)
         pendingOptions = null
-        stopCapture()
-        // ★ 10.32：用户主动停止**必须告诉宿主**。
-        //   以前这里只 close()，一个报文都不发 —— 宿主收不到任何信号，
-        //   只能靠读超时发现，表现为"点了停止，宿主画面冻住好几秒，
-        //   之后才开始无意义的重连重试"，而且它无法区分"用户停止"和"链路故障"。
-        //   走 closeGracefully 而不是 failAndClose：用户停止不是故障，
-        //   不该把两端的状态都标成"错误"。
-        session?.closeGracefully(CloseReason.USER_STOP)
-        releaseTransport("停止采集")
-        projection?.let { p ->
-            runCatching { p.unregisterCallback(projectionCallback) }
-            runCatching { p.stop() }
+        // ★ 整段拆解都在 [captureLock] 里（10.33）：
+        //   宿主收到 CLSE 后 0.4s 就会重连并发 OPEN，那条路径会并发读 projection /
+        //   写 encoder 字段。不互斥的话会出现"拆到一半被新建覆盖"——
+        //   要么 createVirtualDisplay 抛异常把链路掐掉，要么留下一个挂在已失效投影上的编码器
+        //   被下次会话复用（表现为"连上了但永远没画面"）。
+        synchronized(captureLock) {
+            stopCapture()
+            // ★ 10.32：用户主动停止**必须告诉宿主**。
+            //   以前这里只 close()，一个报文都不发 —— 宿主收不到任何信号，
+            //   只能靠读超时发现，表现为"点了停止，宿主画面冻住好几秒，
+            //   之后才开始无意义的重连重试"，而且它无法区分"用户停止"和"链路故障"。
+            //   走 closeGracefully 而不是 failAndClose：用户停止不是故障，
+            //   不该把两端的状态都标成"错误"。
+            session?.closeGracefully(CloseReason.USER_STOP)
+            releaseTransport("停止采集")
+            projection?.let { p ->
+                runCatching { p.unregisterCallback(projectionCallback) }
+                runCatching { p.stop() }
+            }
+            projection = null
         }
-        projection = null
     }
 
     override fun onDestroy() {

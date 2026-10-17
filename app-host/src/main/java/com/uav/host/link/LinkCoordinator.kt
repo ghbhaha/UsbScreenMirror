@@ -87,6 +87,32 @@ class LinkCoordinator(
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
+     * 链路收尾 / 重建的**串行后台队列**（10.33）。
+     *
+     * 为什么必须有它：关会话是阻塞操作 —— `MediaCodec.release()` + `Connection.close()`
+     * （后者会去拿 `BufferedByteChannel` 的锁，而读线程正卡在 `bulkTransfer` 里）。
+     * 实测主线程点一下"强制重握手"就被堵 5 秒、系统直接 ANR：
+     * ```
+     * "main" Blocked at BufferedByteChannel.close ← HostSession.close ← LinkCoordinator.scan
+     * ```
+     * 单线程 FIFO 同时保证"先关干净旧会话，再开新连接"——两者都碰 USB，并发会抢端点。
+     */
+    private val ioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "uav-link-io").apply { isDaemon = true }
+    }
+
+    /**
+     * 是否已有一次"重启链路"排在队里（10.33）。
+     *
+     * 串行只保证**顺序**，不保证**不重复**：用户连点三次「强制重握手」会排出三轮
+     * 完整 AOA 握手（每轮都发 `START_ACCESSORY`）。实测代价很重 —— 每发一次都会重置
+     * 配件配置、踢掉手机端刚打开的 fd，三轮连发直接把手机打进"配件功能被锁"的死状态
+     * （`svc usb getFunctions` 返回 `accessory`，此后软件手段全无效，**只能拔插线**）。
+     * 用这个标志把连点合并成一次。
+     */
+    private val restartQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
      * 「用户主动切换画质 / 正在重开会话」标志（10.17）。
      *
      * 为 `true` 时，瞬时握手失败不当 ERROR 展示、也不触发强制 AOA 重握手 ——
@@ -154,6 +180,9 @@ class LinkCoordinator(
         router?.close()
         router = null
         stopSession()
+        // 不 shutdownNow：正在跑的关闭任务被中断的话，fd 可能真的漏掉
+        // （`/dev/usb_accessory` 独占，漏一个就永久连不回来）。
+        ioExecutor.shutdown()
     }
 
     /**
@@ -174,15 +203,13 @@ class LinkCoordinator(
         if (forceHandshake) forceRetried = true
         else forceRetried = false
         if (forceHandshake) fastPathUnverified = false
-        stopSession()
-        router?.scanAndAttach(forceHandshake)
+        restartSerial { router?.scanAndAttach(forceHandshake) }
     }
 
     /** USB 设备刚插上。 */
     fun onDeviceAttached(device: UsbDevice) {
-        stopSession()
         forceRetried = false
-        router?.onDeviceAttached(device)
+        restartSerial { router?.onDeviceAttached(device) }
     }
 
     /** 设备拔出。 */
@@ -202,8 +229,9 @@ class LinkCoordinator(
         val s = session
         if (s == null) {
             // 没有活动会话（还没连上）→ 直接走扫描/重连
-            stopSession()
-            router?.scanAndAttach()
+            // ★ 必须走串行队列：旧会话的 close 可能还排在里面（10.33），
+            //   并发碰 USB 会抢端点。
+            restartSerial { router?.scanAndAttach() }
             return
         }
         // 同一时刻只允许一次重协商，避免布局回调连发把手机端反复重建
@@ -247,14 +275,87 @@ class LinkCoordinator(
         mainHandler.postDelayed(clearExpectingRestart, RESTART_FLAG_TIMEOUT_MS)
     }
 
+    /**
+     * 断开当前会话。
+     *
+     * 分两段：**同步**地"解除引用 + 通知上层"（这样轮询能立刻接管、界面立刻清空），
+     * **异步**地关连接 —— 后者是阻塞的（`MediaCodec.release()` +
+     * `Connection.close()` 要拿 `BufferedByteChannel` 的锁，而读线程正卡在 `bulkTransfer`）。
+     * 这段阻塞以前直接压在调用者线程上，主线程点"强制重握手"就会被堵 5 秒 ⇒ ANR（10.33）。
+     */
     fun stopSession() {
+        detachSession()?.let { submitClose(it) }
+    }
+
+    /**
+     * 只解除引用 + 通知上层，**不关连接**。
+     *
+     * @return 被摘下来的旧会话（调用方负责关闭）
+     */
+    private fun detachSession(): HostSession? {
+        val old = session
+        if (old == null && bulkChannel == null) return null
         // 链路没了：旧 HID 注册随之失效。触点状态**保留**在控制器里 ——
         // 重连后它会把"手指还按着"补发回去，避免手机上手指"卡住"。
         onLinkLost()
-        session?.close()
         session = null
         bulkChannel = null
         panelClearVideoSize()
+        return old
+    }
+
+    /** 把关闭动作丢进串行后台队列（队列已关时另起线程关，绝不退回调用线程）。 */
+    private fun submitClose(s: HostSession) {
+        val job = Runnable {
+            runCatching { s.close() }
+                .onFailure { logger.w(TAG, "关闭旧会话失败: ${it.message}") }
+        }
+        try {
+            ioExecutor.execute(job)
+        } catch (re: java.util.concurrent.RejectedExecutionException) {
+            // 队列已 shutdown（Activity 正在销毁）⇒ 另起线程关。
+            // ★ 不能直接 job.run()：调用方可能是主线程，而 close() 是阻塞的。
+            Thread(job, "uav-link-close").apply { isDaemon = true }.start()
+        }
+    }
+
+    /**
+     * 串行执行"关干净旧会话 → 再做 [then]"。
+     *
+     * ★ 必须串行：关会话和重新握手都要碰 USB，旧连接还没 close 就 claim 新接口会抢端点。
+     *   单线程 FIFO 天然保证顺序，而且整段都不在主线程。
+     */
+    private fun restartSerial(then: () -> Unit) {
+        // 连点合并：见 [restartQueued]
+        if (!restartQueued.compareAndSet(false, true)) {
+            logger.i(TAG, "已有一次链路重启在排队/执行中，忽略这次重复请求")
+            return
+        }
+        val job = Runnable {
+            try {
+                detachSession()?.let { old ->
+                    runCatching { old.close() }
+                        .onFailure { logger.w(TAG, "关闭旧会话失败: ${it.message}") }
+                }
+                then()
+            } finally {
+                restartQueued.set(false)
+            }
+        }
+        try {
+            ioExecutor.execute(job)
+        } catch (re: java.util.concurrent.RejectedExecutionException) {
+            // 同上：不能退回调用线程（它可能是主线程，[then] 里的握手是阻塞的）
+            Thread(job, "uav-link-io-fallback").apply { isDaemon = true }.start()
+        }
+    }
+
+    /** 同步关会话。只用于"马上就要 claim 新接口、必须先放掉旧连接"的后台路径。 */
+    private fun stopSessionNow() {
+        detachSession()?.let { old ->
+            runCatching { old.close() }
+                .onFailure { logger.w(TAG, "关闭旧会话失败: ${it.message}") }
+        }
     }
 
     /**
@@ -316,7 +417,10 @@ class LinkCoordinator(
 
         // ⚠️ 顺序要求：stopSession() 里会作废旧连接的 HID 注册，所以它必须排在下面
         //    "绑定新连接"**之前** —— 反过来的话刚绑上就被清掉了，表现为触摸屏永远注册不上（踩过）。
-        stopSession()
+        //
+        // ★ 这里用**同步**版本：马上要 claim 新接口，旧连接必须先真的关掉，
+        //   否则两者抢同一组端点。本方法本来就跑在 router 的后台线程上，同步关不会卡 UI。
+        stopSessionNow()
         currentConnection = connection
         onLinkEstablished(connection)
 
@@ -393,10 +497,8 @@ class LinkCoordinator(
         if (expectingRestart.get()) {
             logger.w(TAG, "切换画质重开会话中的瞬时失败（将自动重试）: $message", cause)
             listener.onProgress("重协商未成功（$message），正在自动重试…")
-            mainHandler.post {
-                stopSession()
-                router?.scanAndAttach()
-            }
+            // ★ 串行：先关干净这条失败的会话，再重连（10.33）
+            restartSerial { router?.scanAndAttach() }
             consecutiveFailures.incrementAndGet()
             return
         }

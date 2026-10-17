@@ -46,6 +46,13 @@ class BufferedByteChannel(
     private val leftover = ByteArray(scratchSize)
     private var leftoverLen = 0
     private var leftoverPos = 0
+
+    /**
+     * 是否已关闭。
+     *
+     * ★ 必须是 `@Volatile`：`close()` 不再持锁（见下），读线程在锁内也要能看到置位。
+     */
+    @Volatile
     private var closed = false
 
     /** 底层被真正读了几次（残留能服务多少上层请求，看这个数最直观）。 */
@@ -106,11 +113,28 @@ class BufferedByteChannel(
         }
     }
 
+    /**
+     * 关闭通道。
+     *
+     * ★ **绝不能 `synchronized(lock)`**（10.33 ANR 修复，真机堆栈实证）：
+     *   读线程在锁内做的是**阻塞的 USB 读**（`bulkTransfer`，超时 200ms 起，设备半断时更久），
+     *   主线程调 `close()` 会被卡在锁上 —— 实测点"强制重握手"时主线程 Blocked 5 秒，
+     *   系统直接 ANR：
+     *   ```
+     *   "main" prio=5 tid=1 Blocked
+     *     at BufferedByteChannel.close(BufferedByteChannel.kt:110)
+     *     - waiting to lock held by thread 108
+     *   "uav-reader" tid=108 Native
+     *     UsbDeviceConnection.bulkTransfer ← BufferedByteChannel.read
+     *   ```
+     *
+     * 现在只置标志（`@Volatile`，读线程下一圈就会看到并退出），再关底层通道
+     * （[ByteChannel.close] 的契约是"只置标志、不阻塞"，见 `BulkByteChannel.close`）。
+     * 残留缓冲不再清理 —— 关闭之后没有读者，丢了也无所谓。
+     */
     override fun close() {
-        synchronized(lock) {
-            if (closed) return
-            closed = true
-        }
+        if (closed) return
+        closed = true
         delegate.close()
     }
 

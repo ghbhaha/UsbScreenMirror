@@ -168,8 +168,16 @@ class AudioPipeline(
 
     fun stop() {
         if (!running.getAndSet(false) && thread == null) return
-        // 先让两个阻塞点返回，再 join —— 否则 join 会白等到超时
-        runCatching { codec?.stop() }
+        // ★ 顺序很关键（10.33 崩溃修复）：**先让编码线程自己退出去，最后才关编码器。**
+        //
+        //   原先是 `codec.stop()` → `join()`，于是编码线程可能正好走到
+        //   `feed()` 里的 `getInputBuffer()`，撞上 "Invalid to call during stop();
+        //   only valid in Executing states" —— 那是**未捕获的 IllegalStateException**，
+        //   发生在 `uav-audio` 线程上，直接打崩进程（真机 FATAL，用户点"停止投屏"时踩到）。
+        //
+        //   现在只 `record.stop()` 让阻塞的 `read()` 立刻返回（`dequeueInputBuffer`
+        //   本身带 10ms 超时，不需要靠关编码器来打断），join 之后线程已经走完
+        //   `while (running && !interrupted)` 的最后一圈，再释放编码器就没有竞争了。
         runCatching { record?.stop() }
         thread?.interrupt()
         try {
@@ -178,6 +186,8 @@ class AudioPipeline(
             Thread.currentThread().interrupt()
         }
         thread = null
+        // join 超时（例如线程卡在 USB 写上）时线程可能还活着 ——
+        // 那里靠 [feed] 的 catch 兜底，绝不会再让异常冒到线程顶层。
         releaseQuietly()
         logger.i(TAG, "内录已停止（${stats()}）")
     }
@@ -355,7 +365,16 @@ class AudioPipeline(
             inputTimeouts++
             return
         }
-        val buf = enc.getInputBuffer(index)
+        // ★ 必须包住（10.33）：`getInputBuffer` 在编码器已经 stop/release 之后会抛
+        //   `IllegalStateException: Invalid to call during stop()`。这个异常发生在
+        //   `uav-audio` 线程顶层，没人接就是进程 FATAL —— 停止投屏/音频出错降级都会撞上。
+        //   兜住之后下一圈 `while (running…)` 自然退出（此时 running 已经是 false）。
+        val buf = try {
+            enc.getInputBuffer(index)
+        } catch (t: Throwable) {
+            if (running.get()) logger.w(TAG, "音频 getInputBuffer 失败: ${t.message}")
+            return
+        }
         if (buf == null) {
             runCatching { enc.queueInputBuffer(index, 0, 0, 0, 0) }
             return
@@ -381,7 +400,11 @@ class AudioPipeline(
             }
 
             when {
-                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> emitConfig(enc.outputFormat)
+                // 同上：`enc.outputFormat` 在编码器已 stop/release 之后也会抛，
+                // 这里在 `when` 分支里、不在下面的 try 内，漏了同样是线程顶层 FATAL。
+                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
+                    runCatching { emitConfig(enc.outputFormat) }
+                        .onFailure { logger.w(TAG, "读取音频输出格式失败: ${it.message}") }
 
                 index == MediaCodec.INFO_TRY_AGAIN_LATER -> return
 
