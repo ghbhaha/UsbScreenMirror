@@ -84,6 +84,14 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
     /** 本次连接是否已经扫过残留 id（只做一次）。 */
     private var sweptThisConnection = false
 
+    /**
+     * 取"当前那条 USB 连接"（链路层提供）。
+     *
+     * 只用于 [rebindInjectorLocked] 的自愈兜底；正常路径仍走 [onLinkReady]。
+     */
+    @Volatile
+    var connectionProvider: () -> UsbDeviceConnection? = { null }
+
     // ------------------------------------------------------------------ 链路
 
     /**
@@ -160,9 +168,31 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
         }
     }
 
+    /**
+     * 注入器丢了就再要一次当前连接（**自愈**）。
+     *
+     * 为什么需要：注入器只在 [onLinkReady] 里绑，而 [onLinkLost] 会把它清成 null。
+     * 重连路径上"清掉"和"重新绑"本来是配对的，但**不配对的情况真实存在**：
+     * `LinkCoordinator.stopSession()` 在错误收口、重协商失败重试、轮询接管等多处被调，
+     * 其中若有任何一条后续没走到 `onReady`（例如握手被 `busy` 挡掉、或直接失败），
+     * 注入器就永久为 null —— 表现是**画面正常、但触摸从此完全没反应**，
+     * 且只有一条 W 级日志，极难发现（真机踩到过）。
+     *
+     * 兜底思路：只要能拿到"当前那条 USB 连接"，触摸就不该失效
+     * —— 连接失效时 `registerAndLoad` 自己会失败并打日志，不会误报成功。
+     */
+    private fun rebindInjectorLocked(): HidInjector? {
+        val connection = connectionProvider() ?: return null
+        val fresh = HidInjector(connection, logger)
+        injector = fresh
+        registeredId = 0
+        logger.i(TAG, "注入器自愈：从当前连接重新绑定（此前 onLinkReady 与 onLinkLost 不配对）")
+        return fresh
+    }
+
     /** 只在 worker 线程调用。 */
     private fun ensureRegisteredLocked() {
-        val inj = injector
+        val inj = injector ?: rebindInjectorLocked()
         if (inj == null) {
             // 这条路**必须留日志**：曾经因为静默 return，排查"触摸屏怎么都注册不上"
             // 时多花了不少时间（真因是宿主侧调用顺序把刚绑好的连接又清掉了）。

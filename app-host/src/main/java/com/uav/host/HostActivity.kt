@@ -206,6 +206,9 @@ class HostActivity : Activity() {
         }
         link.panelClearVideoSize = { panel.setVideoSize(0, 0) }
         link.onLinkEstablished = { connection -> hidTouch?.onLinkReady(connection) }
+        // 注入器自愈的取数口：重连路径上"onLinkLost 清了、却没走到 onLinkReady"时，
+        // HidTouchController 会从这里再要一次当前连接（否则触摸静默失效）。
+        hidTouch?.connectionProvider = { link.currentConnection }
 
         // ---- 画质层 ----
         quality = QualityController(

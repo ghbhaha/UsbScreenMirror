@@ -282,6 +282,16 @@ class LinkCoordinator(
     /** 链路就绪（拿到新的 USB 连接）→ 让上层把 HID 绑定上去。 */
     var onLinkEstablished: (android.hardware.usb.UsbDeviceConnection) -> Unit = {}
 
+    /**
+     * 当前那条 USB 连接（没有链路时为 null）。
+     *
+     * 只给 HID 层做"注入器自愈"用：`onLinkLost` 清了注入器、而重建路径没走到
+     * `onReady` 时，靠它把触摸救回来（见 `HidTouchController.rebindInjectorLocked`）。
+     */
+    @Volatile
+    var currentConnection: UsbDeviceConnection? = null
+        private set
+
     // ------------------------------------------------------------------ router 回调
 
     override fun onStatus(text: String) {
@@ -307,6 +317,7 @@ class LinkCoordinator(
         // ⚠️ 顺序要求：stopSession() 里会作废旧连接的 HID 注册，所以它必须排在下面
         //    "绑定新连接"**之前** —— 反过来的话刚绑上就被清掉了，表现为触摸屏永远注册不上（踩过）。
         stopSession()
+        currentConnection = connection
         onLinkEstablished(connection)
 
         val raw = BulkByteChannel(connection, pair, logger)
