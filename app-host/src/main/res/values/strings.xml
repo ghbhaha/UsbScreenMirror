@@ -23,10 +23,21 @@
     <string name="host_chip_connecting">连接中</string>
     <string name="host_chip_mirroring">投屏中</string>
     <string name="host_chip_renegotiating">重协商</string>
+    <string name="host_chip_replay">回放</string>
     <string name="host_chip_error">出错</string>
 
     <!-- 状态行 -->
     <string name="host_status_idle">空闲中 —— 请把配件手机插上来</string>
+    <!--
+      主状态行只说"处于哪个阶段"（10.23）。它**不能**包含任何"正在等你…"式的进度语义 ——
+      进度文本归副行。原先两者共用一行，导致原地重协商时画面没断却被说成"等待视频流"。
+    -->
+    <string name="host_status_connecting">正在建立连接…</string>
+    <string name="host_status_mirroring">投屏中</string>
+    <string name="host_status_renegotiating">投屏中 · 正在重协商…</string>
+    <string name="host_status_replay">回放抓流中</string>
+    <!-- ERROR 阶段的主行只说"出错了"，具体原因在副行（onError 已把原因拼进去） -->
+    <string name="host_status_error">链路出错</string>
 
     <!-- 操作（磁贴：图标在上、文字在下，文案尽量短） -->
     <string name="host_btn_scan">扫描 / 重试</string>
@@ -42,10 +53,9 @@
     <!-- 统计卡片标题 -->
     <string name="host_section_link">链路状态</string>
 
-    <!-- 切换画质时的状态行（见 docs/实施计划.md 10.17 / 10.18） -->
-    <string name="host_status_switch_11">已切到 1:1 像素模式，正在重协商…</string>
-    <string name="host_status_switch_hd">已切到高清模式（按面板长边编码），正在重协商…</string>
-    <string name="host_status_restarting">正在重协商…（原地重发 OPEN，手机重建编码器）</string>
+    <!-- 切换画质时的细节行（10.23 起只进副行，主行已由阶段显示"正在重协商…"） -->
+    <string name="host_status_switch_11">已切到 1:1 像素模式（按显示区编码）</string>
+    <string name="host_status_switch_hd">已切到高清模式（按面板长边编码）</string>
 
     <!--
       底部提示：面板会在首帧到达时自动收起，得让用户知道怎么叫回来；

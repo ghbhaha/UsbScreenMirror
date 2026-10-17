@@ -28,6 +28,7 @@ import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.AspectRatioSurfaceView
 import com.uav.protocol.BufferedByteChannel
 import com.uav.protocol.ByteChannel
+import com.uav.protocol.HostUiState
 import com.uav.protocol.Protocol
 import com.uav.protocol.Scale
 import com.uav.protocol.TouchPoint
@@ -52,6 +53,15 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     private lateinit var surfaceView: AspectRatioSurfaceView
     private lateinit var statusText: TextView
+
+    /**
+     * 主状态行**下面**的副行（10.23）：承载"瞬时进度"文本。
+     *
+     * 以前进度文本直接写主状态行，于是会把"投屏中"覆盖成"等待视频流"（10.23 的 bug）。
+     * 分成两行后：主行只说"处于哪个阶段"，副行只说"刚发生了什么"。
+     */
+    private lateinit var statusDetailText: TextView
+
     private lateinit var statsText: TextView
 
     /** 顶部的整块界面（状态 + 统计 + 按钮）；可以整体收起，让画面干净地占满。 */
@@ -93,6 +103,17 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
     /** 常驻状态药丸的状态（决定圆点颜色）。 */
     private enum class ChipState { IDLE, CONNECTING, ACTIVE, ERROR }
+
+    /**
+     * 面板状态机（10.23，纯逻辑在 `:protocol/HostUiState`，有 JVM 单测）。
+     *
+     * ★ **以前状态行是被事件流无条件覆盖的**（`onStatus` 直接 `statusText.text = text`），
+     *   而事件里混着"瞬时进度"与"持久状态"两种语义。真机 bug：原地重协商收到 `OKAY`
+     *   后照旧发「会话已建立，等待视频流…」，可画面根本没断过，而 `onFirstFrame()`
+     *   不会再来 —— 状态行被永久钉死，同时药丸是绿的，自相矛盾。
+     *   现在主状态行只由 [renderUiState] 按阶段渲染，进度文本降级为副行信息。
+     */
+    private val uiState = HostUiState()
 
     private lateinit var chipDot: View
     private lateinit var chipText: TextView
@@ -266,6 +287,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         surfaceView = findViewById(R.id.surface)
         statusText = findViewById(R.id.status)
+        statusDetailText = findViewById(R.id.status_detail)
         statsText = findViewById(R.id.stats)
         overlayView = findViewById(R.id.overlay)
         chipDot = findViewById(R.id.chip_dot)
@@ -288,14 +310,16 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // Scan / Retry 与 Force handshake 是**功能**而非调试入口
         // （手机被别的宿主 App 切成配件模式时，用户需要它们自救），release 保留。
         findViewById<Button>(R.id.btn_scan).setOnClickListener {
-            setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
+            uiState.onScanRequested()
+            renderUiState()
             router?.scanAndAttach()
         }
         findViewById<Button>(R.id.btn_force).setOnClickListener {
             stopSession()
             forceRetried = true
             fastPathUnverified = false
-            setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
+            uiState.onProgress("强制 AOA 重握手中…")
+            renderUiState()
             router?.scanAndAttach(forceHandshake = true)
         }
 
@@ -320,7 +344,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // 面板右上角：收起
         findViewById<View>(R.id.btn_collapse).setOnClickListener { setMenuVisible(false) }
 
-        setChip(ChipState.IDLE, getString(R.string.host_chip_idle))
+        renderUiState()
 
         router = UsbAttachRouter(this, logger, this).also { it.start() }
 
@@ -403,7 +427,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             TAG,
             "宿主显示区 ${area[0]}x${area[1]} 变化 -> 1:1 目标 max_size $have -> $want（差 ${(diff * 100).toInt()}%），重协商"
         )
-        statusText.text = "显示区变了，按新尺寸重协商…"
+        uiState.onRenegotiate()
+        uiState.onProgress("显示区变了（${area[0]}x${area[1]}），按新尺寸重协商…")
+        renderUiState()
         requestRenegotiate()
     }
 
@@ -434,10 +460,11 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         HostPrefs.setOneToOne(this, oneToOne)
         applyPixelModeUi()
         logger.i(TAG, "像素模式切换 → ${if (enabled) "1:1（按显示区编码）" else "高清（按面板长边编码）"}")
-        statusText.text = getString(
-            if (enabled) R.string.host_status_switch_11 else R.string.host_status_switch_hd
+        uiState.onRenegotiate()
+        uiState.onProgress(
+            getString(if (enabled) R.string.host_status_switch_11 else R.string.host_status_switch_hd)
         )
-        setChip(ChipState.CONNECTING, getString(R.string.host_chip_renegotiating))
+        renderUiState()
         requestRenegotiate()
     }
 
@@ -463,6 +490,59 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             }
         )
         chipDot.backgroundTintList = ColorStateList.valueOf(color)
+    }
+
+    /**
+     * 按 [HostUiState] 的当前阶段刷新**主状态行 + 副行 + 药丸**（10.23）。
+     *
+     * 主状态行只反映"现在处于哪个阶段"（投屏中 / 连接中 / 重协商中 / …），
+     * 进度文本（`CNXN 已发送` / `max_size=…` 这类有用信息）落到下面的副行。
+     * 这样无论事件怎么乱序，**主状态行都不会说谎**。
+     *
+     * 线程安全：会话回调来自 worker 线程，同 [setChip] 的约定自己转主线程。
+     */
+    private fun renderUiState() {
+        if (!::statusText.isInitialized) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { renderUiState() }
+            return
+        }
+        val phase = uiState.phase
+        statusText.text = getString(
+            when (phase) {
+                HostUiState.Phase.IDLE -> R.string.host_status_idle
+                HostUiState.Phase.CONNECTING -> R.string.host_status_connecting
+                HostUiState.Phase.MIRRORING -> R.string.host_status_mirroring
+                HostUiState.Phase.RENEGOTIATING -> R.string.host_status_renegotiating
+                HostUiState.Phase.REPLAY -> R.string.host_status_replay
+                HostUiState.Phase.ERROR -> R.string.host_status_error
+            }
+        )
+        // 副行：进度文本。与主行同色系但更淡，避免和主状态抢注意力。
+        statusDetailText.text = uiState.detail
+        statusDetailText.visibility =
+            if (uiState.detail.isBlank() || phase == HostUiState.Phase.ERROR) View.GONE else View.VISIBLE
+
+        setChip(
+            when (phase) {
+                HostUiState.Phase.IDLE -> ChipState.IDLE
+                HostUiState.Phase.CONNECTING -> ChipState.CONNECTING
+                // 重协商时点保持绿：画面确实还在播（原地重协商不中断渲染）
+                HostUiState.Phase.MIRRORING, HostUiState.Phase.RENEGOTIATING -> ChipState.ACTIVE
+                HostUiState.Phase.REPLAY -> ChipState.ACTIVE
+                HostUiState.Phase.ERROR -> ChipState.ERROR
+            },
+            getString(
+                when (phase) {
+                    HostUiState.Phase.IDLE -> R.string.host_chip_idle
+                    HostUiState.Phase.CONNECTING -> R.string.host_chip_connecting
+                    HostUiState.Phase.MIRRORING -> R.string.host_chip_mirroring
+                    HostUiState.Phase.RENEGOTIATING -> R.string.host_chip_renegotiating
+                    HostUiState.Phase.REPLAY -> R.string.host_chip_replay
+                    HostUiState.Phase.ERROR -> R.string.host_chip_error
+                }
+            ),
+        )
     }
 
     /**
@@ -858,10 +938,12 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // 会话真正建立起来 -> 快路径已验证通过，撤销自愈待办
         if (text.contains("会话已建立")) {
             fastPathUnverified = false
-            // 已握手、等画面 —— 药丸先显示"连接中"，首帧/尺寸就绪后再转"投屏中"
-            setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
         }
-        runOnUiThread { statusText.text = text }
+        // ★ 10.23：进度文本**不再**直接写主状态行，只进副行 + 由状态机决定主行。
+        //   原地重协商时画面根本没断，但这里照样会发「会话已建立，等待视频流…」——
+        //   旧代码直接覆盖主行，而 onFirstFrame 不会再来，于是状态被永久钉死。
+        uiState.onProgress(text)
+        renderUiState()
     }
 
     override fun onReady(
@@ -889,7 +971,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         //   这里清零 id，等拿到视频尺寸（= 手机屏幕尺寸 + 视频方向都已知）时重新注册。
         //   （触点状态**不清** —— 重连后要按它补发"还按着的那些手指"。）
         hidTouch?.onLinkReady(connection)
-        setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
+        // 建链成功但还没画面 ⇒ "连接中"。⚠️ 不能在这里报"投屏中"（画面还没出来）。
+        uiState.onProgress("链路已建立，等待 CNXN / 首帧…")
+        renderUiState()
 
         val raw = BulkByteChannel(connection, pair, logger)
         // ★ 先把上一次会话残留在 FIFO 里的字节丢掉，再开新会话。
@@ -928,9 +1012,11 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         //   坏了；也**不触发"强制 AOA 重握手"**（那会真重枚举手机，对一次画质切换是过重的反应）。
         if (expectingRestart) {
             logger.w(TAG, "切换画质重开会话中的瞬时失败（将自动重试）: $message", cause)
+            uiState.onProgress("重协商未成功（${message}），正在自动重试…")
+            renderUiState()
             runOnUiThread {
-                statusText.text = getString(R.string.host_status_restarting)
                 stopSession()
+                renderUiState()
             }
             consecutiveFailures.incrementAndGet()
             router?.resetAttempts()
@@ -939,8 +1025,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
 
         // ★ 出错必须把菜单叫回来：面板收起时错误信息是看不见的，
         //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
-        runOnUiThread { statusText.text = "ERROR: $message" }
-        setChip(ChipState.ERROR, getString(R.string.host_chip_error))
+        uiState.onError(message)
+        renderUiState()
         setMenuVisible(true)
         logger.e(TAG, message, cause)
 
@@ -962,7 +1048,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             forceRetried = true
             fastPathUnverified = false
             logger.w(TAG, "快路径失败（$message）→ 改为强制完整 AOA 握手重试一次")
-            runOnUiThread { statusText.text = "重试：强制 AOA 重握手（改写配件身份）…" }
+            uiState.onProgress("快路径未验证通过（$message），强制重握手…")
+            renderUiState()
             session?.close()
             session = null
             router?.onDeviceAttached(dev, forceHandshake = true)
@@ -972,8 +1059,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     /** 设备拔出：与读写异常统一走这里（计划 2.10）。 */
     private fun onDetached(device: UsbDevice?) {
         stopSession()
-        statusText.text = "USB 已拔出，请重新插线或点 Scan/Retry"
-        setChip(ChipState.IDLE, getString(R.string.host_chip_idle))
+        uiState.onDetached("USB 已拔出，请重新插线或点 Scan/Retry")
+        renderUiState()
         // 这条提示藏在收起的菜单里就等于没提示
         setMenuVisible(true)
     }
@@ -984,7 +1071,16 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         // 尺寸（重）配置成功 = 重协商已见效 → 立刻清掉"切换中"标志，
         // 免得它一直挂到 45s 兜底、把这段窗口里的真错误也吞掉。
         expectingRestart = false
-        setChip(ChipState.ACTIVE, getString(R.string.host_chip_mirroring))
+        // ★ 10.23：尺寸就绪只用来给"重协商中"收尾，**不能**提前宣告投屏中
+        //   （还没出画面就报"投屏中"是同一类错误，只是方向相反）。
+        //   同时把副行换成"新参数已生效"：否则重协商结束后副行会一直挂着
+        //   「会话已建立，等待视频流…」—— 那句话在画面正在播的时候读起来很别扭。
+        val wasRenegotiating = uiState.phase == HostUiState.Phase.RENEGOTIATING
+        uiState.onVideoSize()
+        if (wasRenegotiating) {
+            uiState.onProgress("已生效：${width}x$height" + if (oneToOne) "（1:1 像素）" else "（高清）")
+        }
+        renderUiState()
         runOnUiThread { surfaceView.setVideoSize(width, height) }
         // ★ 视频尺寸是**触摸坐标空间**的权威线索：手机屏幕的物理尺寸只在 CNXN 报一次，
         //   旋转后不会重报，只能靠视频方向推出它当前的长宽（见 TouchMapper）。
@@ -996,8 +1092,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     override fun onFirstFrame() {
         // 重开会话成功（画面出来了）→ 清掉"切换中"标志
         expectingRestart = false
-        setChip(ChipState.ACTIVE, getString(R.string.host_chip_mirroring))
-        runOnUiThread { statusText.text = "投屏中（首帧已输出）" }
+        // ★ 10.23：这是**唯一**能宣告"投屏中"的事件（首帧真的输出了）。
+        uiState.onFirstFrame()
+        renderUiState()
         // 画面出来了就把菜单收起来，让视频干净地占满整屏（只自动收一次，见 menuAutoCollapsed）。
         // 想调参数时点一下画面外的空白处即可叫回来。
         if (!menuAutoCollapsed) {
@@ -1007,8 +1104,9 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
     }
 
     override fun onClosed(reason: String) {
-        setChip(ChipState.CONNECTING, getString(R.string.host_chip_connecting))
-        runOnUiThread { statusText.text = "已断开：$reason" }
+        // 链路断开不是终态：前台轮询会自动重试（见 usbPoller），所以回"连接中"而非"空闲"。
+        uiState.onClosed(reason)
+        renderUiState()
         setMenuVisible(true)
     }
 
@@ -1066,7 +1164,8 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         )
         session = s
         s.start()
-        statusText.text = "回放：${file.name}（${channel.totalBytes} 字节）"
+        uiState.onReplay("回放：${file.name}（${channel.totalBytes} 字节）")
+        renderUiState()
     }
 
     // ------------------------------------------------------------------ 生命周期

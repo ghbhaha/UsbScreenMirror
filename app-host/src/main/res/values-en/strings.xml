@@ -10,9 +10,16 @@
     <string name="host_chip_connecting">Connecting</string>
     <string name="host_chip_mirroring">Mirroring</string>
     <string name="host_chip_renegotiating">Renegotiating</string>
+    <string name="host_chip_replay">Replay</string>
     <string name="host_chip_error">Error</string>
 
+    <!-- Main status line only states the current phase (10.23); progress text goes to the subtitle. -->
     <string name="host_status_idle">Idle — plug in the accessory phone</string>
+    <string name="host_status_connecting">Connecting…</string>
+    <string name="host_status_mirroring">Mirroring</string>
+    <string name="host_status_renegotiating">Mirroring · renegotiating…</string>
+    <string name="host_status_replay">Replaying capture</string>
+    <string name="host_status_error">Link error</string>
 
     <string name="host_btn_scan">Scan / Retry</string>
     <string name="host_btn_force">Rehandshake</string>
@@ -25,9 +32,8 @@
 
     <string name="host_section_link">LINK</string>
 
-    <string name="host_status_switch_11">Switched to 1:1 pixels — renegotiating…</string>
-    <string name="host_status_switch_hd">Switched to HD (panel long side) — renegotiating…</string>
-    <string name="host_status_restarting">Renegotiating… (re-sending OPEN in place; phone rebuilds encoder)</string>
+    <string name="host_status_switch_11">Switched to 1:1 pixels (encodes at display area)</string>
+    <string name="host_status_switch_hd">Switched to HD (encodes at panel long side)</string>
 
     <string name="host_hint">Tap outside the video to show / hide this panel · enable auto-rotate on the phone</string>
 </resources>

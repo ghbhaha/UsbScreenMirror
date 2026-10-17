@@ -115,6 +115,11 @@
                 android:tint="@color/host_text_dim" />
         </LinearLayout>
 
+        <!--
+            ★ 分成两行（10.23）：主行只说"处于哪个阶段"，副行承载"瞬时进度"。
+              以前进度文本直接写主行，会把「投屏中」覆盖成「等待视频流…」——
+              原地重协商时画面根本没断，但进度事件照旧发这一句，主行就被永久钉死了。
+        -->
         <TextView
             android:id="@+id/status"
             android:layout_width="match_parent"
@@ -124,6 +129,16 @@
             android:text="@string/host_status_idle"
             android:textColor="@color/host_text"
             android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/status_detail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:lineSpacingExtra="2dp"
+            android:textColor="@color/host_text_faint"
+            android:textSize="11sp"
+            android:visibility="gone" />
 
         <!-- 链路统计（内嵌卡片，层次比面板再暗一档） -->
         <LinearLayout
