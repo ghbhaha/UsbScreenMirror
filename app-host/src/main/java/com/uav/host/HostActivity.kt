@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.SurfaceHolder
+import android.view.WindowManager
 import androidx.core.content.IntentCompat
 import com.uav.host.debug.DebugIntents
 import com.uav.host.debug.FileByteChannel
@@ -168,6 +169,12 @@ class HostActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_host)
+
+        // ★ 宿主这块屏就是"显示器"：一息屏画面就没了，也没有人会去点它唤醒。
+        //   FLAG_KEEP_SCREEN_ON 只在**本窗口可见时**生效，切后台/锁屏后自动恢复系统的
+        //   息屏策略，所以不需要手动 clear（也因此不会拖住整个系统的休眠）。
+        //   ⚠️ 它只阻止"息屏"，不改亮度；用户手动按电源键仍然能立即息屏。
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         panel = HostPanel(this)
         // ★ 先 bind 再挂 listener / 建TouchForwarder（10.24 崩溃修复）：
