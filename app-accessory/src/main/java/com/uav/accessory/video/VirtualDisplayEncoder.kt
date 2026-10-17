@@ -241,6 +241,25 @@ class VirtualDisplayEncoder(
                 runCatching { setFloat(KEY_MAX_FPS_TO_ENCODER, options.maxFps.toFloat()) }
                     .onFailure { logger.w(TAG, "设置 $KEY_MAX_FPS_TO_ENCODER 失败: ${it.message}") }
             }
+
+            // ---- 低延迟三件套（10.31）----
+            // 都只是"请求"：编解码器不认识就忽略（用 runCatching 兜住，不让它挡住启动）。
+            //
+            // ⚠️ 为什么用字符串而不是 `MediaFormat.KEY_LATENCY`：后者是 API 30 才有的常量，
+            //   而本模块 minSdk 23，直接引用会让 lint 报 NewApi；这些 key 的字符串值本身稳定。
+
+            // ① 实时优先级：编码器在有其它活（相机预览之类）时也不被降级。
+            runCatching { setInteger(KEY_PRIORITY, 0) }
+                .onFailure { logger.w(TAG, "设置 priority 失败（忽略）: ${it.message}") }
+
+            // ② 最低延迟模式：让编码器少攒几帧再吐（默认模式下它有 1~2 帧的内部缓冲）。
+            runCatching { setInteger(KEY_LATENCY_ENC, 0) }
+                .onFailure { logger.w(TAG, "设置 latency 失败（忽略）: ${it.message}") }
+
+            // ③ 禁 B 帧：B 帧要等后面的帧才能编码，天然多 2~3 帧延迟。
+            //    实时投屏**永远**不该用 B 帧（默认多半不开，但厂商实现不一，显式关掉）。
+            runCatching { setInteger(KEY_MAX_B_FRAMES, 0) }
+                .onFailure { logger.w(TAG, "设置 max-bframes 失败（忽略）: ${it.message}") }
         }
 
         val encoder = MediaCodec.createEncoderByType(MIME_TYPE)
@@ -718,6 +737,15 @@ class VirtualDisplayEncoder(
 
         /** `repeat-previous-frame-after`（微秒）。 */
         private const val KEY_REPEAT_PREVIOUS_FRAME_AFTER = "repeat-previous-frame-after"
+
+        /** 10.31 低延迟：实时优先级（0 = realtime）。 */
+        private const val KEY_PRIORITY = "priority"
+
+        /** 10.31 低延迟：编码器最低延迟模式（0 = 最少内部缓冲）。 */
+        private const val KEY_LATENCY_ENC = "latency"
+
+        /** 10.31 低延迟：禁用 B 帧。 */
+        private const val KEY_MAX_B_FRAMES = "max-bframes"
 
         /** 已核实存在的限帧键（surface 输入模式下由编码器丢源帧）。 */
         private const val KEY_MAX_FPS_TO_ENCODER = "max-fps-to-encoder"

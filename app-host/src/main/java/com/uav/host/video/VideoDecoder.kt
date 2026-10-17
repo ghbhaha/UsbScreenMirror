@@ -130,6 +130,14 @@ class VideoDecoder(
             csdUnits.forEachIndexed { i, unit ->
                 format.setByteBuffer("csd-$i", ByteBuffer.wrap(unit))
             }
+            // ---- 低延迟（10.31）----
+            // ⚠️ 只"请求"，不支持就忽略：解码器不认这些 key 时只是没效果，不能让它挡住启动。
+            // ① 低延迟模式：解码器凑够一帧就立刻输出，不等后续参考帧（默认会攒几帧）。
+            runCatching { format.setInteger(KEY_LOW_LATENCY, 1) }
+                .onFailure { logger.w(TAG, "设置 low-latency 失败（忽略）: ${it.message}") }
+            // ② 实时优先级：与编码端同理，别被系统降级。
+            runCatching { format.setInteger(KEY_PRIORITY, 0) }
+                .onFailure { logger.w(TAG, "设置 priority 失败（忽略）: ${it.message}") }
             c = MediaCodec.createDecoderByType(MIME_TYPE)
             c.configure(format, surface, null, 0)
             c.start()
@@ -267,6 +275,18 @@ class VideoDecoder(
 
         /** 输入缓冲 dequeue 超时（微秒）；宁可短一些，避免拖住消费线程。 */
         const val INPUT_TIMEOUT_US = 10_000L
+
+        /**
+         * 低延迟解码（10.31）。
+         *
+         * ⚠️ 用字符串而非 `MediaFormat.KEY_LOW_LATENCY`：后者是 API 30 的常量，
+         *   本模块 minSdk 23，直接引用会触发 lint NewApi；这些 key 的字符串值本身是稳定的。
+         *   解码器不认识时会被忽略（configure 不会因此失败）。
+         */
+        private const val KEY_LOW_LATENCY = "low-latency"
+
+        /** 实时优先级（0 = realtime），与编码端对齐。 */
+        private const val KEY_PRIORITY = "priority"
 
         /**
          * 按 Annex-B 起始码切分 NAL。

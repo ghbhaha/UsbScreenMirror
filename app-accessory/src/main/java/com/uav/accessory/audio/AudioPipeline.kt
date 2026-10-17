@@ -271,6 +271,14 @@ class AudioPipeline(
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             // 一次输入就是 1024 样本，声明出来免得编码器内部再切
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, AudioSpec.PCM_FRAME_BYTES)
+            // ---- 低延迟（10.31，与视频侧同构）----
+            // 音频不降延迟的话，视频快了之后音画会错位（实测视频 p50 从 143→38ms 后，
+            // A/V 偏移从 +7~20ms 变成 -178ms，即画面比声音早 0.18 秒）。
+            // 只"请求"，编码器不认就忽略。
+            runCatching { setInteger("priority", 0) }      // 实时
+                .onFailure { AndroidLogger.w(TAG, "设置 priority 失败（忽略）: ${it.message}") }
+            runCatching { setInteger("latency", 0) }       // 最低延迟
+                .onFailure { AndroidLogger.w(TAG, "设置 latency 失败（忽略）: ${it.message}") }
         }
         val c = MediaCodec.createEncoderByType(AudioSpec.MIME)
         c.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
