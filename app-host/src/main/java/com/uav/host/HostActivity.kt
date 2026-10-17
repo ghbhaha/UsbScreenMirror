@@ -12,6 +12,9 @@ import android.os.Looper
 import android.view.SurfaceHolder
 import android.view.WindowManager
 import androidx.core.content.IntentCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.uav.host.debug.DebugIntents
 import com.uav.host.debug.FileByteChannel
 import com.uav.host.input.HidTouchController
@@ -175,6 +178,7 @@ class HostActivity : Activity() {
         //   息屏策略，所以不需要手动 clear（也因此不会拖住整个系统的休眠）。
         //   ⚠️ 它只阻止"息屏"，不改亮度；用户手动按电源键仍然能立即息屏。
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        goFullscreen()
 
         panel = HostPanel(this)
         // ★ 先 bind 再挂 listener / 建TouchForwarder（10.24 崩溃修复）：
@@ -241,6 +245,28 @@ class HostActivity : Activity() {
         mainHandler.post(statsTicker)
 
         handleIntent(intent)
+    }
+
+    /**
+     * 全屏：隐藏状态栏与导航栏。
+     *
+     * ★ 宿主这块屏是"显示器"，两根系统栏纯属干扰 —— 尤其导航栏会永久吃掉底部一条画面。
+     * ★ `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`：从边缘划一下就能临时调出系统栏，
+     *   松手自动隐藏 —— 既干净，又不至于"退不出去"。
+     * ⚠️ 必须**每次拿到焦点时重新隐藏**：从后台回来、或用户划出系统栏之后，它们会赖着不走。
+     *   只在 `onCreate` 设一次是不够的，这是沉浸式全屏最经典的一个坑。
+     */
+    private fun goFullscreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) goFullscreen()
     }
 
     /**

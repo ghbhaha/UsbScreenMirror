@@ -7,7 +7,10 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
 import android.view.ViewConfiguration
+import android.widget.FrameLayout
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.uav.host.R
 import com.uav.host.video.AspectRatioSurfaceView
 import com.uav.protocol.HostUiState
@@ -55,6 +58,7 @@ class HostPanel(private val activity: Activity) {
     private lateinit var statusText: TextView
     private lateinit var statusDetailText: TextView
     private lateinit var statsText: TextView
+    private lateinit var chipView: View
     private lateinit var chipDot: View
     private lateinit var chipText: TextView
 
@@ -119,6 +123,7 @@ class HostPanel(private val activity: Activity) {
         statusDetailText = r.findViewById(R.id.status_detail)
         statsText = r.findViewById(R.id.stats)
         overlayView = r.findViewById(R.id.overlay)
+        chipView = r.findViewById(R.id.status_chip)
         chipDot = r.findViewById(R.id.chip_dot)
         chipText = r.findViewById(R.id.chip_state)
         segOneToOne = r.findViewById(R.id.btn_pixel_11)
@@ -176,6 +181,47 @@ class HostPanel(private val activity: Activity) {
         // `configChanges=orientation|screenSize|screenLayout|density` ⇒ **不会重建**，
         // 会话里的 max_size 就会过期（典型症状：画面变糊，因为手机按旧尺寸编、宿主放大显示）。
         rootView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> onDisplayAreaChanged() }
+
+        setUpSystemBarInsets()
+    }
+
+    /**
+     * 全屏后系统栏不再占位，但**刘海 / 挖孔 / 手势条仍然压在屏幕上**
+     * —— 面板顶部会被挖孔挡住、底部那行提示会被手势条盖住。
+     *
+     * 所以要把 insets 折进面板的内边距和药丸的上外边距。
+     *
+     * ⚠️ 基准值必须在**首次**回调前记下来：insets 会随旋转 / 键盘 / 划出系统栏多次回调，
+     *   每次都拿"当前 padding"当基准会一路累加，面板会越缩越窄。
+     */
+    private fun setUpSystemBarInsets() {
+        val basePadding = intArrayOf(
+            overlayView.paddingLeft, overlayView.paddingTop,
+            overlayView.paddingRight, overlayView.paddingBottom,
+        )
+        val chipParams = chipView.layoutParams as? FrameLayout.LayoutParams
+        val baseChipTop = chipParams?.topMargin ?: 0
+
+        ViewCompat.setOnApplyWindowInsetsListener(rootView) { _, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            overlayView.setPadding(
+                basePadding[0],
+                basePadding[1] + bars.top,
+                basePadding[2],
+                basePadding[3] + bars.bottom,
+            )
+            chipParams?.let {
+                val want = baseChipTop + bars.top
+                if (it.topMargin != want) {
+                    it.topMargin = want
+                    chipView.layoutParams = it
+                }
+            }
+            insets
+        }
+        ViewCompat.requestApplyInsets(rootView)
     }
 
     /**
