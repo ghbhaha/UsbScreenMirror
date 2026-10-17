@@ -4,35 +4,25 @@ import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.content.res.ColorStateList
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.view.MotionEvent
 import android.view.SurfaceHolder
-import android.view.Surface
-import android.view.View
-import android.view.ViewConfiguration
-import android.widget.Button
-import android.widget.TextView
 import androidx.core.content.IntentCompat
+import com.uav.host.debug.DebugIntents
 import com.uav.host.debug.FileByteChannel
 import com.uav.host.input.HidTouchController
+import com.uav.host.input.TouchForwarder
+import com.uav.host.link.LinkCoordinator
 import com.uav.host.session.HostSession
-import com.uav.host.usb.BulkByteChannel
+import com.uav.host.ui.HostPanel
 import com.uav.host.usb.BulkPair
 import com.uav.host.usb.UsbAttachRouter
-import com.uav.host.video.AspectRatioSurfaceView
-import com.uav.protocol.BufferedByteChannel
-import com.uav.protocol.ByteChannel
+import com.uav.host.video.QualityController
 import com.uav.protocol.HostUiState
 import com.uav.protocol.Protocol
-import com.uav.protocol.Scale
-import com.uav.protocol.TouchPoint
-import com.uav.protocol.TouchMapper
 import com.uav.protocol.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
@@ -40,156 +30,74 @@ import com.uav.protocol.w
 import java.io.File
 
 /**
- * 宿主投屏页（计划 2.12 / 4.7）。
+ * 宿主投屏页 —— **只做装配与生命周期**（10.24 分层重构）。
  *
- * 职责很薄：把 UI 与三个部件接起来
- *  - [UsbAttachRouter]：插线 → 权限 → AOA 握手 → 等重枚举 → claim 接口
- *  - [HostSession]：CNXN / OPEN / OKAY 编排 + 收流 + 解码渲染
- *  - 状态与统计文本：联调全靠它看进度（计划 2.12）
+ * ## 为什么它现在这么短
  *
- * 另外提供 **`.uav` 回放**入口（计划 4.0）：跳过 USB 与握手直接把抓流喂进同一套会话代码。
+ * 拆分前这个类 1262 行，同时干 6 件事：View 渲染、链路编排、画质策略、触摸转发、
+ * 调试入口、回放。任何改动都要在脑子里维护全部 6 条线。现在每件事各归其位：
+ *
+ * | 层 | 类 | 职责 | 不碰 |
+ * |---|---|---|---|
+ * | View | [HostPanel] | 状态行 / 副行 / 药丸 / 菜单 / 统计 | 链路、画质 |
+ * | 链路 | [LinkCoordinator] | 插线 → AOA → 建会话 → 断链自愈 → 轮询退避 | 任何 View |
+ * | 画质 | [QualityController] | 1:1↔高清、显示区变化该不该重协商 | View、USB |
+ * | 输入 | [TouchForwarder] | `MotionEvent` → 手机触摸 → HID | 链路状态 |
+ * | 调试 | [DebugIntents] | adb extra → 动作（release 门控） | 一切实现细节 |
+ *
+ * 本类剩下的是**它们之间唯一的粘合剂**：生命周期回调、Surface 回调、
+ * 状态机（[HostUiState]）的推进、以及"一次重协商"的编排。
+ *
+ * ## 不变的东西
+ *
+ * - **实现语义一字未改**：所有阈值、时序、顺序要求（见各层里的注释）都原样搬过来了。
+ *   拆分只改"谁住在哪个文件里"。
+ * - **调试入口 `--ez scan true` 等**行为不变。
+ * - **状态机**（10.23）仍是主状态行的唯一权威。
  */
-class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener {
+class HostActivity : Activity() {
 
-    private lateinit var surfaceView: AspectRatioSurfaceView
-    private lateinit var statusText: TextView
+    private lateinit var panel: HostPanel
+    private lateinit var link: LinkCoordinator
+    private lateinit var quality: QualityController
+    private lateinit var touch: TouchForwarder
+    private lateinit var debugIntents: DebugIntents
 
-    /**
-     * 主状态行**下面**的副行（10.23）：承载"瞬时进度"文本。
-     *
-     * 以前进度文本直接写主状态行，于是会把"投屏中"覆盖成"等待视频流"（10.23 的 bug）。
-     * 分成两行后：主行只说"处于哪个阶段"，副行只说"刚发生了什么"。
-     */
-    private lateinit var statusDetailText: TextView
-
-    private lateinit var statsText: TextView
-
-    /** 顶部的整块界面（状态 + 统计 + 按钮）；可以整体收起，让画面干净地占满。 */
-    private lateinit var overlayView: View
-
-    /** 根容器：视频显示区的"可用区"就是它（1:1 协商与"点空白处切菜单"都用它）。 */
-    private lateinit var rootView: View
-
-    /** 菜单当前是否展开。 */
-    private var menuShown = true
-
-    /**
-     * 「首帧到达时自动收起一次」是否已经做过。
-     *
-     * 只做**一次**而不是每次首帧都收：重连后画面恢复同样会触发首帧，
-     * 那时用户若正开着菜单看统计，被强行收掉会很恼人。
-     */
-    private var menuAutoCollapsed = false
-
-    /** 空白区触摸的按下点，用来判断"这是点击"还是"从空白区划出去"。 */
-    private var menuDownX = 0f
-    private var menuDownY = 0f
-
-    /** 判定"点击"的最大位移平方（`ViewConfiguration` 的 touchSlop 平方，免开方）。 */
-    private var menuSlopSq = 0f
-
-    private var router: UsbAttachRouter? = null
-    private var session: HostSession? = null
-    private var bulkChannel: BulkByteChannel? = null
-    private var replayChannel: FileByteChannel? = null
-
-    /**
-     * 像素模式：`true` = 1:1 像素映射（省算力），`false` = 高清旧口径（宿主端缩放更锐）。
-     *
-     * 决定 `OPEN` 协商的 `max_size`，改了要让新参数生效（见 [setPixelMode]）。
-     * 初值从 [HostPrefs] 读，切换后写回。
-     */
-    private var oneToOne = true
-
-    /** 常驻状态药丸的状态（决定圆点颜色）。 */
-    private enum class ChipState { IDLE, CONNECTING, ACTIVE, ERROR }
+    /** 触摸注入控制器。链接失败、Surface 销毁、Activity 结束都会用到它。 */
+    private var hidTouch: HidTouchController? = null
 
     /**
      * 面板状态机（10.23，纯逻辑在 `:protocol/HostUiState`，有 JVM 单测）。
      *
-     * ★ **以前状态行是被事件流无条件覆盖的**（`onStatus` 直接 `statusText.text = text`），
-     *   而事件里混着"瞬时进度"与"持久状态"两种语义。真机 bug：原地重协商收到 `OKAY`
-     *   后照旧发「会话已建立，等待视频流…」，可画面根本没断过，而 `onFirstFrame()`
-     *   不会再来 —— 状态行被永久钉死，同时药丸是绿的，自相矛盾。
-     *   现在主状态行只由 [renderUiState] 按阶段渲染，进度文本降级为副行信息。
+     * ★ **以前状态行是被事件流无条件覆盖的**，而事件里混着"瞬时进度"与"持久状态"两种语义。
+     *   现在主状态行只由 [render] 按阶段渲染，进度文本降级为副行信息。
      */
     private val uiState = HostUiState()
 
-    private lateinit var chipDot: View
-    private lateinit var chipText: TextView
-    private lateinit var segOneToOne: TextView
-    private lateinit var segHighQuality: TextView
-
-    /**
-     * 「用户主动切换画质、正在重开会话」标志（10.17）。
-     *
-     * 为 `true` 时，瞬时握手失败不当 ERROR 展示、也不触发强制 AOA 重握手 ——
-     * 那类失败是"手机端还在推流 + 宿主刚重连"的字节交错，自动重试即恢复。
-     * 首个视频帧到达（或 [_clearExpectingRestartDelayed] 超时兜底）即清除。
-     */
-    private var expectingRestart = false
-
-    /** 切换重开的兜底清理：即使一直没出画面，也不能让标志永久挂着掩盖真错误。 */
-    private val clearExpectingRestartDelayed = Runnable { expectingRestart = false }
-
-    /** 同一时刻只允许一次"尺寸重协商"在飞（布局回调可能连发）。 */
-    private val renegotiating = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /**
-     * 触摸注入控制器（路线图 P1「输入通道」）：把**宿主屏幕上的触摸**转发成手机上的触摸。
-     *
-     * 坐标换算在 `:protocol/TouchMapper`（纯逻辑 + 单测），本类只负责
-     * 「从 MotionEvent 取点 → 换算 → 交给控制器」这段接线。
-     */
-    private var hidTouch: HidTouchController? = null
-
-    /**
-     * 是否向手机请求音频（10.13）。
-     *
-     * 默认开启；调试入口 `--ez no_audio true` 可关（只在 debug 包生效）。
-     */
+    /** 是否向手机请求音频（10.13）。调试入口 `--ez no_audio true` 可关。 */
     private var audioEnabled = true
 
     /** 音频起播延迟（A/V 粗补偿），可由 `--ei audio_delay_ms N` 调整。 */
     private var audioDelayMs = HostSession.DEFAULT_AUDIO_DELAY_MS
 
-    @Volatile
-    private var surfaceReady = false
-
-    /** 最近一次 attach 的设备，供"自愈"重试用。 */
-    @Volatile
-    private var lastDevice: UsbDevice? = null
-
-    /** 本次连接是否走了"跳过握手"的快路径（`aoaVersion == 0` 即表示跳过）。 */
-    @Volatile
-    private var fastPathUnverified = false
-
-    /** 是否已经为本次连接做过一次强制重握手，避免死循环。 */
-    @Volatile
-    private var forceRetried = false
-
-    /**
-     * 连续建链失败次数（成功一次即归零），用于轮询退避。
-     *
-     * 用原子类而不是普通 int：`onError` 可能从会话线程过来（`HostSession.fail`），
-     * 而 `onReady` 与轮询都在主线程。
-     */
-    private val consecutiveFailures = java.util.concurrent.atomic.AtomicInteger()
+    private val logger = AndroidLogger
 
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 回放通道（`.uav` 调试模式）；与 USB 会话互斥。 */
+    private var replayChannel: FileByteChannel? = null
+
     private var tickCount = 0L
 
+    /** 链路统计的周期刷新。UI 用紧凑形状，日志用完整形状（见 [HostSession.statsCompact]）。 */
     private val statsTicker = object : Runnable {
         override fun run() {
-            val s = session
-            // ★ 界面与日志刻意用**两种形状**：面板要"一眼看懂"（紧凑分行，见 statsCompact），
-            //   日志要"什么都别漏"（一整行，压测读首末对比）。
+            val s = link.session
             val uiText = when {
                 s != null -> s.statsCompact()
-                bulkChannel != null -> bulkChannel!!.stats()
-                else -> "无活动会话"
+                else -> link.bulkStats() ?: "无活动会话"
             }
-            statsText.text = uiText
+            panel.setStats(uiText)
             // 每 5 秒把统计打进日志：5 分钟压测（计划 4.10）要靠它读首末对比，
             // 也避免依赖 UI 取值（画面持续刷新时 uiautomator dump 会拿不到稳定帧）。
             // release 下关掉：发布包每 5 秒刷一条 logcat 没有意义（计划 5.2）。
@@ -201,56 +109,30 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         }
     }
 
-    /**
-     * 前台轮询兜底：实测宿主设备（BOE P40UCH）在手机重枚举后**只发 DETACHED、不发 ATTACHED**，
-     * 只靠 `USB_DEVICE_ATTACHED` 广播会让"插线即投"彻底失效。
-     * 因此在 Activity 可见期间定时扫一遍设备列表，发现没试过的就自动握手。
-     *
-     * ⚠️ 必须同时要求 **Surface 就绪**：没有 Surface 时握手也白搭
-     *   （`handleConfigFrame` 会等不到 Surface 而失败），而且每次握手都会让手机**重新枚举**
-     *   USB —— 切后台时反复重枚举纯属浪费，还会把自动重试配额耗掉。
-     */
-    private val usbPoller = object : Runnable {
-        override fun run() {
-            if (session == null && surfaceReady) {
-                runCatching { router?.pollOnce() }
-                    .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
-            }
-            mainHandler.postDelayed(this, nextPollDelayMs())
-        }
-    }
-
-    /**
-     * 轮询间隔：连续失败时**指数退避**（2s → 4s → 8s → 16s → 30s 封顶）。
-     *
-     * 为什么要退避：设备一直在、但握手一直失败时（例如它已被别的宿主 App 占成孤儿链路），
-     * 固定 2 秒轮询会无休止重试；退避能在**不放弃**的前提下把空转降到最低。
-     * 建链成功 后 [consecutiveFailures] 归零，立刻回到最快档。
-     */
-    private fun nextPollDelayMs(): Long =
-        (POLL_INTERVAL_MS shl consecutiveFailures.get().coerceIn(0, MAX_POLL_BACKOFF_SHIFT))
-            .coerceAtMost(MAX_POLL_INTERVAL_MS)
-
     private val detachReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
-            val device = IntentCompat.getParcelableExtra(intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+            val device = IntentCompat.getParcelableExtra(
+                intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java,
+            )
             logger.i(TAG, "detach broadcast: ${intent.action} device=${device?.deviceId}")
-            onDetached(device)
+            link.onDeviceDetached(device)
+            uiState.onDetached("USB 已拔出，请重新插线或点 Scan/Retry")
+            render()
+            // 这条提示藏在收起的菜单里就等于没提示
+            panel.setMenuVisible(true)
         }
     }
-
-    private val logger = AndroidLogger
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {
-            surfaceReady = true
+            panel.onSurfaceReady()
             logger.i(TAG, "surface created: ${holder.surface}")
             // 优先「原地重建解码器」：链路不动，只把解码器挂到新 Surface 上。
-            session?.resumeRendering()
+            link.session?.resumeRendering()
             // 会话已经没了（链路错误 / 首次启动）时，才重新建链。
-            if (session == null) {
+            if (link.session == null) {
                 logger.i(TAG, "无活动会话，立即尝试建立链接")
-                router?.scanAndAttach()
+                link.scan()
             }
         }
 
@@ -259,7 +141,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
         }
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
-            surfaceReady = false
+            panel.onSurfaceGone()
             logger.i(TAG, "surface destroyed")
             // 手指若还按着，必须全部补抬起 —— 否则手机上那几根手指会**一直按住**。
             // （正常路径上 View 会先收到 ACTION_CANCEL，这里只是兜底，`cancelAll()` 幂等。）
@@ -277,396 +159,255 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             //
             //   所以正确做法是：**只释放解码器、停止渲染，链路原样保持**。
             //   解码器另有一层兜底（见 `VideoDecoder.drainOutput`）。
-            session?.suspendRendering()
+            link.session?.suspendRendering()
         }
     }
+
+    // ------------------------------------------------------------------ 生命周期
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_host)
 
-        surfaceView = findViewById(R.id.surface)
-        statusText = findViewById(R.id.status)
-        statusDetailText = findViewById(R.id.status_detail)
-        statsText = findViewById(R.id.stats)
-        overlayView = findViewById(R.id.overlay)
-        chipDot = findViewById(R.id.chip_dot)
-        chipText = findViewById(R.id.chip_state)
-        segOneToOne = findViewById(R.id.btn_pixel_11)
-        segHighQuality = findViewById(R.id.btn_pixel_hd)
-        rootView = findViewById(R.id.root)
+        panel = HostPanel(this)
+        // ★ 先 bind 再挂 listener / 建TouchForwarder（10.24 崩溃修复）：
+        //   bind() 才去找面板里的控件，顺序反了会在 onCreate 里直接崩。
+        panel.bind(
+            onTogglePixelMode = { quality.setPixelMode(it) },
+            onScan = { userScan() },
+            onForceRehandshake = { userForceRehandshake() },
+            onPickReplay = { pickReplayFile() },
+            onDisplayAreaChanged = { quality.onDisplayAreaChanged() },
+        )
 
-        surfaceView.holder.addCallback(surfaceCallback)
-
-        setUpMenuToggle()
-
-        // 触摸注入：把宿主屏幕上的触摸转发成手机上的触摸（路线图 P1）。
         hidTouch = HidTouchController(logger)
-        surfaceView.setOnTouchListener { _, event -> handleSurfaceTouch(event) }
-
-        val screen = DisplaySize.of(this)
-        logger.i(TAG, "host screen ${screen.x}x${screen.y}, protocol v${Protocol.VERSION}")
-
-        // Scan / Retry 与 Force handshake 是**功能**而非调试入口
-        // （手机被别的宿主 App 切成配件模式时，用户需要它们自救），release 保留。
-        findViewById<Button>(R.id.btn_scan).setOnClickListener {
-            uiState.onScanRequested()
-            renderUiState()
-            router?.scanAndAttach()
-        }
-        findViewById<Button>(R.id.btn_force).setOnClickListener {
-            stopSession()
-            forceRetried = true
-            fastPathUnverified = false
-            uiState.onProgress("强制 AOA 重握手中…")
-            renderUiState()
-            router?.scanAndAttach(forceHandshake = true)
+        touch = TouchForwarder(panel.surfaceView, logger).also { f ->
+            f.injector = hidTouch
         }
 
-        // `.uav` 回放是**纯调试入口**（计划 5.2）：release 包连按钮都不显示。
-        findViewById<Button>(R.id.btn_replay).apply {
-            if (DebugTools.ENABLED) {
-                setOnClickListener { pickReplayFile() }
-            } else {
-                visibility = View.GONE
-            }
+        // ---- 链路层 ----
+        link = LinkCoordinator(
+            context = this,
+            logger = logger,
+            surfaceProvider = { panel.currentSurface() },
+            displayArea = { panel.displayArea() },
+            oneToOne = { quality.oneToOne },
+            audioEnabled = { audioEnabled },
+            audioDelayMs = { audioDelayMs },
+            listener = linkListener,
+        )
+        link.isSurfaceReady = { panel.surfaceReady }
+        link.onLinkLost = {
+            // ⚠️ 触点状态**保留**在控制器里 —— 重连后它会把"手指还按着"补发回去，
+            //   避免手机上手指"卡住"。
+            // ⚠️ 只调 TouchForwarder 这一处：它内部的 injector 就是 hidTouch，
+            //   以前两个都调，日志会重复打两条「作废注入器」。
+            touch.onLinkLost()
         }
+        link.panelClearVideoSize = { panel.setVideoSize(0, 0) }
+        link.onLinkEstablished = { connection -> hidTouch?.onLinkReady(connection) }
 
-        // 像素模式是**用户可见的画质选择**（不是调试入口）—— release 也保留。
-        //   1:1 = 按宿主显示区编码（省算力，但无超采样）；高清 = 按面板长边编高分辨率、宿主端缩下去。
-        oneToOne = HostPrefs.oneToOne(this)
-        applyPixelModeUi()
-        segOneToOne.setOnClickListener { setPixelMode(true) }
-        segHighQuality.setOnClickListener { setPixelMode(false) }
+        // ---- 画质层 ----
+        quality = QualityController(
+            context = this,
+            logger = logger,
+            sessionProvider = { link.session },
+            displayArea = { panel.displayArea() },
+            listener = qualityListener,
+        )
 
-        // 常驻状态药丸：面板收起后仍能看到链路状态；点它 = 打开面板（收起后不会"无路可回"）
-        findViewById<View>(R.id.status_chip).setOnClickListener { setMenuVisible(!menuShown) }
-        // 面板右上角：收起
-        findViewById<View>(R.id.btn_collapse).setOnClickListener { setMenuVisible(false) }
+        // ---- 调试入口层 ----
+        debugIntents = DebugIntents(logger, debugHandler)
 
-        renderUiState()
+        panel.surfaceView.setOnTouchListener { _, event -> touch.onTouch(event) }
+        panel.surfaceView.holder.addCallback(surfaceCallback)
+        panel.applyPixelModeUi(quality.oneToOne)
+        panel.setReplayVisible(DebugTools.ENABLED)
+        render()
 
-        router = UsbAttachRouter(this, logger, this).also { it.start() }
-
+        logger.i(TAG, "host screen ${DisplaySize.of(this).x}x${DisplaySize.of(this).y}, protocol v${Protocol.VERSION}")
+        link.start()
         registerReceiver(detachReceiver, UsbAttachRouter.detachFilter())
-
         mainHandler.post(statsTicker)
-        mainHandler.postDelayed(usbPoller, POLL_INTERVAL_MS)
 
         handleIntent(intent)
     }
 
-    // ------------------------------------------------------------------ 菜单显隐（点空白处切换）
-
     /**
-     * 接上「点空白处显示 / 隐藏菜单」。
+     * ★ 10.24 重构时这一段被漏掉了（真机踩到：`am start --ez hid_tap true` 毫无反应）。
      *
-     * ## 为什么"空白处"就是信箱边，且这里不会和触摸转发打架
+     * 它的作用不只是调试入口 —— App 已在前台时，系统派发的
+     * `USB_DEVICE_ATTACHED` / `USB_ACCESSORY_ATTACHED` 也走这里（`launchMode` 单实例）。
+     * 少了它，配件插上来只能靠广播接收器与前台轮询兜底。
      *
-     * 触摸事件的派发是**自上而下命中**的：某个位置的触摸只有**没有任何子 View 消费**时
-     * 才会落到根容器的 `OnTouchListener` 上。而这块屏幕上的分工恰好是干净的：
-     *
-     * | 区域 | 谁消费 | 效果 |
-     * | --- | --- | --- |
-     * | 视频显示区 | `SurfaceView`（已在 `onCreate` 里挂了转发 listener） | 转发成手机上的触摸 |
-     * | 顶部菜单面板 | 面板自己（见下） | 按钮可点；面板上的空白点击**不会**误关菜单 |
-     * | 其余（信箱边） | 根容器 ← 本方法 | 切换菜单 |
-     *
-     * 信箱边**本来就不转发**（`TouchMapper` 会把显示区之外的触点判为忽略），
-     * 所以拿它当开关不会牺牲任何已有功能。
-     *
-     * ⚠️ 已知边界：当视频宽高比与宿主屏幕**完全一致**时不存在信箱边，
-     *    也就没有空白处可点 —— 但那种情况下画面本来就占满整屏、无需收起菜单。
+     * ⚠️ 与手机端相反的约定：这里**不要**无条件重建会话 —— 任何一次 `am start`
+     *   都会走到这里（包括调试入口），把那当成"配件重新插上"会白白断链。
+     *   真正的重建判据在 [handleIntent] 里（必须带 `EXTRA_DEVICE`，且只对 attach 动作生效）。
      */
-    private fun setUpMenuToggle() {
-        menuSlopSq = ViewConfiguration.get(this).scaledTouchSlop.toFloat().let { it * it }
-
-        // 菜单面板自己吃掉触摸：否则点在面板的空白处会被根容器当成"点空白处"而把菜单关掉
-        overlayView.setOnTouchListener { _, _ -> true }
-
-        rootView.setOnTouchListener { _, event -> handleBlankAreaTouch(event) }
-
-        // 1:1 像素映射（10.15）：宿主**自己**旋转/分屏时显示区会变，而本 Activity 声明了
-        // `configChanges=orientation|screenSize|screenLayout|density` ⇒ **不会重建**，
-        // 会话里的 max_size 就会过期（典型症状：画面变糊，因为手机按旧尺寸编、宿主放大显示）。
-        // 所以每次布局变化都核一下"按新显示区该编多大"，差得明显就重建会话。
-        rootView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> renegotiateForDisplayArea() }
-    }
-
-    /** 根视图当前尺寸（= 视频显示区的可用区）。未布局时返回 null。 */
-    private fun rootArea(): IntArray? {
-        if (!::rootView.isInitialized) return null
-        val w = rootView.width
-        val h = rootView.height
-        return if (w > 0 && h > 0) intArrayOf(w, h) else null
-    }
-
-    /**
-     * 显示区变了 → 该编的尺寸也变 → 重启会话让新尺寸生效。
-     *
-     * 为什么是"重协商"而不是"改个状态"：尺寸是在 `OPEN` 里协商的，手机端拿到新参数后才配编码器。
-     * 10.18 起优先**原地重发 OPEN**（<1s、不重连）；失败才回退断开重连（约 1.5s，不重新弹录屏授权）。
-     */
-    private fun renegotiateForDisplayArea() {
-        // 高清模式（1:1 关）下尺寸不依赖显示区，显示区变化无需重建
-        if (!oneToOne) return
-        val s = session ?: return
-        val area = rootArea() ?: return
-        val pw = s.peerWidth
-        val ph = s.peerHeight
-        if (pw <= 0 || ph <= 0) return
-
-        val want = Scale.oneToOneMaxSize(pw, ph, area[0], area[1])
-        val have = s.negotiatedMaxSize
-        if (have <= 0 || want <= 0) return
-
-        val diff = kotlin.math.abs(want - have).toDouble() / have
-        if (diff <= AREA_RENEGOTIATE_RATIO) return
-
-        logger.i(
-            TAG,
-            "宿主显示区 ${area[0]}x${area[1]} 变化 -> 1:1 目标 max_size $have -> $want（差 ${(diff * 100).toInt()}%），重协商"
-        )
-        uiState.onRenegotiate()
-        uiState.onProgress("显示区变了（${area[0]}x${area[1]}），按新尺寸重协商…")
-        renderUiState()
-        requestRenegotiate()
-    }
-
-    // ------------------------------------------------------------------ 像素模式（10.17 / 10.18）
-
-    /** 把分段控件刷成"当前模式"：选中段用强调色实底，另一段留描边。 */
-    private fun applyPixelModeUi() {
-        val onBg = getDrawable(R.drawable.bg_segment_on)
-        val offBg = getDrawable(R.drawable.bg_segment_off)
-        segOneToOne.background = if (oneToOne) onBg else offBg
-        segHighQuality.background = if (oneToOne) offBg else onBg
-        segOneToOne.setTextColor(getColor(if (oneToOne) R.color.host_text else R.color.host_text_dim))
-        segHighQuality.setTextColor(getColor(if (oneToOne) R.color.host_text_dim else R.color.host_text))
-    }
-
-    /**
-     * 切到指定像素模式。
-     *
-     * ⚠️ **已经是该模式就直接返回** —— 点"已选中"的那一段必须是无副作用的 no-op，
-     * 否则手滑点一下就会白白触发一次重协商（画面闪一下）。
-     *
-     * `max_size` 只在 `OPEN` 时协商一次，所以改完要让新参数生效 —— 走 [requestRenegotiate]：
-     * **优先原地重发 OPEN**（10.18，约 2~3s、不重连），失败才回退断开重连。
-     */
-    private fun setPixelMode(enabled: Boolean) {
-        if (oneToOne == enabled) return
-        oneToOne = enabled
-        HostPrefs.setOneToOne(this, oneToOne)
-        applyPixelModeUi()
-        logger.i(TAG, "像素模式切换 → ${if (enabled) "1:1（按显示区编码）" else "高清（按面板长边编码）"}")
-        uiState.onRenegotiate()
-        uiState.onProgress(
-            getString(if (enabled) R.string.host_status_switch_11 else R.string.host_status_switch_hd)
-        )
-        renderUiState()
-        requestRenegotiate()
-    }
-
-    /**
-     * 刷新左上角常驻状态药丸（圆点颜色 + 短文案）。
-     *
-     * 线程安全：会话回调来自 worker 线程，这里自己判线程再转 UI 线程
-     * （与 [setMenuVisible] 同一约定，免得每个调用点都包一层 `runOnUiThread`）。
-     */
-    private fun setChip(state: ChipState, text: String) {
-        if (!::chipText.isInitialized) return
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            runOnUiThread { setChip(state, text) }
-            return
-        }
-        chipText.text = text
-        val color = getColor(
-            when (state) {
-                ChipState.IDLE -> R.color.host_idle
-                ChipState.CONNECTING -> R.color.host_warn
-                ChipState.ACTIVE -> R.color.host_ok
-                ChipState.ERROR -> R.color.host_err
-            }
-        )
-        chipDot.backgroundTintList = ColorStateList.valueOf(color)
-    }
-
-    /**
-     * 按 [HostUiState] 的当前阶段刷新**主状态行 + 副行 + 药丸**（10.23）。
-     *
-     * 主状态行只反映"现在处于哪个阶段"（投屏中 / 连接中 / 重协商中 / …），
-     * 进度文本（`CNXN 已发送` / `max_size=…` 这类有用信息）落到下面的副行。
-     * 这样无论事件怎么乱序，**主状态行都不会说谎**。
-     *
-     * 线程安全：会话回调来自 worker 线程，同 [setChip] 的约定自己转主线程。
-     */
-    private fun renderUiState() {
-        if (!::statusText.isInitialized) return
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            runOnUiThread { renderUiState() }
-            return
-        }
-        val phase = uiState.phase
-        statusText.text = getString(
-            when (phase) {
-                HostUiState.Phase.IDLE -> R.string.host_status_idle
-                HostUiState.Phase.CONNECTING -> R.string.host_status_connecting
-                HostUiState.Phase.MIRRORING -> R.string.host_status_mirroring
-                HostUiState.Phase.RENEGOTIATING -> R.string.host_status_renegotiating
-                HostUiState.Phase.REPLAY -> R.string.host_status_replay
-                HostUiState.Phase.ERROR -> R.string.host_status_error
-            }
-        )
-        // 副行：进度文本。与主行同色系但更淡，避免和主状态抢注意力。
-        statusDetailText.text = uiState.detail
-        statusDetailText.visibility =
-            if (uiState.detail.isBlank() || phase == HostUiState.Phase.ERROR) View.GONE else View.VISIBLE
-
-        setChip(
-            when (phase) {
-                HostUiState.Phase.IDLE -> ChipState.IDLE
-                HostUiState.Phase.CONNECTING -> ChipState.CONNECTING
-                // 重协商时点保持绿：画面确实还在播（原地重协商不中断渲染）
-                HostUiState.Phase.MIRRORING, HostUiState.Phase.RENEGOTIATING -> ChipState.ACTIVE
-                HostUiState.Phase.REPLAY -> ChipState.ACTIVE
-                HostUiState.Phase.ERROR -> ChipState.ERROR
-            },
-            getString(
-                when (phase) {
-                    HostUiState.Phase.IDLE -> R.string.host_chip_idle
-                    HostUiState.Phase.CONNECTING -> R.string.host_chip_connecting
-                    HostUiState.Phase.MIRRORING -> R.string.host_chip_mirroring
-                    HostUiState.Phase.RENEGOTIATING -> R.string.host_chip_renegotiating
-                    HostUiState.Phase.REPLAY -> R.string.host_chip_replay
-                    HostUiState.Phase.ERROR -> R.string.host_chip_error
-                }
-            ),
-        )
-    }
-
-    /**
-     * 请求一次"尺寸重协商"：优先**原地重发 OPEN**（10.18），失败再回退"断开 + 重连"。
-     *
-     * ⚠️ 不能在主线程做 `renegotiate()` —— 它会等手机回 `OKAY`（最长 `TIMEOUT_MS`）。
-     * 统一丢到后台线程；回退路径里的 `stopSession()` 有 UI 调用，再 post 回主线程。
-     */
-    private fun requestRenegotiate() {
-        val s = session
-        if (s == null) {
-            // 没有活动会话（还没连上）→ 直接走扫描/重连
-            stopSession()
-            router?.scanAndAttach()
-            return
-        }
-        // 同一时刻只允许一次重协商，避免布局回调连发把手机端反复重建
-        if (!renegotiating.compareAndSet(false, true)) {
-            logger.i(TAG, "已有重协商在进行，忽略这次请求")
-            return
-        }
-        // 标记"预期内重开"：期间瞬时失败不弹 ERROR（见 onError），45s 兜底清除
-        expectingRestart = true
-        mainHandler.removeCallbacks(clearExpectingRestartDelayed)
-        mainHandler.postDelayed(clearExpectingRestartDelayed, RESTART_FLAG_TIMEOUT_MS)
-
-        Thread({
-            val ok = try {
-                s.renegotiate()
-            } catch (t: Throwable) {
-                logger.w(TAG, "原地重协商异常: ${t.message}", t)
-                false
-            } finally {
-                renegotiating.set(false)
-            }
-            if (!ok) {
-                logger.w(TAG, "原地重协商未成功 → 回退到断开重连")
-                runOnUiThread {
-                    stopSession()
-                    router?.scanAndAttach()
-                }
-            }
-        }, "uav-renegotiate").apply { isDaemon = true }.start()
-    }
-
-    /**
-     * 空白区的触摸 → 切换菜单。
-     *
-     * 只在"按下与抬起基本落在同一处"时才算点击 —— 否则从空白区划出去也会误触发。
-     * 一律返回 true：这块区域没有别的用途，吃掉事件可避免继续上抛。
-     */
-    private fun handleBlankAreaTouch(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                menuDownX = event.x
-                menuDownY = event.y
-            }
-
-            MotionEvent.ACTION_UP -> {
-                val dx = event.x - menuDownX
-                val dy = event.y - menuDownY
-                if (dx * dx + dy * dy <= menuSlopSq) toggleMenu()
-            }
-        }
-        return true
-    }
-
-    private fun toggleMenu() {
-        setMenuVisible(!menuShown)
-        logger.i(TAG, "菜单已${if (menuShown) "展开" else "收起"}（点了画面外的空白处）")
-    }
-
-    /**
-     * 显示 / 隐藏菜单（状态 + 统计 + 按钮那一整块）。
-     *
-     * 线程安全：`onError` / `onClosed` 这些会话回调来自 worker 线程，
-     * 所以这里自己判线程再转 UI 线程，免得每个调用点都包一层 `runOnUiThread`。
-     */
-    private fun setMenuVisible(visible: Boolean, animate: Boolean = true) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            runOnUiThread { setMenuVisible(visible, animate) }
-            return
-        }
-        menuShown = visible
-        // 面板是**左侧竖栏**，所以从左边"滑入 / 滑回"一点距离（比纯淡入淡出更像一块抽屉）。
-        // 位移取固定 16dp，不依赖测量宽度 —— 首次展开时 width 还是 0。
-        val slidePx = 16f * resources.displayMetrics.density
-
-        if (visible) {
-            overlayView.animate().cancel()
-            overlayView.visibility = View.VISIBLE
-            if (animate) {
-                overlayView.alpha = 0f
-                overlayView.translationX = -slidePx
-                overlayView.animate().alpha(1f).translationX(0f).setDuration(MENU_ANIM_MS).start()
-            } else {
-                overlayView.alpha = 1f
-                overlayView.translationX = 0f
-            }
-        } else if (animate) {
-            overlayView.animate().cancel()
-            overlayView.animate().alpha(0f).translationX(-slidePx).setDuration(MENU_ANIM_MS).withEndAction {
-                // 收起动画期间可能又被叫回来（连着点两下），收尾时再确认一次
-                if (!menuShown) {
-                    overlayView.visibility = View.GONE
-                    overlayView.translationX = 0f
-                }
-            }.start()
-        } else {
-            overlayView.animate().cancel()
-            overlayView.visibility = View.GONE
-            overlayView.translationX = 0f
-        }
-    }
-
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleIntent(intent)
     }
 
+    override fun onDestroy() {
+        mainHandler.removeCallbacks(statsTicker)
+        runCatching { unregisterReceiver(detachReceiver) }
+        link.close()
+        closeReplay()
+        hidTouch?.close()
+        hidTouch = null
+        super.onDestroy()
+    }
+
+    // ------------------------------------------------------------------ 链路回调（只汇报，不决策）
+
+    private val linkListener = object : LinkCoordinator.Listener {
+        override fun onProgress(text: String) {
+            // ★ 10.23：进度文本**不再**直接写主状态行，只进副行 + 由状态机决定主行。
+            //   原地重协商时画面根本没断，但这里照样会发「会话已建立，等待视频流…」——
+            //   旧代码直接覆盖主行，而 onFirstFrame 不会再来，于是状态被永久钉死。
+            uiState.onProgress(text)
+            render()
+        }
+
+        override fun onVideoSize(width: Int, height: Int) {
+            // ★ 10.23：尺寸就绪只用来给"重协商中"收尾，**不能**提前宣告投屏中
+            //   （还没出画面就报"投屏中"是同一类错误，只是方向相反）。
+            //   同时把副行换成"新参数已生效"：否则重协商结束后副行会一直挂着
+            //   「会话已建立，等待视频流…」—— 那句话在画面正在播的时候读起来很别扭。
+            val wasRenegotiating = uiState.phase == HostUiState.Phase.RENEGOTIATING
+            uiState.onVideoSize()
+            if (wasRenegotiating) {
+                uiState.onProgress(
+                    "已生效：${width}x$height" + if (quality.oneToOne) "（1:1 像素）" else "（高清）"
+                )
+            }
+            render()
+            panel.setVideoSize(width, height)
+            // ★ 视频尺寸是**触摸坐标空间**的权威线索：手机屏幕的物理尺寸只在 CNXN 报一次，
+            //   旋转后不会重报，只能靠视频方向推出它当前的长宽（见 TouchMapper）。
+            //   空间变了控制器会自动重新注册 HID（描述符里的 Logical Max 就是空间尺寸）。
+            link.session?.let {
+                touch.onGeometry(it.peerWidth, it.peerHeight, width, height)
+                hidTouch?.updateGeometry(it.peerWidth, it.peerHeight, width, height)
+            }
+        }
+
+        override fun onFirstFrame() {
+            // ★ 10.23：这是**唯一**能宣告"投屏中"的事件（首帧真的输出了）。
+            uiState.onFirstFrame()
+            render()
+            // 画面出来了就把菜单收起来，让视频干净地占满整屏（只自动收一次）。
+            panel.autoCollapseOnFirstFrame()
+        }
+
+        override fun onClosed(reason: String) {
+            // 链路断开不是终态：前台轮询会自动重试，所以回"连接中"而非"空闲"。
+            uiState.onClosed(reason)
+            render()
+            panel.setMenuVisible(true)
+        }
+
+        override fun onError(message: String, cause: Throwable?) {
+            // ★ 出错必须把菜单叫回来：面板收起时错误信息是看不见的，
+            //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
+            uiState.onError(message)
+            render()
+            panel.setMenuVisible(true)
+            logger.e(TAG, message, cause)
+            // 链路层已负责 stopSession / 退避计数 / 自愈判定，这里只管"让用户可见"。
+
+
+        }
+
+        override fun onSelfHealRequest(device: UsbDevice) {
+            uiState.onProgress("快路径未验证通过，强制重握手（改写配件身份）…")
+            render()
+            link.stopSession()
+            link.onDeviceAttached(device)
+        }
+    }
+
+    // ------------------------------------------------------------------ 画质回调
+
+    private val qualityListener = object : QualityController.Listener {
+        override fun onQualityChange(oneToOne: Boolean, reason: String) {
+            uiState.onRenegotiate()
+            uiState.onProgress(reason)
+            render()
+            panel.applyPixelModeUi(oneToOne)
+            // ⚠️ 必须**先**打"预期内重开"标志，**再**发起重协商：
+            //   一旦 renegotiate() 已返回 false 并开始回退重连，那期间的失败就不再是"预期内"的。
+            link.beginExpectedRestart()
+            link.requestRenegotiate()
+        }
+    }
+
+    // ------------------------------------------------------------------ 用户动作
+
+    private fun userScan() {
+        uiState.onScanRequested()
+        render()
+        link.scan()
+    }
+
+    private fun userForceRehandshake() {
+        uiState.onProgress("强制 AOA 重握手中…")
+        render()
+        link.scan(forceHandshake = true)
+    }
+
+    // ------------------------------------------------------------------ 调试入口
+
+    private val debugHandler = object : DebugIntents.Handler {
+        override fun onReplay(path: String, file: File) {
+            if (!file.exists()) {
+                linkListener.onError("回放文件不存在: $path（可先用 run-as 放进 filesDir）", null)
+                return
+            }
+            startReplay(file)
+        }
+
+        override fun onScan() {
+            uiState.onScanRequested()
+            render()
+            link.scan()
+        }
+
+        override fun onForceHandshake() {
+            uiState.onProgress("强制 AOA 重握手中…")
+            render()
+            link.scan(forceHandshake = true)
+        }
+
+        override fun onHidProbe() {
+            hidTouch?.forceReRegister()
+        }
+
+        override fun onHidTap(x: Int, y: Int, x2: Int, y2: Int, holdMs: Int): Boolean =
+            touch.debugTap(x, y, x2, y2, holdMs)
+
+        override fun onAudioTuning(noAudio: Boolean?, audioDelayMs: Int?) {
+            if (noAudio != null) {
+                audioEnabled = !noAudio
+                logger.i(TAG, "音频已${if (audioEnabled) "启用" else "关闭"}（调试参数）")
+            }
+            if (audioDelayMs != null) {
+                this@HostActivity.audioDelayMs = audioDelayMs.coerceIn(0, 2_000)
+                logger.i(TAG, "音频起播延迟 = ${this@HostActivity.audioDelayMs}ms（调试参数）")
+            }
+        }
+    }
+
     private fun handleIntent(intent: Intent?) {
-        // 先消化调试入口 extra（release 构建下整块被跳过，计划 5.2）
-        if (handleDebugIntent(intent)) return
+        // 先消化调试入口 extra（release 构建下整块被跳过，计划 5.2）。
+        // ⚠️ 音频参数**不接管 intent**，所以无论是否命中别的动作都要应用。
+        debugIntents.applyAudioTuning(intent)
+        debugIntents.parse(intent)?.let { action ->
+            debugIntents.dispatch(action)
+            return
+        }
 
         val action = intent?.action ?: return
         logger.i(TAG, "intent action=$action")
@@ -680,437 +421,10 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             logger.w(TAG, "attach intent 但没有 EXTRA_DEVICE")
             return
         }
-        stopSession()
-        forceRetried = false
-        router?.onDeviceAttached(device)
+        link.onDeviceAttached(device)
     }
 
-    /**
-     * 处理 adb 驱动的调试 extra（计划 5.2）。
-     *
-     * 这三条都是为「不碰屏幕就能驱动联调」而加的，**release 包必须全部失效** ——
-     * 否则发布版仍可被 `--es replay_path` 读任意本地文件、被 `--ez force_handshake`
-     * 强制打断正常链路。
-     *
-     * @return `true` 表示 extra 命中并已接管本次 intent，调用方不应再按 action 分发。
-     */
-    private fun handleDebugIntent(intent: Intent?): Boolean {
-        if (!DebugTools.ENABLED) {
-            // release 下若仍传了调试 extra，明确说一句"被门控忽略"。
-            // 否则调用方只会看到"extra 毫无反应"，无从判断是漏实现还是被门控（计划 5.2）。
-            if (intent != null && (
-                    intent.hasExtra(EXTRA_REPLAY_PATH) ||
-                        intent.hasExtra(EXTRA_SCAN) ||
-                        intent.hasExtra(EXTRA_FORCE_HANDSHAKE) ||
-                        intent.hasExtra(EXTRA_HID_PROBE) ||
-                        intent.hasExtra(EXTRA_HID_TAP) ||
-                        intent.hasExtra(EXTRA_HOLD_MS) ||
-                        intent.hasExtra(EXTRA_TAP2_X) ||
-                        intent.hasExtra(EXTRA_TAP2_Y) ||
-                        intent.hasExtra(EXTRA_NO_AUDIO) ||
-                        intent.hasExtra(EXTRA_AUDIO_DELAY_MS)
-                    )
-            ) {
-                logger.w(TAG, "release 构建：调试入口已关闭，忽略 intent extra")
-            }
-            return false
-        }
-
-        // am start -n com.uav.host/.HostActivity --es replay_path /data/data/com.uav.host/files/replay.uav
-        //   从指定文件回放抓流（计划 4.0），跳过整个 USB 与握手。
-        intent?.getStringExtra(EXTRA_REPLAY_PATH)?.takeIf { it.isNotEmpty() }?.let { path ->
-            logger.i(TAG, "收到回放指令: $path")
-            val file = File(path)
-            if (!file.exists()) {
-                onError("回放文件不存在: $path（可先用 run-as 放进 filesDir）", null)
-                return true
-            }
-            startReplay(file)
-            return true
-        }
-
-        // am start -n com.uav.host/.HostActivity --ez scan true
-        //   走普通扫描（已是配件则复用直连），等价于点界面上的 Scan / Retry 按钮。
-        if (intent?.getBooleanExtra(EXTRA_SCAN, false) == true) {
-            logger.i(TAG, "收到扫描指令")
-            stopSession()
-            forceRetried = false
-            router?.scanAndAttach(forceHandshake = false)
-            return true
-        }
-
-        // am start -n com.uav.host/.HostActivity --ez force_handshake true
-        //   强制走完整 AOA 握手，用于"手机已被别的宿主 App 切成配件模式"的场景。
-        if (intent?.getBooleanExtra(EXTRA_FORCE_HANDSHAKE, false) == true) {
-            logger.i(TAG, "收到强制重握手指令")
-            stopSession()
-            forceRetried = true
-            fastPathUnverified = false
-            router?.scanAndAttach(forceHandshake = true)
-            return true
-        }
-
-        // ---- HID 触摸注入的排障入口（正常情况下**自动注册**，不需要这些）----
-        //
-        // am start -n com.uav.host/.HostActivity --ez hid_probe true
-        //   强制重新注册触摸屏（排查"手机上没出现触摸设备"用）。
-        if (intent?.getBooleanExtra(EXTRA_HID_PROBE, false) == true) {
-            logger.i(TAG, "收到指令：强制重新注册 HID 触摸屏")
-            hidTouch?.forceReRegister()
-            return true
-        }
-
-        // am start -n com.uav.host/.HostActivity --ez hid_tap true [--ei tap_x X --ei tap_y Y --ei hold_ms Ms]
-        //   在**手机坐标**上发一次点按，不用真去点宿主屏幕就能验证注入链路（不传坐标用安全位置）。
-        //   再加 --ei tap2_x X --ei tap2_y Y 就是**双指同时按**（验证多点，见 10.12）。
-        if (intent?.getBooleanExtra(EXTRA_HID_TAP, false) == true) {
-            val xArg = intent.getIntExtra(EXTRA_TAP_X, Int.MIN_VALUE)
-            val yArg = intent.getIntExtra(EXTRA_TAP_Y, Int.MIN_VALUE)
-            val x2Arg = intent.getIntExtra(EXTRA_TAP2_X, Int.MIN_VALUE)
-            val y2Arg = intent.getIntExtra(EXTRA_TAP2_Y, Int.MIN_VALUE)
-            val hold = intent.getIntExtra(EXTRA_HOLD_MS, DEFAULT_TAP_HOLD_MS)
-            debugTap(xArg, yArg, x2Arg, y2Arg, hold)
-            return true
-        }
-
-        // ---- 音频开关与 A/V 粗补偿（10.13）----
-        //
-        // 这两个**不接管 intent**，只改参数，所以放在最后、返回 false 继续正常流程。
-        //
-        // am start -n com.uav.host/.HostActivity --ez scan true --ez no_audio true
-        //   关掉音频（A/B 对比"到底有没有声音"、或手机上没给录音权限时用）。
-        // am start -n com.uav.host/.HostActivity --ez scan true --ei audio_delay_ms 200
-        //   调整音频起播延迟（对齐音画；默认见 HostSession.DEFAULT_AUDIO_DELAY_MS）。
-        intent?.let {
-            if (it.hasExtra(EXTRA_NO_AUDIO)) {
-                audioEnabled = !it.getBooleanExtra(EXTRA_NO_AUDIO, false)
-                logger.i(TAG, "音频已${if (audioEnabled) "启用" else "关闭"}（调试参数）")
-            }
-            if (it.hasExtra(EXTRA_AUDIO_DELAY_MS)) {
-                audioDelayMs = it.getIntExtra(EXTRA_AUDIO_DELAY_MS, audioDelayMs).coerceIn(0, 2_000)
-                logger.i(TAG, "音频起播延迟 = ${audioDelayMs}ms（调试参数）")
-            }
-        }
-
-        return false
-    }
-
-    // ------------------------------------------------------------------ 触摸注入（宿主 → 手机）
-
-    /**
-     * 宿主屏幕上的触摸 → 手机（**支持多点**）。
-     *
-     * 规则：
-     *  - 只有落在**视频显示区**内的触点才转发（信箱边忽略，见 [TouchMapper]）；
-     *  - 按 `pointerId` 逐个跟踪，抬起要显式发（否则手机上那根手指会"一直按住"）；
-     *  - 某个触点被拖出显示区 → 视同抬起，避免手机上的手指"卡"在边缘；
-     *  - 槽位分配（pointerId → 槽位号）交给 `MultiTouchTracker`，它满了会**拒绝**新手指
-     *    而不是挤掉已有的。
-     */
-    private fun handleSurfaceTouch(event: MotionEvent): Boolean {
-        val s = session ?: return false
-        val viewW = surfaceView.width
-        val viewH = surfaceView.height
-        val screenW = s.peerWidth
-        val screenH = s.peerHeight
-        if (viewW <= 0 || viewH <= 0 || screenW <= 0 || screenH <= 0) return false
-
-        /** 把第 [pointerIndex] 个触点映射成手机坐标；不在显示区内返回 null。 */
-        fun mapPointer(pointerIndex: Int) = TouchMapper.mapTouch(
-            viewX = event.getX(pointerIndex).toInt(),
-            viewY = event.getY(pointerIndex).toInt(),
-            viewW = viewW,
-            viewH = viewH,
-            videoW = surfaceView.videoWidth,
-            videoH = surfaceView.videoHeight,
-            screenW = screenW,
-            screenH = screenH,
-        )
-
-        /** 只在 debug 包打，用于判断"点了没反应"是落在信箱边还是映射错了。 */
-        fun logDown(pointerIndex: Int, phone: TouchPoint?) {
-            if (!DebugTools.ENABLED) return
-            val inView = "(${event.getX(pointerIndex).toInt()},${event.getY(pointerIndex).toInt()})"
-            val geom = "/ view=${viewW}x$viewH video=" +
-                "${surfaceView.videoWidth}x${surfaceView.videoHeight} 手机屏=${screenW}x$screenH"
-            // 带上 pointer 信息：多点时要能一眼看出"事件流里到底有几个 pointer、id 各是多少"
-            val who = "pointer=${event.getPointerId(pointerIndex)} (共 ${event.pointerCount})"
-            logger.i(
-                TAG,
-                if (phone == null) {
-                    "触摸忽略：视图内 $inView $who 不在显示区内（$geom）"
-                } else {
-                    "触摸转发：视图内 $inView $who $geom → 手机 (${phone.x},${phone.y})"
-                },
-            )
-        }
-
-        return when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                val idx = event.actionIndex
-                val phone = mapPointer(idx)
-                logDown(idx, phone)
-                if (phone != null) {
-                    hidTouch?.down(event.getPointerId(idx), phone.x, phone.y)
-                }
-                true
-            }
-
-            MotionEvent.ACTION_MOVE -> {
-                for (i in 0 until event.pointerCount) {
-                    val pid = event.getPointerId(i)
-                    val phone = mapPointer(i)
-                    if (phone == null) {
-                        // 拖到信箱边/显示区外：等价于抬指，否则手机上会一直按着
-                        hidTouch?.up(pid)
-                    } else {
-                        hidTouch?.move(pid, phone.x, phone.y)
-                    }
-                }
-                true
-            }
-
-            MotionEvent.ACTION_POINTER_UP -> {
-                hidTouch?.up(event.getPointerId(event.actionIndex))
-                true
-            }
-
-            MotionEvent.ACTION_UP -> {
-                // 抬起前先按最终坐标更新一次，避免"最后一跳"
-                for (i in 0 until event.pointerCount) {
-                    mapPointer(i)?.let { hidTouch?.move(event.getPointerId(i), it.x, it.y) }
-                }
-                for (i in 0 until event.pointerCount) {
-                    hidTouch?.up(event.getPointerId(i))
-                }
-                true
-            }
-
-            MotionEvent.ACTION_CANCEL -> {
-                hidTouch?.cancelAll()
-                true
-            }
-
-            else -> false
-        }
-    }
-
-    /**
-     * 在**手机坐标**上发点按（排障用）。给了第二组坐标就是**双指同时按**。
-     *
-     * 不传坐标时落在一个**安全位置**（屏幕上方 6% 处的正中，通常是状态栏下方的空白区），
-     * 避免误触手机上的按钮（手机上就有"停止投屏"这种一按就断链的按钮）。
-     */
-    private fun debugTap(xArg: Int, yArg: Int, x2Arg: Int, y2Arg: Int, holdMs: Int) {
-        val w = session?.peerWidth ?: 0
-        val h = session?.peerHeight ?: 0
-        if (w <= 0 || h <= 0) {
-            logger.w(TAG, "HID 点按：还没收到手机的 CNXN（拿不到屏幕尺寸）")
-            return
-        }
-        val size = TouchMapper.logicalPhoneSize(
-            w, h, surfaceView.videoWidth, surfaceView.videoHeight,
-        ) ?: return
-
-        val x = if (xArg == Int.MIN_VALUE) size.width / 2 else xArg
-        val y = if (yArg == Int.MIN_VALUE) (size.height * 0.06f).toInt() else yArg
-
-        // 第二根手指：默认在屏幕上方居右（与第一根拉开的两个独立坐标）
-        val twoFingers = x2Arg != Int.MIN_VALUE
-        val x2 = if (!twoFingers) 0 else if (x2Arg == Int.MIN_VALUE) (size.width * 0.75f).toInt() else x2Arg
-        val y2 = if (y2Arg == Int.MIN_VALUE) (size.height * 0.12f).toInt() else y2Arg
-
-        logger.i(
-            TAG,
-            if (twoFingers) {
-                "HID 双指点按指令：手机坐标 ($x,$y) + ($x2,$y2) 按住 ${holdMs}ms" +
-                    "（逻辑空间 ${size.width}x${size.height}）"
-            } else {
-                "HID 点按指令：手机坐标 ($x,$y) 按住 ${holdMs}ms（逻辑空间 ${size.width}x${size.height}）"
-            },
-        )
-        hidTouch?.debugTap(x, y, holdMs, if (twoFingers) x2 else null, if (twoFingers) y2 else null)
-    }
-
-    // ------------------------------------------------------------------ router 回调
-
-    override fun onStatus(text: String) {
-        // 会话真正建立起来 -> 快路径已验证通过，撤销自愈待办
-        if (text.contains("会话已建立")) {
-            fastPathUnverified = false
-        }
-        // ★ 10.23：进度文本**不再**直接写主状态行，只进副行 + 由状态机决定主行。
-        //   原地重协商时画面根本没断，但这里照样会发「会话已建立，等待视频流…」——
-        //   旧代码直接覆盖主行，而 onFirstFrame 不会再来，于是状态被永久钉死。
-        uiState.onProgress(text)
-        renderUiState()
-    }
-
-    override fun onReady(
-        connection: android.hardware.usb.UsbDeviceConnection,
-        pair: BulkPair,
-        aoaVersion: Int,
-        device: UsbDevice,
-    ) {
-        logger.i(TAG, "link ready: aoaVersion=$aoaVersion device=${device.deviceId}")
-
-        // 建链成功 -> 退避归零，轮询回到最快档
-        consecutiveFailures.set(0)
-
-        lastDevice = device
-        // aoaVersion == 0 表示这次是按"已是配件、跳过握手"的快路径连的，
-        // 配件身份未被验证过（可能还是别的宿主 App 留下的）
-        fastPathUnverified = aoaVersion == 0
-
-        // ⚠️ 顺序要求：`stopSession()` 里会 `hidTouch.onLinkLost()`（作废旧连接），
-        //    所以它必须排在下面"绑定新连接"**之前** —— 反过来的话刚绑上就被清掉了，
-        //    表现为触摸屏永远注册不上（踩过）。
-        stopSession()
-
-        // 触摸注入绑定到**本次连接**。★ 旧的 HID 注册随重枚举一起失效（id 只在连接内有效），
-        //   这里清零 id，等拿到视频尺寸（= 手机屏幕尺寸 + 视频方向都已知）时重新注册。
-        //   （触点状态**不清** —— 重连后要按它补发"还按着的那些手指"。）
-        hidTouch?.onLinkReady(connection)
-        // 建链成功但还没画面 ⇒ "连接中"。⚠️ 不能在这里报"投屏中"（画面还没出来）。
-        uiState.onProgress("链路已建立，等待 CNXN / 首帧…")
-        renderUiState()
-
-        val raw = BulkByteChannel(connection, pair, logger)
-        // ★ 先把上一次会话残留在 FIFO 里的字节丢掉，再开新会话。
-        //   否则第一个 payload 会被当成流头解析，静默配错解码器（实测踩到过）。
-        raw.drainStaleInput()
-        bulkChannel = raw
-        // ★ 10.16 内核 panic 防线：协议层无论要多少（哪怕 24B 报文头），对内核的 bulkTransfer
-        //   永远整块（readChunkSize=16KB ≥ 端点包长 512B）发起，多到货的进残留缓冲续读。
-        //   直接把协议层的小请求透传给内核，MTK 主机栈不截断 actual_length → usercopy BUG → 重启
-        //   （实测：kmalloc-128 被要求拷 391B，Comm: uav-reader）。
-        val channel: ByteChannel = BufferedByteChannel(raw, pair.readChunkSize)
-        val transport = Transport(channel, logger, TAG)
-
-        val screen = DisplaySize.of(this)
-        val s = HostSession(
-            transport = transport,
-            localWidth = screen.x,
-            localHeight = screen.y,
-            surfaceProvider = ::currentSurface,
-            logger = logger,
-            listener = this,
-            audioEnabled = audioEnabled,
-            audioDelayMs = audioDelayMs,
-            // ★ 1:1 像素映射：把"视频显示区的可用区"交给会话去算编码尺寸（取当前值）
-            displayArea = { rootArea() },
-            // ★ 像素模式：传**回调**而非当前值 —— 原地重协商要在同一会话里取"此刻"的模式
-            oneToOne = { oneToOne },
-        )
-        session = s
-        s.start()
-    }
-
-    override fun onError(message: String, cause: Throwable?) {
-        // ★ 10.17：用户主动切换画质时的"预期内重开" —— 首个握手偶尔会撞上手机端仍在推流的
-        //   字节（`bad magic` / 握手超时），自动重试即可恢复。这里**不弹 ERROR**，免得让用户以为
-        //   坏了；也**不触发"强制 AOA 重握手"**（那会真重枚举手机，对一次画质切换是过重的反应）。
-        if (expectingRestart) {
-            logger.w(TAG, "切换画质重开会话中的瞬时失败（将自动重试）: $message", cause)
-            uiState.onProgress("重协商未成功（${message}），正在自动重试…")
-            renderUiState()
-            runOnUiThread {
-                stopSession()
-                renderUiState()
-            }
-            consecutiveFailures.incrementAndGet()
-            router?.resetAttempts()
-            return
-        }
-
-        // ★ 出错必须把菜单叫回来：面板收起时错误信息是看不见的，
-        //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
-        uiState.onError(message)
-        renderUiState()
-        setMenuVisible(true)
-        logger.e(TAG, message, cause)
-
-        // ★ 自动重连（P0）：链路错误后**必须**把会话清掉 ——
-        //   前台轮询的接管条件是 `session == null`，不清就永远不会自动重试
-        //   （加自动重连之前，`readFully timeout` 之类断链后只能靠用户点按钮）。
-        //   注意 stopSession 里有 UI 调用（setVideoSize），只能放主线程。
-        runOnUiThread { stopSession() }
-        consecutiveFailures.incrementAndGet()
-        // 断线是"新情况"（设备可能马上回来），重置自动重试计数；
-        // 否则几次偶发断线就会耗光 MAX_ATTEMPTS_PER_DEVICE 配额，自动重连永久失效
-        router?.resetAttempts()
-
-        // ★ 自愈：快路径（跳过握手）连上的链路如果没人应答，说明配件身份不是我们的
-        //   —— 手机很可能被"别的宿主 App"切成了配件模式，系统因此没有拉起我们的手机端 App。
-        //   这时强制走一次完整 AOA 握手，把配件身份改写成 UAV/usbscreen。
-        val dev = lastDevice
-        if (fastPathUnverified && !forceRetried && dev != null) {
-            forceRetried = true
-            fastPathUnverified = false
-            logger.w(TAG, "快路径失败（$message）→ 改为强制完整 AOA 握手重试一次")
-            uiState.onProgress("快路径未验证通过（$message），强制重握手…")
-            renderUiState()
-            session?.close()
-            session = null
-            router?.onDeviceAttached(dev, forceHandshake = true)
-        }
-    }
-
-    /** 设备拔出：与读写异常统一走这里（计划 2.10）。 */
-    private fun onDetached(device: UsbDevice?) {
-        stopSession()
-        uiState.onDetached("USB 已拔出，请重新插线或点 Scan/Retry")
-        renderUiState()
-        // 这条提示藏在收起的菜单里就等于没提示
-        setMenuVisible(true)
-    }
-
-    // ------------------------------------------------------------------ session 回调
-
-    override fun onVideoSize(width: Int, height: Int) {
-        // 尺寸（重）配置成功 = 重协商已见效 → 立刻清掉"切换中"标志，
-        // 免得它一直挂到 45s 兜底、把这段窗口里的真错误也吞掉。
-        expectingRestart = false
-        // ★ 10.23：尺寸就绪只用来给"重协商中"收尾，**不能**提前宣告投屏中
-        //   （还没出画面就报"投屏中"是同一类错误，只是方向相反）。
-        //   同时把副行换成"新参数已生效"：否则重协商结束后副行会一直挂着
-        //   「会话已建立，等待视频流…」—— 那句话在画面正在播的时候读起来很别扭。
-        val wasRenegotiating = uiState.phase == HostUiState.Phase.RENEGOTIATING
-        uiState.onVideoSize()
-        if (wasRenegotiating) {
-            uiState.onProgress("已生效：${width}x$height" + if (oneToOne) "（1:1 像素）" else "（高清）")
-        }
-        renderUiState()
-        runOnUiThread { surfaceView.setVideoSize(width, height) }
-        // ★ 视频尺寸是**触摸坐标空间**的权威线索：手机屏幕的物理尺寸只在 CNXN 报一次，
-        //   旋转后不会重报，只能靠视频方向推出它当前的长宽（见 TouchMapper）。
-        //   空间变了控制器会自动重新注册 HID（描述符里的 Logical Max 就是空间尺寸）。
-        val s = session ?: return
-        hidTouch?.updateGeometry(s.peerWidth, s.peerHeight, width, height)
-    }
-
-    override fun onFirstFrame() {
-        // 重开会话成功（画面出来了）→ 清掉"切换中"标志
-        expectingRestart = false
-        // ★ 10.23：这是**唯一**能宣告"投屏中"的事件（首帧真的输出了）。
-        uiState.onFirstFrame()
-        renderUiState()
-        // 画面出来了就把菜单收起来，让视频干净地占满整屏（只自动收一次，见 menuAutoCollapsed）。
-        // 想调参数时点一下画面外的空白处即可叫回来。
-        if (!menuAutoCollapsed) {
-            menuAutoCollapsed = true
-            setMenuVisible(false)
-        }
-    }
-
-    override fun onClosed(reason: String) {
-        // 链路断开不是终态：前台轮询会自动重试（见 usbPoller），所以回"连接中"而非"空闲"。
-        uiState.onClosed(reason)
-        renderUiState()
-        setMenuVisible(true)
-    }
-
-    // ------------------------------------------------------------------ 回放
+    // ------------------------------------------------------------------ 回放（纯调试入口，计划 4.0）
 
     private fun pickReplayFile() {
         if (!DebugTools.ENABLED) return
@@ -1134,7 +448,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             }
             startReplay(dest)
         } catch (t: Throwable) {
-            onError("读取抓流文件失败: ${t.message}", t)
+            linkListener.onError("读取抓流文件失败: ${t.message}", t)
         }
     }
 
@@ -1144,7 +458,7 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             logger.w(TAG, "release 构建不支持 .uav 回放（请用 debug 包）: ${file.name}")
             return
         }
-        stopSession()
+        link.stopSession()
         // 不回环：抓流里的"流头"只在该流首条 WRTE 有效，循环第二遍时这 12B 会被当成
         // 一帧解析而报错。要看第二遍就再触发一次回放。
         // 配速默认开启（按帧 PTS 还原真实速度），否则会把深度 4 的队列冲爆。
@@ -1157,106 +471,50 @@ class HostActivity : Activity(), UsbAttachRouter.Callback, HostSession.Listener 
             transport = transport,
             localWidth = screen.x,
             localHeight = screen.y,
-            surfaceProvider = ::currentSurface,
+            surfaceProvider = { panel.currentSurface() },
             logger = logger,
-            listener = this,
             replay = true,
+            listener = replayListener,
         )
-        session = s
+        link.adoptReplaySession(s)
         s.start()
         uiState.onReplay("回放：${file.name}（${channel.totalBytes} 字节）")
-        renderUiState()
+        render()
     }
 
-    // ------------------------------------------------------------------ 生命周期
+    /**
+     * 回放会话的回调：**只接进度**，其余事件一律忽略。
+     *
+     * ⚠️ 回放模式下没有链路可言，报"已断开 / 出错"会让状态机说谎；
+     *   画面与统计照常由 `HostSession` 自己驱动。
+     */
+    private val replayListener = object : HostSession.Listener {
+        override fun onStatus(text: String) {
+            uiState.onProgress(text)
+            render()
+        }
 
-    private fun currentSurface(): Surface? =
-        if (surfaceReady) surfaceView.holder.surface else null
+        override fun onError(message: String, cause: Throwable?) {
+            linkListener.onError(message, cause)
+        }
+    }
 
-    private fun stopSession() {
-        // 链路没了：旧 HID 注册随之失效。触点状态**保留**在控制器里 ——
-        // 重连后它会把"手指还按着"补发回去，避免手机上手指"卡住"。
-        hidTouch?.onLinkLost()
-        session?.close()
-        session = null
+    private fun closeReplay() {
         replayChannel?.close()
         replayChannel = null
-        bulkChannel = null
-        surfaceView.setVideoSize(0, 0)
     }
 
-    override fun onDestroy() {
-        mainHandler.removeCallbacks(statsTicker)
-        mainHandler.removeCallbacks(usbPoller)
-        mainHandler.removeCallbacks(clearExpectingRestartDelayed)
-        runCatching { unregisterReceiver(detachReceiver) }
-        router?.close()
-        router = null
-        stopSession()
-        hidTouch?.close()
-        hidTouch = null
-        super.onDestroy()
+    // ------------------------------------------------------------------ 渲染
+
+    /** 把状态机画到面板上（唯一的主状态行渲染入口）。 */
+    private fun render() {
+        panel.render(uiState)
     }
 
     companion object {
         const val TAG = "UAV-Host"
         const val REQ_PICK_UAV = 1001
-        const val STATS_INTERVAL_MS = 1000L
+        const val STATS_INTERVAL_MS = 1_000L
         const val STATS_LOG_EVERY_TICKS = 5L
-        const val POLL_INTERVAL_MS = 2_000L
-
-        /** 轮询退避的上限（连续失败会 2s→4s→8s… 最长等这么久再试）。 */
-        const val MAX_POLL_INTERVAL_MS = 30_000L
-
-        /** 退避最多翻几番（2s 左移 4 位 = 32s，会被上面那条封到 30s）。 */
-        const val MAX_POLL_BACKOFF_SHIFT = 4
-
-        /** adb 调试入口用的 extra：`--es replay_path <绝对路径>`。 */
-        const val EXTRA_REPLAY_PATH = "replay_path"
-
-        /** adb 调试入口用的 extra：`--ez force_handshake true`。 */
-        const val EXTRA_FORCE_HANDSHAKE = "force_handshake"
-
-        /** adb 调试入口用的 extra：`--ez scan true`。 */
-        const val EXTRA_SCAN = "scan"
-
-        /** adb 调试入口用的 extra：`--ez hid_probe true`（强制重新注册触摸屏）。 */
-        const val EXTRA_HID_PROBE = "hid_probe"
-
-        /** adb 调试入口用的 extra：`--ez hid_tap true [--ei tap_x N --ei tap_y M --ei hold_ms ms]`。 */
-        const val EXTRA_HID_TAP = "hid_tap"
-
-        const val EXTRA_TAP_X = "tap_x"
-        const val EXTRA_TAP_Y = "tap_y"
-
-        /** 第二根手指（给了就是双指同时按，用于验证多点）。 */
-        const val EXTRA_TAP2_X = "tap2_x"
-        const val EXTRA_TAP2_Y = "tap2_y"
-
-        /** 点按的按住时长（毫秒）。留证时拉长，普通点按用默认值。 */
-        const val EXTRA_HOLD_MS = "hold_ms"
-
-        /** 排障点按的默认按住时长：够手机侧产生明确的按下/抬起两条事件。 */
-        const val DEFAULT_TAP_HOLD_MS = 80
-
-        /** 菜单展开/收起的动画时长。够快（不拖沓）又够慢（不是硬闪）。 */
-        const val MENU_ANIM_MS = 160L
-
-        /**
-         * 宿主显示区变化多少才值得重建会话（1:1 像素映射，10.15）。
-         *
-         * 10% 的阈值是为了躲开布局抖动与对齐取整带来的 1~2px 噪声 ——
-         * 真正的横竖屏切换会让目标尺寸变化 40% 以上（1024 -> 1920）。
-         */
-        const val AREA_RENEGOTIATE_RATIO = 0.10
-
-        /** 「切换画质重开中」标志的兜底存活时长（ms）；出画面会提前清除。 */
-        const val RESTART_FLAG_TIMEOUT_MS = 45_000L
-
-        /** adb 调试入口用的 extra：`--ez no_audio true`（关掉音频，A/B 对比用）。 */
-        const val EXTRA_NO_AUDIO = "no_audio"
-
-        /** adb 调试入口用的 extra：`--ei audio_delay_ms N`（音频起播延迟，对齐音画用）。 */
-        const val EXTRA_AUDIO_DELAY_MS = "audio_delay_ms"
     }
 }

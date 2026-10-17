@@ -95,6 +95,7 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
     fun onLinkReady(connection: UsbDeviceConnection) {
         worker.execute {
             injector = HidInjector(connection, logger)
+            logger.i(TAG, "链路就绪：已绑定注入器")
             registeredId = 0
             idSeq.set(0)
             sweptThisConnection = false
@@ -107,6 +108,7 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
     /** 链路断开：清掉注入器与 id（**保留**触点状态，重连后据此重发）。 */
     fun onLinkLost() {
         worker.execute {
+            logger.i(TAG, "链路断开：作废注入器（registeredId=$registeredId）")
             injector = null
             registeredId = 0
         }
