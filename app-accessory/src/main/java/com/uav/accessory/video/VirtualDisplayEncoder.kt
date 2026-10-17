@@ -8,11 +8,13 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
+import android.os.Bundle
 import android.view.Surface
 import com.uav.accessory.AndroidLogger
 import com.uav.accessory.DisplaySize
 import com.uav.protocol.CodecId
 import com.uav.protocol.Flags
+import com.uav.protocol.GopTailGate
 import com.uav.protocol.Logger
 import com.uav.protocol.Options
 import com.uav.protocol.ParsedOpen
@@ -90,6 +92,17 @@ class VirtualDisplayEncoder(
     val framesEncoded = AtomicLong()
     val configFrames = AtomicLong()
     val keyFrames = AtomicLong()
+
+    /**
+     * 整 GOP 尾部丢弃（10.20②）：新会话接入后，在下一个 IDR 之前**不推帧**。
+     *
+     * 为什么：不丢的话，宿主那个全新的解码器会拿到缺 IDR 的 P 帧 → 花屏到下一个 I 帧
+     * （I 帧周期 3s）。门控逻辑在 `:protocol/GopTailGate`（可单测），这里只负责喂它帧类型。
+     */
+    private val gopGate = GopTailGate()
+
+    /** 因「等 IDR」被丢弃的帧数（诊断用；非 0 说明门控确实在起作用）。 */
+    val gopTailDropped = AtomicLong()
 
     /** 最近一次产出的 CONFIG payload —— 新会话接入时要重发（宿主的解码器靠它 configure）。 */
     @Volatile
@@ -238,6 +251,8 @@ class VirtualDisplayEncoder(
 
     private fun startOutputLoop() {
         val encoder = codec ?: return
+        // 新编码器 = 新会话接入：先 arm（它的第一帧本来就是 IDR，arm 只是把"必须先见 IDR"这条规矩立起来）
+        gopGate.arm()
         running.set(true)
         outputThread = Thread({ outputLoop(encoder) }, "uav-encoder-out").apply {
             isDaemon = true
@@ -457,8 +472,23 @@ class VirtualDisplayEncoder(
                     try {
                         val isCodecConfig =
                             (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                        val isKey = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                         val size = bufferInfo.size
-                        if (size > 0 && !isCodecConfig) {
+                        // ★ 整 GOP 尾部丢弃（10.20②）。⚠️ CONFIG 走的是 INFO_OUTPUT_FORMAT_CHANGED
+                        //   分支，**不受门控** —— 解码器配置依赖它，丢了必然黑屏。
+                        val wasWaiting = gopGate.isWaiting
+                        val gated = !gopGate.shouldEmit(isKey)
+                        if (gated) {
+                            gopTailDropped.incrementAndGet()
+                        } else if (wasWaiting && isKey) {
+                            // 拿到 IDR、门控解除 —— 这是"整 GOP 尾部丢弃"生效的直接证据
+                            logger.i(
+                                TAG,
+                                "整 GOP 尾部丢弃：等 IDR 期间丢掉 ${gopTailDropped.get()} 帧，" +
+                                    "拿到关键帧后恢复推流（${outputWidth}x$outputHeight）"
+                            )
+                        }
+                        if (size > 0 && !isCodecConfig && !gated) {
                             val buf = encoder.getOutputBuffer(index)
                             if (buf != null) {
                                 val data = ByteArray(size)
@@ -530,6 +560,26 @@ class VirtualDisplayEncoder(
     }
 
     /**
+     * 让编码器**立刻**吐一个 IDR（`PARAMETER_KEY_REQUEST_SYNC_FRAME`，API 26+）。
+     *
+     * 与 [gopGate] 配套：有它，[GopTailGate] 的等待通常是 ~1 帧（几十毫秒）；
+     * 没有它就得等编码器自己的 I 帧周期（本项目 3s）—— 那 3 秒就是花屏窗口。
+     *
+     * ⚠️ 静态画面下部分 ROM 可能忽略这个请求，所以门控那边还有 600ms 超时兜底。
+     */
+    private fun requestKeyFrame() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val c = codec ?: return
+        runCatching {
+            // ⚠️ 必须自己 new Bundle：`MediaCodec.getParameters()` 是**隐藏 API**（编译期就不存在），
+            //   公开的只有 `setParameters(Bundle)` + `PARAMETER_KEY_REQUEST_SYNC_FRAME` 常量。
+            val params = Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 1)
+            c.setParameters(params)
+        }.onFailure { logger.w(TAG, "请求关键帧失败: ${it.message}") }
+    }
+
+    /**
      * 新会话接入时**复用既有编码器**，只把「流头 + 最近一份 CONFIG」重发一遍。
      *
      * ★ 为什么必须这样做，而不能"停掉再重建"：
@@ -540,6 +590,10 @@ class VirtualDisplayEncoder(
      * @return true 表示成功重发；false 表示还没有可用的 CONFIG（宿主将无法 configure 解码器）
      */
     fun resendStartup(): Boolean {
+        // ★ 复用既有编码器接新会话：它正处在某个 GOP 中间，推过去的 P 帧在宿主的新解码器里
+        //   **没有对应的 IDR** ⇒ 花屏到下一个 I 帧。所以先 arm 等 IDR，并**立刻向编码器要一个**。
+        gopGate.arm()
+        requestKeyFrame()
         val cfg = lastConfig
         sink.onStreamHeader(StreamHeader(CodecId.AVC1, outputWidth, outputHeight))
         if (cfg == null) {
@@ -570,7 +624,8 @@ class VirtualDisplayEncoder(
 
     fun stats(): String =
         "out=${outputWidth}x$outputHeight frames=${framesEncoded.get()} " +
-            "key=${keyFrames.get()} config=${configFrames.get()} rebuilds=${rebuilds.get()}"
+            "key=${keyFrames.get()} config=${configFrames.get()} rebuilds=${rebuilds.get()} " +
+            "gopTailDropped=${gopTailDropped.get()}"
 
     companion object {
         const val TAG = "UAV-Video"
