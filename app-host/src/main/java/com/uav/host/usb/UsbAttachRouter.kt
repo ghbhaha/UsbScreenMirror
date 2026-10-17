@@ -176,7 +176,18 @@ class UsbAttachRouter(
         attemptCounts[target.deviceId] = n
         if (n > MAX_ATTEMPTS_PER_DEVICE) return
         logger.i(TAG, "轮询发现设备 id=${target.deviceId}（第 $n 次尝试），自动建立连接")
-        onDeviceAttached(target, forceHandshake = Aoa.isAccessoryPid(target.productId))
+        // ★ 10.32：这里**绝不能**按"配件 PID"去强制重握手。
+        //
+        //   配件 PID 只说明设备已经处在配件配置里 —— 这正是手机端可能已经打开
+        //   `/dev/usb_accessory` 在等我们的状态，此时该做的是**直接 claim + CNXN**（快路径），
+        //   而不是再发一轮 AOA：`SET_/START_ACCESSORY` 会重置配件配置，把对端刚打开的
+        //   fd 一起踢掉。之后手机端 12s 空闲看门狗释放 fd、我们更连不上，下一轮轮询又重握手
+        //   —— 形成"越重连越连不上"的死循环（实测宿主日志里连续出现 START_ACCESSORY）。
+        //
+        //   "这个配件到底是不是我们的"由快路径失败后的自愈兜底：
+        //   见 [LinkCoordinator] 的 `fastPathUnverified` / `onSelfHealRequest`，
+        //   它会补一次 `forceHandshake = true`。
+        onDeviceAttached(target, forceHandshake = false)
     }
 
     private fun pickCandidate(): UsbDevice? {

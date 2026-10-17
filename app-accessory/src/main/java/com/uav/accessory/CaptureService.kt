@@ -24,6 +24,7 @@ import com.uav.accessory.session.AccessorySession
 import com.uav.accessory.usb.FdByteChannel
 import com.uav.accessory.video.VirtualDisplayEncoder
 import com.uav.protocol.ByteChannel
+import com.uav.protocol.CloseReason
 import com.uav.protocol.Flags
 import com.uav.protocol.ParsedOpen
 import com.uav.protocol.StreamHeader
@@ -127,6 +128,16 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     private val reconnectTask = Runnable { attemptReconnect() }
 
     /**
+     * "空闲释放后自动重开"的次数（10.32）。
+     *
+     * 与 [reconnectAttempts] 分开计数：前者是"链路断了重连"，这里是
+     * "打开了 fd 但宿主 12s 没说话"。两者触发条件不同，配额也该各自独立。
+     */
+    private val idleRetries = java.util.concurrent.atomic.AtomicInteger()
+
+    private val idleRetryTask = Runnable { attemptReconnect() }
+
+    /**
      * 服务正在收尾（用户点停止 / 重连放弃 / `onDestroy`）。
      *
      * 没有它会出现这种情况：`stopEverything()` 主动 `close()` 会话后，异步到达的
@@ -180,6 +191,22 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
                     return START_NOT_STICKY
                 }
                 acquireProjection(resultCode, resultData)
+
+                // ★ 10.32 兜底：这条路径以前**假定"会话已经在跑"**（见下面的注释），
+                //   但用户点过"停止投屏"之后服务被 stopSelf 销毁，再来授权时
+                //   `session` 就是 null —— 于是投影拿到了、前台服务也活着，
+                //   却没人打开配件 fd 去应答宿主的 CNXN。界面还显示"录屏授权已获取"，
+                //   看起来像一切正常，实际永远连不上（只能重开 App 或拔插）。
+                //   这里自己把配件重新打开；采集由随后到达的宿主 OPEN 驱动。
+                if (session == null) {
+                    val acc = resolveAccessory(intent)
+                    if (acc == null) {
+                        AccessoryStatus.set("已拿到录屏授权，但没有可用的 USB 配件 —— 请重新插线")
+                        return START_NOT_STICKY
+                    }
+                    AccessoryStatus.set("录屏授权已获取，重新建立配件链路…")
+                    openAccessoryAndStartSession(acc)
+                }
 
                 // 如果 OPEN 已经先到（宿主比用户点授权更快），这里把挂起的采集补启动
                 val pending = pendingOptions
@@ -360,6 +387,8 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
         // 这条也顺手解决了"主动重启后被 onClosed 误排重连"的重复建链问题。
         cancelReconnect()
         reconnectAttempts.set(0)
+        // 真正建链成功 ⇒ 空闲重开配额归零（下次再遇到假配件又是完整的 N 次机会）
+        idleRetries.set(0)
         stopping = false
         s.start()
         AccessoryStatus.set("配件已打开（${accessory.model}/${accessory.manufacturer}），等待宿主报文")
@@ -618,16 +647,38 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     /**
      * "假配件"：会话起来了但宿主一声不响。
      *
-     * ★ **刻意只释放、不重连。** 原因见 [AccessorySession.Listener.onIdleTimeout]：
-     *   fd 被我们握着时手机端切不进配件模式，硬重连只会再次拿到同一个假配件、
-     *   把互锁继续维持下去。释放之后等宿主重新握手，系统会重新派发 attach，
-     *   那时 [ProjectionActivity.onNewIntent] 会把会话重新拉起来。
+     * ★ 必须先释放。fd 被我们握着时手机端切不进配件模式，硬重连只会再次拿到同一个
+     *   假配件、把互锁继续维持下去（见 [AccessorySession.Listener.onIdleTimeout]）。
+     *
+     * ★ 但**不能释放完就撒手**（10.32 修正）：原来的注释说"释放之后等宿主重新握手，
+     *   系统会重新派发 attach，由 [ProjectionActivity.onNewIntent] 把会话拉起来" ——
+     *   这依赖"宿主会做一次完整的 AOA 重握手"。而宿主在设备已是配件 PID 时走的是
+     *   **快路径**（不重新枚举），系统因此**不会**再派发 attach。
+     *   双方于是互等：宿主每 2~30s 发一次 CNXN，手机端早就释放了 fd，谁也接不上。
+     *   表现就是"点了停止投屏 / 重连失败之后，画面再也回不来，只能拔插"。
+     *
+     *   所以改成"释放 → 隔一会儿自己重开"，最多 [MAX_IDLE_RETRIES] 次；
+     *   真正建链成功后在 [openAccessoryAndStartSession] 里归零。
+     *   "释放"这个动作保留了，所以不会长期堵住配件模式切换。
      */
     override fun onIdleTimeout(reason: String) {
-        AndroidLogger.w(TAG, "释放假配件（$reason），等待宿主重新握手")
         cancelReconnect()
         releaseTransport("假配件: $reason")
-        AccessoryStatus.set("配件无应答（$reason），已释放。等待宿主重新握手…")
+        val n = idleRetries.incrementAndGet()
+        if (n > MAX_IDLE_RETRIES) {
+            AndroidLogger.w(TAG, "释放假配件（$reason），已重试 $MAX_IDLE_RETRIES 次仍无应答，停止")
+            AccessoryStatus.set("配件无应答（$reason），已停止重试。请重新插线或重新打开本应用")
+            return
+        }
+        AndroidLogger.w(
+            TAG,
+            "释放假配件（$reason），${IDLE_RETRY_DELAY_MS / 1000}s 后自动重开（第 $n/$MAX_IDLE_RETRIES 次）",
+        )
+        AccessoryStatus.set(
+            "配件无应答（$reason），${IDLE_RETRY_DELAY_MS / 1000}s 后自动重试（第 $n/$MAX_IDLE_RETRIES 次）…"
+        )
+        reconnectHandler.removeCallbacks(idleRetryTask)
+        reconnectHandler.postDelayed(idleRetryTask, IDLE_RETRY_DELAY_MS)
     }
 
     // ------------------------------------------------------------------ 前台通知
@@ -765,6 +816,9 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
 
     private fun cancelReconnect() {
         reconnectHandler.removeCallbacks(reconnectTask)
+        // ★ 必须一起取消：否则用户点了"停止投屏"之后，排队中的空闲重开
+        //   会把刚停掉的服务又拉起来（停止瞬间正好撞上 2s 的延迟窗口）。
+        reconnectHandler.removeCallbacks(idleRetryTask)
     }
 
     /**
@@ -798,8 +852,17 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
     private fun stopEverything() {
         stopping = true
         cancelReconnect()
+        // 用户主动停止 ⇒ 空闲重开的配额也归零，下次启动是干净的 N 次机会
+        idleRetries.set(0)
         pendingOptions = null
         stopCapture()
+        // ★ 10.32：用户主动停止**必须告诉宿主**。
+        //   以前这里只 close()，一个报文都不发 —— 宿主收不到任何信号，
+        //   只能靠读超时发现，表现为"点了停止，宿主画面冻住好几秒，
+        //   之后才开始无意义的重连重试"，而且它无法区分"用户停止"和"链路故障"。
+        //   走 closeGracefully 而不是 failAndClose：用户停止不是故障，
+        //   不该把两端的状态都标成"错误"。
+        session?.closeGracefully(CloseReason.USER_STOP)
         releaseTransport("停止采集")
         projection?.let { p ->
             runCatching { p.unregisterCallback(projectionCallback) }
@@ -825,6 +888,14 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
 
         const val ACTION_STOP = "com.uav.accessory.STOP"
 
+        /**
+         * 用户主动停止时发给宿主的 `CLSE` 原因。
+         *
+         * ⚠️ 定义在 `:protocol/CloseReason` —— 它是**两端契约**，
+         *   宿主那边要按同一个字面量判断"这是用户停止，不是链路故障"。
+         */
+        const val STOP_REASON_USER = CloseReason.USER_STOP
+
         const val EXTRA_RESULT_CODE = "resultCode"
         const val EXTRA_RESULT_DATA = "resultData"
 
@@ -843,6 +914,23 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
          * 太长则用户要干等。10 次 × 3s ≈ 30 秒的耐心窗口，实测够用。
          */
         const val RECONNECT_DELAY_MS = 3_000L
+
+        /**
+         * 空闲释放后自动重开的最大次数（10.32）。
+         *
+         * 取 3：宿主的轮询退避是 2→4→8→16→30s，手机端每次重开能提供 12s 的窗口，
+         * 三次足够覆盖到宿主的第二、三次重试，又不至于让"真的没人要我"的场景
+         * 长时间占着 fd。
+         */
+        const val MAX_IDLE_RETRIES = 3
+
+        /**
+         * 空闲释放后隔多久重开。
+         *
+         * 不能是 0：释放 fd 之后要留给内核一点时间真正回到"未打开"状态，
+         * 立刻重开容易拿到同一个坏句柄。2s 与宿主轮询的最小间隔同量级。
+         */
+        const val IDLE_RETRY_DELAY_MS = 2_000L
 
         /** openAccessory 的重试次数与间隔（应对"系统派发晚于服务启动"的瞬时无权限）。 */
         const val OPEN_ACCESSORY_ATTEMPTS = 6

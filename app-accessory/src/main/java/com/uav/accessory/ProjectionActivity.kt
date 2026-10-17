@@ -57,10 +57,21 @@ class ProjectionActivity : Activity() {
         statusText = findViewById(R.id.status)
         statsText = findViewById(R.id.stats)
 
-        findViewById<Button>(R.id.btn_grant).setOnClickListener { requestScreenCapture() }
+        // ★ 10.32：点"授予录屏权限"必须**先建链、再弹授权**。
+        //   用户可能刚点过"停止投屏"——那时 CaptureService 已经 stopSelf，
+        //   session / fd 全被清掉了；而录屏授权回来后只走 ACTION_SET_PROJECTION，
+        //   那条路径假定"会话已经在跑"，于是投影拿到了也没人应答宿主，投屏永远出不来。
+        //   ACTION_START 本身幂等（`session != null` 就直接 return），重复调用是安全的。
+        findViewById<Button>(R.id.btn_grant).setOnClickListener {
+            if (accessory == null) accessory = resolveAccessory(null)
+            startSessionService()
+            requestScreenCapture()
+        }
         findViewById<Button>(R.id.btn_stop).setOnClickListener {
             ContextCompat.startForegroundService(this, CaptureService.stopIntent(this))
-            AccessoryStatus.set("已请求停止")
+            // 文案点明"会通知宿主"：用户按下去之后马上能在宿主界面上看到这条原因，
+            // 不然容易怀疑"是不是没点成功"。
+            AccessoryStatus.set("已请求停止投屏（已通知宿主）")
         }
 
         accessory = resolveAccessory(intent)

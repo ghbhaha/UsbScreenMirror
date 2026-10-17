@@ -360,7 +360,19 @@ class LinkCoordinator(
                     listener.onFirstFrame()
                 }
 
-                override fun onClosed(reason: String) = listener.onClosed(reason)
+                override fun onClosed(reason: String) {
+                    listener.onClosed(reason)
+                    // ★ 10.32：这里**必须**把会话清掉，理由与 [handleSessionError] 完全一样 ——
+                    //   轮询的接管条件是 `session == null`，不清就永远不会自动重连
+                    //   （界面会一直停在"正在建立连接…"，实际一次都没去连）。
+                    //
+                    //   以前漏了没暴露：手机端 `close()` 从不发 CLSE，宿主这边总是因为
+                    //   读失败走 `onError`，那条路径会清。后来手机端改成"停止时发 CLSE"，
+                    //   才第一次走进这条分支 —— 表现就是"点了停止，宿主界面提示对了，
+                    //   但画面再也回不来，还得拔插"。
+                    mainHandler.post { stopSession() }
+                    consecutiveFailures.incrementAndGet()
+                }
 
                 override fun onError(message: String, cause: Throwable?) =
                     handleSessionError(message, cause)

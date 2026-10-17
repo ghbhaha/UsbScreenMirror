@@ -1,6 +1,7 @@
 package com.uav.protocol
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -115,6 +116,17 @@ class HostUiStateTest {
     }
 
     @Test
+    fun `对端主动 CLSE 的原因会剥掉日志前缀`() {
+        // 手机端点"停止投屏"会发 CLSE(CLOSE_ALL, "用户停止投屏")，
+        // 宿主这一侧拿到的是 Connection 加了日志前缀的字符串。
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onClosed("peer CLSE: 用户停止投屏")
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+        assertEquals("已断开：用户停止投屏", s.detail)
+    }
+
+    @Test
     fun `拔出回到空闲`() {
         val s = HostUiState()
         s.onFirstFrame()
@@ -206,5 +218,51 @@ class HostUiStateTest {
         s.onStreamHealth(StreamHealth.State.HEALTHY, silentMs = 0)
         assertEquals(HostUiState.Phase.MIRRORING, s.phase)
         assertEquals(before, s.detail)
+    }
+
+    // ---------------------------------------------------------------- 用户主动停止（10.32）
+
+    @Test
+    fun `用户停止的原因不会被重连进度刷掉`() {
+        // 宿主收到 CLSE 之后会立刻自动重连，每秒一条进度事件。
+        // 若照旧走 onProgress，几秒内"用户停止投屏"就被刷成"CNXN 已发送…"，
+        // 用户刚按的按钮等于没有任何反馈。
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onPeerStopped()
+        s.onProgress("CNXN 已发送（本机 1920x1080），等待手机尺寸…")
+        s.onProgress("检测到配件设备，直接建立通道…")
+        assertTrue("原因应被钉住，实际=${s.detail}", s.detail.contains("已停止投屏"))
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+        assertTrue(s.peerStopped)
+    }
+
+    @Test
+    fun `重新出首帧后停止提示自动撤销`() {
+        val s = HostUiState()
+        s.onPeerStopped()
+        s.onFirstFrame()
+        assertEquals(HostUiState.Phase.MIRRORING, s.phase)
+        assertEquals("首帧已输出", s.detail)
+        assertTrue("连上了就不该再钉着停止提示", !s.peerStopped)
+    }
+
+    @Test
+    fun `用户点扫描后停止提示也撤销`() {
+        // 用户已经在推动恢复，那条"请去手机上点授权"就没必要继续占着副行。
+        val s = HostUiState()
+        s.onPeerStopped()
+        s.onScanRequested()
+        assertTrue(!s.peerStopped)
+        assertEquals("正在扫描配件手机…", s.detail)
+    }
+
+    @Test
+    fun `普通断线不带停止语义`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onClosed("链路读失败")
+        assertTrue("普通断线不该置 peerStopped", !s.peerStopped)
+        assertEquals("已断开：链路读失败", s.detail)
     }
 }

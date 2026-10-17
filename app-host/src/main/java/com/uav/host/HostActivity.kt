@@ -26,6 +26,7 @@ import com.uav.host.ui.HostPanel
 import com.uav.host.usb.BulkPair
 import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.QualityController
+import com.uav.protocol.CloseReason
 import com.uav.protocol.HostUiState
 import com.uav.protocol.Protocol
 import com.uav.protocol.StreamHealth
@@ -355,7 +356,15 @@ class HostActivity : Activity() {
 
         override fun onClosed(reason: String) {
             // 链路断开不是终态：前台轮询会自动重试，所以回"连接中"而非"空闲"。
-            uiState.onClosed(reason)
+            //
+            // ★ 10.32：用户主动停止要和"意外断线"分开。前者要在界面上把原因**钉住**
+            //   （否则紧接着的自动重连会把"用户停止投屏"刷成"CNXN 已发送…"），
+            //   后者照旧随进度走。判据用协议层的同一个常量，两端不会失配。
+            if (reason.contains(CloseReason.USER_STOP)) {
+                uiState.onPeerStopped()
+            } else {
+                uiState.onClosed(reason)
+            }
             render()
             panel.revealMenu()
         }

@@ -82,6 +82,15 @@ class HostUiState {
         private set
 
     /**
+     * 是否正处于"对端用户主动停止"的状态（见 [onPeerStopped]）。
+     *
+     * 置位期间 [onProgress] 只丢弃，不更新 [detail] —— 这样宿主一边重连、
+     * 一边还能把"为什么断的、怎么恢复"留在屏幕上。
+     */
+    var peerStopped: Boolean = false
+        private set
+
+    /**
      * 会话进度事件（对应 `HostSession.Listener.onStatus`）。
      *
      * ★ **绝不降级 [phase]** —— 已在 [Phase.MIRRORING] / [Phase.REPLAY] 时，
@@ -90,6 +99,9 @@ class HostUiState {
      * @param text 进度文本（会成为 [detail]）
      */
     fun onProgress(text: String) {
+        // 对端用户主动停止之后，原因要钉在副行上 —— 宿主紧接着就会自动重连，
+        // 每秒一次的进度事件会把用户刚做的那个动作彻底刷掉（见 onPeerStopped）。
+        if (peerStopped) return
         detail = text
         // 只有"还没定下来"的阶段才会被进度事件推进；已到达的阶段保持不变。
         if (phase == Phase.IDLE || phase == Phase.CONNECTING) {
@@ -99,6 +111,7 @@ class HostUiState {
 
     /** 首帧已输出 ⇒ 画面在播。这是**唯一**能宣告"投屏中"的事件。 */
     fun onFirstFrame() {
+        peerStopped = false
         phase = Phase.MIRRORING
         detail = "首帧已输出"
     }
@@ -123,29 +136,58 @@ class HostUiState {
      * 还没出首帧时**不能**提前报"投屏中" —— 那正是"药丸绿、状态行说等待"的另一种错法。
      */
     fun onVideoSize() {
+        // 尺寸就绪说明链路已经重新接上 —— 用户停止留下的提示可以撤了。
+        peerStopped = false
         if (phase == Phase.RENEGOTIATING) phase = Phase.MIRRORING
+    }
+
+    /**
+     * 对端用户主动停止（`CLSE` 原因 = [CloseReason.USER_STOP]，10.32）。
+     *
+     * ★ 这个原因必须**粘住**（[peerStopped]），不能用普通 [onProgress] 处理：
+     *   宿主收到 `CLSE` 之后会**立刻开始自动重连**（这是对的，手机端用户接下来大概率
+     *   要点「授予录屏权限」，链路得随时能接上），于是每秒的进度事件几秒内就会把
+     *   "用户停止投屏"刷成「CNXN 已发送…」。用户刚按了按钮，却只看到界面在转圈，
+     *   会以为没生效、或者以为是故障。
+     *
+     * 语义上与 [onClosed] 的区别：
+     * | | 普通断线 | 用户主动停止 |
+     * |---|---|---|
+     * | 主行 | 连接中 | 连接中（我们确实在重连） |
+     * | 副行 | 随进度走 | **钉住**"手机端已停止投屏"，直到真的重新连上 |
+     */
+    fun onPeerStopped() {
+        phase = Phase.CONNECTING
+        peerStopped = true
+        detail = "手机端已停止投屏 —— 在手机上点「授予录屏权限」即可恢复"
     }
 
     /** 链路断开（`onClosed`）⇒ 回到连接中（前台轮询会自动重试，不是终态）。 */
     fun onClosed(reason: String) {
+        peerStopped = false
         phase = Phase.CONNECTING
-        detail = "已断开：$reason"
+        // 剥掉 `Connection` 层的日志措辞前缀，否则用户看到的是
+        // "已断开：peer CLSE: 用户停止投屏" —— 既是术语又重复。
+        detail = "已断开：${reason.removePrefix(PEER_CLSE_PREFIX)}"
     }
 
     /** 链路出错。终态：要么用户点重试，要么 `scanAndAttach` 把它带走。 */
     fun onError(message: String) {
+        peerStopped = false
         phase = Phase.ERROR
         detail = "ERROR: $message"
     }
 
     /** USB 拔出 / 强制重握手前清场 ⇒ 空闲。 */
     fun onDetached(reason: String) {
+        peerStopped = false
         phase = Phase.IDLE
         detail = reason
     }
 
     /** 本地回放。 */
     fun onReplay(text: String) {
+        peerStopped = false
         phase = Phase.REPLAY
         detail = text
     }
@@ -153,6 +195,8 @@ class HostUiState {
     /** 用户点了 Scan / Retry ⇒ 从任何阶段回到连接中。 */
     fun onScanRequested() {
         if (phase == Phase.REPLAY) return
+        // 用户主动点了扫描 ⇒ 他已经在推动恢复，那条"请去手机上点授权"的提示可以撤了。
+        peerStopped = false
         phase = Phase.CONNECTING
         detail = "正在扫描配件手机…"
     }
@@ -203,4 +247,15 @@ class HostUiState {
 
     /** 秒数显示下限取 1 —— "已 0 秒没输出"读起来像 bug（压阈值测 UI 时真出现过）。 */
     private fun secs(ms: Long): Long = (ms / 1000).coerceAtLeast(1)
+
+    companion object {
+        /**
+         * `Connection` 收到对端 `CLSE(CLOSE_ALL)` 时加在原因前面的日志措辞。
+         *
+         * 这里做一次剥离纯属展示层容错：协议层那句话是给日志看的，
+         * 直接透给用户会变成"已断开：peer CLSE: 用户停止投屏"。
+         * 两边文案一旦不一致，最坏也只是多显示一个前缀，不影响状态判定。
+         */
+        private const val PEER_CLSE_PREFIX = "peer CLSE: "
+    }
 }

@@ -205,14 +205,36 @@ class AccessorySession(
     fun failAndClose(reason: String) {
         logger.e(TAG, "failing session: $reason")
         listener.onError(reason, null)
+        sendCloseAndFlush(reason)
+        close()
+    }
+
+    /**
+     * 正常主动下线：先告诉对端"我为什么走"，再关连接。
+     *
+     * 与 [failAndClose] 的区别是**不触发 `listener.onError`** —— 用户点"停止投屏"
+     * 不是故障，走错误路径会把本端界面的状态标成"错误"，也会让宿主的
+     * `expectingRestart` 之类分流判断走错分支。
+     *
+     * ★ 为什么不直接 `close()`：`close()` 只关本地 socket，**一个报文都不发**。
+     *   对端（宿主）收不到任何信号，只能靠读超时或空闲看门狗自己发现 ——
+     *   表现为"点了停止，宿主画面冻住好几秒，然后才开始无意义的重连重试"，
+     *   而且用户完全不知道自己那一按到底有没有生效。
+     */
+    fun closeGracefully(reason: String) {
+        logger.i(TAG, "closing gracefully: $reason")
+        sendCloseAndFlush(reason)
+        close()
+    }
+
+    /** 发 `CLSE(CLOSE_ALL, reason)` 并给写线程一点时间把它真正送出去。 */
+    private fun sendCloseAndFlush(reason: String) {
         connection?.sendClose(StreamId.CLOSE_ALL, reason)
-        // 给写线程一点时间把 CLSE 送出去，再关闭
         try {
-            Thread.sleep(150)
+            Thread.sleep(CLOSE_FLUSH_MS)
         } catch (ie: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        close()
     }
 
     // ------------------------------------------------------------------ 收报文
@@ -342,5 +364,14 @@ class AccessorySession(
          * 12s 有充足余量；又不能太长，否则"假配件"会把手机端堵住十几秒以上。
          */
         const val IDLE_RELEASE_MS = 12_000L
+
+        /**
+         * 发完 `CLSE` 后等多久再真正关连接（毫秒）。
+         *
+         * 报文是异步写出去的：立刻 `close()` 会把刚排进队列的 `CLSE` 一起掐掉，
+         * 对端就永远收不到"我下线了"。150ms 是实测能稳定送达、又不至于让
+         * "停止"按钮明显卡顿的量级（与 `failAndClose` 一直沿用的值一致）。
+         */
+        private const val CLOSE_FLUSH_MS = 150L
     }
 }
