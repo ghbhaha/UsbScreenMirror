@@ -14,6 +14,7 @@ import com.uav.protocol.Connection
 import com.uav.protocol.ConnectionListener
 import com.uav.protocol.Frame
 import com.uav.protocol.FrameQueue
+import com.uav.protocol.GopTailGate
 import com.uav.protocol.LatencyStats
 import com.uav.protocol.Logger
 import com.uav.protocol.Options
@@ -189,6 +190,17 @@ class HostSession(
     @Volatile
     private var pendingRebuild = false
 
+    /**
+     * 宿主侧的"等 IDR"门控（10.21）。
+     *
+     * 与手机端的 [com.uav.protocol.GopTailGate] 同理，但作用点不同：手机端 arm 是为了
+     * **不推**缺 IDR 的 P 帧；这里 arm 是为了**即使手机端没配合**（老版本 App / RQID 丢失），
+     * 也不把这些无主的 P 帧喂进刚建好的解码器 —— 喂进去轻则花屏，重则 `MediaCodec` 报错。
+     *
+     * 同样有 600ms 超时兜底：宁可短暂花屏，也不要一直黑屏。
+     */
+    private val resumeGate = GopTailGate()
+
     @Volatile
     private var phoneWidth = 0
 
@@ -208,6 +220,9 @@ class HostSession(
     private val framesSkippedBeforeConfig = AtomicLong()
     private var warnedMissingConfig = false
     private var reportedFirstFrame = false
+
+    /** 因"重建解码器后等 IDR"被丢弃的帧数（诊断用；非 0 说明门控在起作用）。 */
+    private val resumeTailDropped = AtomicLong()
 
     // ---- 端到端延迟测量（计划 4.10）----
 
@@ -577,6 +592,15 @@ class HostSession(
                 continue
             }
 
+            // ★ 重建解码器后的"等 IDR"门控（10.21）：新解码器没有任何参考帧，
+            //   缺 IDR 的 P 帧喂进去只会花屏/报错，所以先挡在门外。
+            //   手机端已被 RQID 要求 arm 了同样的门控，这里是**兜底**
+            //   （手机端是旧版本、或 RQID 在 USB FIFO 里丢了）。
+            if (!resumeGate.shouldEmit(frame.isKeyFrame)) {
+                resumeTailDropped.incrementAndGet()
+                continue
+            }
+
             d.feed(frame)
 
             if (!reportedFirstFrame && d.framesDecoded.get() > 0) {
@@ -658,10 +682,21 @@ class HostSession(
             return false
         }
         decoder = d
+
+        // ★ 10.21：新解码器没有历史参考帧 ⇒ 必须先见 IDR。
+        //   本地 arm 门控（挡住缺 IDR 的 P 帧），同时向手机要一个关键帧 ——
+        //   手机端会 arm 它自己的门控并 `setParameters(REQUEST_SYNC_FRAME)`，
+        //   于是这段黑屏从"最长 3s（等 I 帧周期）"缩到"~1 帧（几十毫秒）"。
+        //   ⚠️ 绝不能走 resendStartup 那套（重发流头 + CONFIG）：链路与流头都还有效，
+        //   多发一份流头会把宿主解码器搞乱。
+        resumeGate.arm()
+        resumeTailDropped.set(0)
+        val asked = connection?.send(Command.RQID, StreamId.CONTROL, 0) ?: false
         logger.i(
             TAG,
             "解码器已在新 Surface 上重建（${size.first}x${size.second}，csd=${config.size}B）" +
-                " —— 新解码器没有历史参考帧，最多到下一个 I 帧（3s）画面才干净",
+                " —— 已 arm 等 IDR 门控并向手机请求关键帧（RQID 已发出=$asked），" +
+                "通常 ~1 帧内恢复画面",
         )
         return true
     }
@@ -917,6 +952,7 @@ class HostSession(
             (if (negotiatedDisplayArea.isEmpty()) "" else "(显示区 $negotiatedDisplayArea)") +
             " | ${connection?.stats?.snapshot() ?: "-"} | " +
             "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | avsync=${avSync.stats()} | " +
+            "resumeTailDropped=${resumeTailDropped.get()} | " +
             "audioQueue=$audioQueue | ${audio?.stats() ?: "no audio"} | ${latencyLine()}"
 
     /**

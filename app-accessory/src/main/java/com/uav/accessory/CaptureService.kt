@@ -346,6 +346,10 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
                 override fun stopCapture() {
                     stopCapture()
                 }
+
+                override fun requestKeyFrame() {
+                    encoder?.requestKeyFrameForHost()
+                }
             },
             logger = AndroidLogger,
             listener = this,

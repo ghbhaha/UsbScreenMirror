@@ -209,7 +209,7 @@ class Connection(
                 }
             }
 
-            Command.CNXN, Command.OPEN, Command.OKAY -> notifyMessage(message)
+            Command.CNXN, Command.OPEN, Command.OKAY, Command.RQID -> notifyMessage(message)
 
             null -> {
                 // 未知命令字：向前兼容，记日志并忽略，不中断连接（计划 4.2）

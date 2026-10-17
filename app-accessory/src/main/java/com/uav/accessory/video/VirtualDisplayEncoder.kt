@@ -567,16 +567,39 @@ class VirtualDisplayEncoder(
      *
      * ⚠️ 静态画面下部分 ROM 可能忽略这个请求，所以门控那边还有 600ms 超时兜底。
      */
-    private fun requestKeyFrame() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val c = codec ?: return
-        runCatching {
+    /**
+     * 宿主重建了解码器（切后台→回前台）⇒ **立刻给他一个 IDR**（10.21）。
+     *
+     * 与 [resendStartup] 的区别：那条路是"新会话接入"，会重发流头 + CONFIG；
+     * 而这里链路、流头、CONFIG 全都还有效，宿主只是换了个 Surface ⇒
+     * **只能要一个关键帧，绝不能重发流头**（多发一份流头会把宿主解码器搞乱）。
+     *
+     * 所以这里同样 [gopGate] 先 arm —— 在 IDR 到来之前不推 P 帧，
+     * 否则宿主那个空参考帧的新解码器会吃到无主的 P 帧。
+     *
+     * @return 是否真的发出了请求（编码器不在 / API < 26 时为 false）
+     */
+    fun requestKeyFrameForHost(): Boolean {
+        gopGate.arm()
+        val ok = requestKeyFrame()
+        logger.i(TAG, "宿主请求关键帧（切后台恢复渲染）：已 arm GOP 门控，requestKeyFrame=$ok")
+        return ok
+    }
+
+    private fun requestKeyFrame(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+        val c = codec ?: return false
+        return runCatching {
             // ⚠️ 必须自己 new Bundle：`MediaCodec.getParameters()` 是**隐藏 API**（编译期就不存在），
             //   公开的只有 `setParameters(Bundle)` + `PARAMETER_KEY_REQUEST_SYNC_FRAME` 常量。
             val params = Bundle()
             params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 1)
             c.setParameters(params)
-        }.onFailure { logger.w(TAG, "请求关键帧失败: ${it.message}") }
+            true
+        }.getOrElse {
+            logger.w(TAG, "请求关键帧失败: ${it.message}")
+            false
+        }
     }
 
     /**

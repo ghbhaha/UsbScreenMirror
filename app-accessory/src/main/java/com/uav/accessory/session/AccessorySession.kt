@@ -80,6 +80,16 @@ class AccessorySession(
         fun startCapture(options: ParsedOpen, session: AccessorySession)
 
         fun stopCapture()
+
+        /**
+         * 宿主重建了解码器（切后台→回前台），请**立刻产出一个 IDR**（10.21）。
+         *
+         * ★ 不能靠"新会话接入"那套：`resendStartup` 会重发流头 + CONFIG，
+         *   而这里链路与流头都还有效，重发只会把宿主的解码器搞乱。
+         *
+         * 实现必须是**非阻塞**的（跑在协议读线程上）。
+         */
+        fun requestKeyFrame() {}
     }
 
     private val closed = AtomicBoolean(false)
@@ -219,6 +229,13 @@ class AccessorySession(
                 Command.CNXN -> handleCnxn(message)
                 Command.OPEN -> handleOpen(message)
                 Command.OKAY -> logger.i(TAG, "OKAY received (host acks stream ${StreamId.name(message.arg0)})")
+                // ★ 宿主换 Surface 重建了解码器（切后台→回前台），要一个 IDR（10.21）。
+                //   这是**唯一**的"没换会话却要关键帧"路径，所以必须显式支持。
+                Command.RQID -> {
+                    logger.i(TAG, "RQID received：宿主请求关键帧（切后台恢复渲染）")
+                    runCatching { capture.requestKeyFrame() }
+                        .onFailure { logger.w(TAG, "requestKeyFrame 失败: ${it.message}") }
+                }
                 Command.CLSE -> {
                     logger.i(TAG, "CLSE from host: ${message.payload.toString(Charsets.UTF_8)}")
                     stopCaptureQuietly()
