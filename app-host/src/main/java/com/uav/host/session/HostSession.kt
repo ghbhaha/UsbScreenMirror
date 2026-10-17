@@ -1,5 +1,6 @@
 package com.uav.host.session
 
+import android.os.SystemClock
 import android.view.Surface
 import com.uav.host.AndroidLogger
 import com.uav.host.audio.AudioPlayer
@@ -109,6 +110,18 @@ class HostSession(
     }
 
     private val videoQueue = FrameQueue(StreamId.VIDEO, logger = logger)
+
+    /**
+     * 最后一次收到**媒体帧**（非 CONFIG）的单调时刻；`0` = 本次会话还没收到过。
+     *
+     * 供流健康监测（10.30）用：上层（`HostActivity` 的每秒 tick）拿它喂
+     * `:protocol/StreamHealth`，据此判断"手机端是不是不再产帧了"。
+     * 以前没有这个判据时，手机端编码器静默卡死会让宿主一直显示「投屏中」，
+     * 用户只看到画面冻住却无从判断原因。
+     */
+    @Volatile
+    var lastVideoFrameAtMs: Long = 0L
+        private set
 
     /**
      * A/V 同步门（10.20③）：以**音频播放头**为基准，决定每一帧是"渲染 / 等一下再渲染 / 丢掉"。
@@ -580,6 +593,11 @@ class HostSession(
                 if (rendering) decoder?.drainOutput()
                 continue
             }
+
+            // 流健康监测（10.30）：只认**媒体帧**，不认 CONFIG。
+            // CONFIG 在重建路径里可能单独出现，但那不代表画面在动；静态画面则有
+            // KEY_REPEAT_PREVIOUS_FRAME_AFTER=100ms 兜底送帧，所以"有媒体帧"等价于"流在跑"。
+            if (!frame.isConfig) lastVideoFrameAtMs = SystemClock.elapsedRealtime()
 
             // ★ 换了 Surface 就必须重建解码器（MediaCodec 的 output surface 不能改绑）。
             //   放在消费线程里做而不是在 `surfaceCreated` 回调里做：既保证

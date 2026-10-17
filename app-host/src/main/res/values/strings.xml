@@ -26,6 +26,7 @@
     <string name="host_chip_mirroring">投屏中</string>
     <string name="host_chip_renegotiating">重协商</string>
     <string name="host_chip_replay">回放</string>
+    <string name="host_chip_no_signal">无输出</string>
     <string name="host_chip_error">出错</string>
 
     <!-- 状态行 -->
@@ -39,6 +40,7 @@
     <string name="host_status_renegotiating">投屏中 · 正在重协商…</string>
     <string name="host_status_replay">回放抓流中</string>
     <!-- ERROR 阶段的主行只说"出错了"，具体原因在副行（onError 已把原因拼进去） -->
+    <string name="host_status_no_signal">手机无输出</string>
     <string name="host_status_error">链路出错</string>
 
     <!-- 操作（磁贴：图标在上、文字在下，文案尽量短） -->

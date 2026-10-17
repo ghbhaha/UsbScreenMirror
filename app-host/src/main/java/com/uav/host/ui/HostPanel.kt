@@ -356,7 +356,7 @@ class HostPanel(private val activity: Activity) {
     // ------------------------------------------------------------------ 状态渲染
 
     /** 常驻状态药丸的状态（决定圆点颜色）。 */
-    private enum class ChipState { IDLE, CONNECTING, ACTIVE, ERROR }
+    private enum class ChipState { IDLE, CONNECTING, ACTIVE, NO_SIGNAL, ERROR }
 
     /**
      * 按 [HostUiState] 的当前阶段刷新**主状态行 + 副行 + 药丸**（10.23）。
@@ -377,6 +377,7 @@ class HostPanel(private val activity: Activity) {
                 HostUiState.Phase.MIRRORING -> R.string.host_status_mirroring
                 HostUiState.Phase.RENEGOTIATING -> R.string.host_status_renegotiating
                 HostUiState.Phase.REPLAY -> R.string.host_status_replay
+                HostUiState.Phase.NO_SIGNAL -> R.string.host_status_no_signal
                 HostUiState.Phase.ERROR -> R.string.host_status_error
             }
         )
@@ -392,6 +393,8 @@ class HostPanel(private val activity: Activity) {
                 // 重协商时点保持绿：画面确实还在播（原地重协商不中断渲染）
                 HostUiState.Phase.MIRRORING, HostUiState.Phase.RENEGOTIATING -> ChipState.ACTIVE
                 HostUiState.Phase.REPLAY -> ChipState.ACTIVE
+                // 无输出用黄色（警告）：链路是好的，只是对面不动了 —— 不是链路错误。
+                HostUiState.Phase.NO_SIGNAL -> ChipState.NO_SIGNAL
                 HostUiState.Phase.ERROR -> ChipState.ERROR
             },
             activity.getString(
@@ -401,6 +404,7 @@ class HostPanel(private val activity: Activity) {
                     HostUiState.Phase.MIRRORING -> R.string.host_chip_mirroring
                     HostUiState.Phase.RENEGOTIATING -> R.string.host_chip_renegotiating
                     HostUiState.Phase.REPLAY -> R.string.host_chip_replay
+                    HostUiState.Phase.NO_SIGNAL -> R.string.host_chip_no_signal
                     HostUiState.Phase.ERROR -> R.string.host_chip_error
                 }
             ),
@@ -418,6 +422,7 @@ class HostPanel(private val activity: Activity) {
                 ChipState.IDLE -> R.color.host_idle
                 ChipState.CONNECTING -> R.color.host_warn
                 ChipState.ACTIVE -> R.color.host_ok
+                ChipState.NO_SIGNAL -> R.color.host_warn
                 ChipState.ERROR -> R.color.host_err
             }
         )

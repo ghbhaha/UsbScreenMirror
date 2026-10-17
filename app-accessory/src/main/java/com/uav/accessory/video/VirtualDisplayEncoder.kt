@@ -9,6 +9,7 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Surface
 import com.uav.accessory.AndroidLogger
 import com.uav.accessory.DisplaySize
@@ -148,6 +149,10 @@ class VirtualDisplayEncoder(
 
     @Volatile
     private var stopped = false
+
+    /** 最后一次真正产出编码帧的单调时刻；0 = 本编码器还没跑过。 */
+    @Volatile
+    private var lastOutputAtMs = 0L
 
     /** 生命周期互斥：`stop()` 可能来自主线程，而重建来自 [rotatorThread]。 */
     private val lifecycleLock = Any()
@@ -447,6 +452,8 @@ class VirtualDisplayEncoder(
         sink.onStreamHeader(
             StreamHeader(CodecId.AVC1, outputWidth, outputHeight)
         )
+        // 从那一步开始计时：首帧本身可能要等一两个 vsync，不能一上来就判超时。
+        lastOutputAtMs = SystemClock.elapsedRealtime()
 
         while (running.get() && !Thread.currentThread().isInterrupted) {
             val index = try {
@@ -463,12 +470,32 @@ class VirtualDisplayEncoder(
             when {
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> emitConfig(encoder.outputFormat)
 
-                index == MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                index == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                    // ★ 编码器"活着但不产帧"（10.30）：链路、虚拟屏都正常，
+                    //   就是 dequeueOutputBuffer 一直 TRY_AGAIN。宿主那边只能看到"没有新帧"，
+                    //   而它自己知道得更早 —— 主动上报，别让对端干等。
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastOutputAtMs > NO_OUTPUT_TIMEOUT_MS) {
+                        logger.e(
+                            TAG,
+                            "编码器 ${NO_OUTPUT_TIMEOUT_MS}ms 内没有产出任何帧，判定已卡死",
+                        )
+                        sink.onError(
+                            IllegalStateException(
+                                "编码器 ${NO_OUTPUT_TIMEOUT_MS / 1000} 秒没有输出画面",
+                            ),
+                        )
+                        return
+                    }
+                }
 
                 // 其余负值（含已废弃的 INFO_OUTPUT_BUFFERS_CHANGED = -3）统一忽略
                 index < 0 -> Unit
 
                 else -> {
+                    // ★ 只要 dequeue 拿到有效 index 就算"编码器在干活"，无论这一帧随后
+                    //   是被 GOP 门控丢掉还是真的发出去 —— 看门狗只看"有没有产出"。
+                    lastOutputAtMs = SystemClock.elapsedRealtime()
                     try {
                         val isCodecConfig =
                             (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
@@ -670,6 +697,18 @@ class VirtualDisplayEncoder(
         const val DISPLAY_NAME = "uav-virtual-display"
 
         private const val DEQUEUE_TIMEOUT_US = 10_000L
+
+        /**
+         * 编码器超过这么久没产出任何帧 ⇒ 判定卡死并主动上报（10.30）。
+         *
+         * 为什么必须主动报：编码器"活着但不产帧"是宿主的噩梦 —— 链路好着、画面冻住，
+         * 宿主那边只能看到"没有新帧"。手机端自己知道得更早也更准，就该先说。
+         *
+         * ⚠️ 阈值要比宿主的 `StreamHealth.DEFAULT_STOP_MS`（10s）早：
+         *   让"手机端自报"先发生，宿主收到 `CLSE("编码器…")` 后走的是明确的错误路径，
+         *   而不是干等到 10 秒再显示"手机无输出"。
+         */
+        private const val NO_OUTPUT_TIMEOUT_MS = 8_000L
 
         /** 旋转检查间隔。旋转动画本身约 300ms，200ms 足够及时又不至于空转。 */
         private const val ROTATION_POLL_MS = 200L

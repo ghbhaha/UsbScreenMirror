@@ -9,6 +9,7 @@ import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.SurfaceHolder
 import android.view.WindowManager
 import androidx.core.content.IntentCompat
@@ -27,6 +28,7 @@ import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.QualityController
 import com.uav.protocol.HostUiState
 import com.uav.protocol.Protocol
+import com.uav.protocol.StreamHealth
 import com.uav.protocol.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
@@ -93,6 +95,18 @@ class HostActivity : Activity() {
 
     private var tickCount = 0L
 
+    /**
+     * 流健康度判定（10.30）。纯逻辑在 `:protocol/StreamHealth`，有 JVM 单测。
+     *
+     * ⚠️ 它要解决的不是"链路断了"（那种有 onClosed/onError），而是**链路好着、对面不动了**：
+     *   手机端编码器静默卡死时，以前宿主状态行照旧写「投屏中」，用户只看到画面冻住。
+     */
+    private val streamHealth = StreamHealth()
+
+    /** 上一拍的健康度与"静默秒数"，用来避免每秒都重绘面板。 */
+    private var lastHealthState = StreamHealth.State.HEALTHY
+    private var lastSilentSec = -1L
+
     /** 链路统计的周期刷新。UI 用紧凑形状，日志用完整形状（见 [HostSession.statsCompact]）。 */
     private val statsTicker = object : Runnable {
         override fun run() {
@@ -109,6 +123,7 @@ class HostActivity : Activity() {
             if (DebugTools.ENABLED && tickCount % STATS_LOG_EVERY_TICKS == 0L) {
                 logger.i(TAG, "STATS ${s?.stats() ?: uiText}")
             }
+            checkStreamHealth(s)
             mainHandler.postDelayed(this, STATS_INTERVAL_MS)
         }
     }
@@ -545,6 +560,33 @@ class HostActivity : Activity() {
     /** 把状态机画到面板上（唯一的主状态行渲染入口）。 */
     private fun render() {
         panel.render(uiState)
+    }
+
+    /**
+     * 每秒评估一次流健康度（10.30）。
+     *
+     * 只在**状态或秒数真的变了**才推进状态机并重绘 —— 否则每秒 render 一次，
+     * 面板会持续重排（10.26 那个"反复显示隐藏"的教训：UI 动作要由真实变化驱动）。
+     */
+    private fun checkStreamHealth(session: HostSession?) {
+        val now = SystemClock.elapsedRealtime()
+        val lastAt = session?.lastVideoFrameAtMs ?: 0L
+        val state = streamHealth.evaluate(now, lastAt)
+        val silentMs = streamHealth.silentMs(now, lastAt)
+        val silentSec = silentMs / 1000
+
+        val changed = state != lastHealthState ||
+            (state == StreamHealth.State.STALLED && silentSec != lastSilentSec) ||
+            (state == StreamHealth.State.STOPPED && silentSec != lastSilentSec)
+        if (!changed) return
+
+        lastHealthState = state
+        lastSilentSec = silentSec
+        uiState.onStreamHealth(state, silentMs)
+        render()
+        if (DebugTools.ENABLED) {
+            logger.w(TAG, "流健康：$state，已 ${silentSec}s 无新帧（判定阈值 stall=${StreamHealth.DEFAULT_STALL_MS}ms stop=${StreamHealth.DEFAULT_STOP_MS}ms）")
+        }
     }
 
     companion object {

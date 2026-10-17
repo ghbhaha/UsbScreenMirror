@@ -56,6 +56,14 @@ class HostUiState {
         /** 回放中：读本地 `.uav` 文件，不走 USB 链路。 */
         REPLAY,
 
+        /**
+         * 手机端无输出（10.30）：链路**还连着**，但对方不再产帧。
+         *
+         * 与 [ERROR] 的区别很关键：ERROR 是"链路出了问题"，而这个是"链路好着、对面不动了"——
+         * 用户的处置方式完全不同（前者等自动重连，后者通常要动手机端）。
+         */
+        NO_SIGNAL,
+
         /** 出错：链路错误且没有自动恢复中。 */
         ERROR,
     }
@@ -148,4 +156,51 @@ class HostUiState {
         phase = Phase.CONNECTING
         detail = "正在扫描配件手机…"
     }
+
+    /**
+     * 流健康度变化（10.30，判据见 [StreamHealth]）。
+     *
+     * 这是**真实的状态变化**（不是乱序进度事件），所以允许降级主状态行 —— 但只在
+     * 本来就在投屏 / 重协商时才降：
+     *
+     * | 健康度 | 动作 |
+     * |---|---|
+     * | [StreamHealth.State.STALLED] | 只更新 [detail]（"画面安静 Ns"），**不动主行** |
+     * | [StreamHealth.State.STOPPED] | [Phase.MIRRORING]/[Phase.RENEGOTIATING] → [Phase.NO_SIGNAL] |
+     * | [StreamHealth.State.HEALTHY] | [Phase.NO_SIGNAL] → [Phase.MIRRORING]（自动恢复） |
+     *
+     * ⚠️ STALLED **刻意不降级**：等 IDR / 重建编码器都会短暂停帧，那时画面其实马上就回来，
+     *   把主行改成"无输出"再改回去会造成闪烁 —— 这正是 10.26 那个"面板乱闪"的同款陷阱。
+     */
+    fun onStreamHealth(state: StreamHealth.State, silentMs: Long) {
+        when (state) {
+            StreamHealth.State.HEALTHY -> {
+                if (phase == Phase.NO_SIGNAL) {
+                    phase = Phase.MIRRORING
+                    detail = "画面已恢复"
+                }
+            }
+
+            StreamHealth.State.STALLED -> {
+                // 只在已经投屏/无输出时提示；连接中（还没首帧）不掺和。
+                if (phase == Phase.MIRRORING || phase == Phase.RENEGOTIATING ||
+                    phase == Phase.NO_SIGNAL
+                ) {
+                    detail = "画面已 ${secs(silentMs)} 秒无新帧…"
+                }
+            }
+
+            StreamHealth.State.STOPPED -> {
+                if (phase == Phase.MIRRORING || phase == Phase.RENEGOTIATING) {
+                    phase = Phase.NO_SIGNAL
+                }
+                if (phase == Phase.NO_SIGNAL) {
+                    detail = "手机端已 ${secs(silentMs)} 秒没有输出画面，请检查手机上的「投屏发送」"
+                }
+            }
+        }
+    }
+
+    /** 秒数显示下限取 1 —— "已 0 秒没输出"读起来像 bug（压阈值测 UI 时真出现过）。 */
+    private fun secs(ms: Long): Long = (ms / 1000).coerceAtLeast(1)
 }

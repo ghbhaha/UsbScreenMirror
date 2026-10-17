@@ -148,4 +148,63 @@ class HostUiStateTest {
         s.onScanRequested()
         assertEquals(HostUiState.Phase.CONNECTING, s.phase)
     }
+
+    // ---------------------------------------------------------------- 流健康（10.30）
+
+    @Test
+    fun `可疑停帧只改副行不动主行`() {
+        // 等 IDR / 重建编码器都会短暂停帧，主行改成"无输出"再改回来会闪（10.26 同款陷阱）。
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onStreamHealth(StreamHealth.State.STALLED, silentMs = 4_200)
+        assertEquals(HostUiState.Phase.MIRRORING, s.phase)
+        assertEquals("画面已 4 秒无新帧…", s.detail)
+    }
+
+    @Test
+    fun `投屏中长时间无帧降级为无输出`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onStreamHealth(StreamHealth.State.STOPPED, silentMs = 12_000)
+        assertEquals(HostUiState.Phase.NO_SIGNAL, s.phase)
+        assert(s.detail.contains("12 秒")) { s.detail }
+    }
+
+    @Test
+    fun `重协商期间长时间无帧也降级为无输出`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onRenegotiate()
+        s.onStreamHealth(StreamHealth.State.STOPPED, silentMs = 11_000)
+        assertEquals(HostUiState.Phase.NO_SIGNAL, s.phase)
+    }
+
+    @Test
+    fun `无输出状态下恢复出帧会自动回到投屏中`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onStreamHealth(StreamHealth.State.STOPPED, silentMs = 15_000)
+        s.onStreamHealth(StreamHealth.State.HEALTHY, silentMs = 0)
+        assertEquals(HostUiState.Phase.MIRRORING, s.phase)
+        assertEquals("画面已恢复", s.detail)
+    }
+
+    @Test
+    fun `连接中（还没首帧）的停帧不该报无输出`() {
+        // 刚 OPEN 完、首帧还没来，这属于正常等待，不能报"手机端没输出"。
+        val s = HostUiState()
+        s.onProgress("会话已建立，等待视频流…")
+        s.onStreamHealth(StreamHealth.State.STOPPED, silentMs = 20_000)
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+    }
+
+    @Test
+    fun `健康时不动任何状态`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        val before = s.detail
+        s.onStreamHealth(StreamHealth.State.HEALTHY, silentMs = 0)
+        assertEquals(HostUiState.Phase.MIRRORING, s.phase)
+        assertEquals(before, s.detail)
+    }
 }
