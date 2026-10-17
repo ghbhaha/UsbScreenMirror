@@ -84,6 +84,14 @@ class HostPanel(private val activity: Activity) {
      */
     private var menuAutoCollapsed = false
 
+    /**
+     * 当前这次展开是**系统**叫回来的（报错 / 断链 / 拔出），不是用户自己点开的。
+     *
+     * 区别对待：系统展开是为了让用户看见告警，画面一恢复就该收回去；
+     * 而用户手动展开（想看统计、想切画质）绝不能被首帧抢走。
+     */
+    private var autoRevealed = false
+
     /** 空白区触摸的按下点，用来判断"这是点击"还是"从空白区划出去"。 */
     private var menuDownX = 0f
     private var menuDownY = 0f
@@ -126,7 +134,7 @@ class HostPanel(private val activity: Activity) {
         // 常驻状态药丸：面板收起后仍能看到链路状态；点它 = 打开面板（收起后不会"无路可回"）
         findViewById<View>(R.id.status_chip).setOnClickListener { toggleMenu() }
         // 面板右上角：收起
-        findViewById<View>(R.id.btn_collapse).setOnClickListener { setMenuVisible(false) }
+        findViewById<View>(R.id.btn_collapse).setOnClickListener { hideMenu() }
 
         segOneToOne.setOnClickListener { onTogglePixelMode(true) }
         segHighQuality.setOnClickListener { onTogglePixelMode(false) }
@@ -193,7 +201,25 @@ class HostPanel(private val activity: Activity) {
     }
 
     fun toggleMenu() {
+        autoRevealed = false
         setMenuVisible(!menuShown)
+    }
+
+    /**
+     * **系统**要把菜单叫出来（报错 / 断链 / 拔出）。
+     *
+     * 与 [toggleMenu] 的区别只有一个：这样展开的菜单会在下一次首帧后自动收回去
+     * （见 [autoCollapseOnFirstFrame]）。
+     */
+    fun revealMenu() {
+        autoRevealed = true
+        setMenuVisible(true)
+    }
+
+    /** 用户主动收起（面板右下角的收起按钮）。 */
+    fun hideMenu() {
+        autoRevealed = false
+        setMenuVisible(false)
     }
 
     /** 当前 Surface（已失效时返回 null）。 */
@@ -213,10 +239,23 @@ class HostPanel(private val activity: Activity) {
      * 显示 / 隐藏菜单（状态 + 统计 + 按钮那一整块）。
      *
      * 线程安全：链路/会话回调来自 worker 线程，所以这里自己判线程再转 UI 线程。
+     *
+     * ★ **幂等**：已经是目标状态就直接返回，**绝不重放动画**。
+     *   踩过的坑：链路层在启动初期会连续发 `onClosed` / `onError`（握手失败、坏 magic、
+     *   自动重试…），而调用点为了"让用户看得见"每次都调 `setMenuVisible(true)`。
+     *   旧实现无条件把 `alpha` 从 0 拉回 1、`translationX` 从 -16dp 归零再 animate，
+     *   于是**已经展开的菜单被反复重播淡入动画** —— 视觉上就是"进去之后面板一顿乱闪"。
+     *   判据用 `menuShown` + `visibility` 一起看：这样"收起动画进行中又被叫回来"
+     *   （`menuShown` 已 false 但 visibility 还是 VISIBLE）仍能正确重新展开。
      */
     fun setMenuVisible(visible: Boolean, animate: Boolean = true) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             activity.runOnUiThread { setMenuVisible(visible, animate) }
+            return
+        }
+        val settledVisibility = if (menuShown) View.VISIBLE else View.GONE
+        if (menuShown == visible && overlayView.visibility == settledVisibility) {
+            // 已经到位，直接返回：让正在跑的动画自己跑完，绝不重播
             return
         }
         menuShown = visible
@@ -252,13 +291,19 @@ class HostPanel(private val activity: Activity) {
     }
 
     /**
-     * 画面出来了就把菜单收起来，让视频干净地占满整屏（**只自动收一次**）。
+     * 画面出来了就把菜单收起来，让视频干净地占满整屏。
      *
-     * 想调参数时点一下画面外的空白处即可叫回来。
+     * 两条规则：
+     * 1. **启动后只自动收一次** —— 否则每次重连恢复都强行收，用户正开着菜单看统计会很恼人；
+     * 2. **系统因报错/断链叫回来的那次，必须收**（[autoRevealed]），
+     *    否则重连之后菜单会一直挂在画面上不动 —— 而它本来只是来报错的。
+     *
+     * 用户自己点开的菜单（`autoRevealed == false` 且已经收过一次）不碰。
      */
     fun autoCollapseOnFirstFrame() {
-        if (menuAutoCollapsed) return
+        if (menuAutoCollapsed && !autoRevealed) return
         menuAutoCollapsed = true
+        autoRevealed = false
         setMenuVisible(false)
     }
 

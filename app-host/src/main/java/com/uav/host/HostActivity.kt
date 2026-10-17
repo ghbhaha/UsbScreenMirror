@@ -120,7 +120,7 @@ class HostActivity : Activity() {
             uiState.onDetached("USB 已拔出，请重新插线或点 Scan/Retry")
             render()
             // 这条提示藏在收起的菜单里就等于没提示
-            panel.setMenuVisible(true)
+            panel.revealMenu()
         }
     }
 
@@ -316,7 +316,7 @@ class HostActivity : Activity() {
             // 链路断开不是终态：前台轮询会自动重试，所以回"连接中"而非"空闲"。
             uiState.onClosed(reason)
             render()
-            panel.setMenuVisible(true)
+            panel.revealMenu()
         }
 
         override fun onError(message: String, cause: Throwable?) {
@@ -324,7 +324,7 @@ class HostActivity : Activity() {
             //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
             uiState.onError(message)
             render()
-            panel.setMenuVisible(true)
+            panel.revealMenu()
             logger.e(TAG, message, cause)
             // 链路层已负责 stopSession / 退避计数 / 自愈判定，这里只管"让用户可见"。
 
