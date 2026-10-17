@@ -4,10 +4,10 @@
 
   运行时状态文本本来就是中文（见 CaptureService 的 AccessoryStatus.set），
   这里统一的是布局与通知栏里的静态文案。
-  英文用户由 values-en/ 覆盖。产品名 app_name 不翻译。
+  英文用户由 values-en/ 覆盖。app_name 是桌面显示名：中文「投屏发送」、英文 Cast Out（理由见 app-host 的说明）。
 -->
 <resources>
-    <string name="app_name">UAV Accessory</string>
+    <string name="app_name">投屏发送</string>
     <string name="acc_status_idle">未连接 —— 请把本机插到宿主上</string>
     <string name="acc_btn_grant">授予录屏权限</string>
     <string name="acc_btn_stop">停止投屏</string>

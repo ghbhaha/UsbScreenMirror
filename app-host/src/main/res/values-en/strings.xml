@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- English UI strings. Key names must match values/strings.xml one-to-one. -->
+<!--
+  English UI strings. Key names must match values/strings.xml one-to-one.
+
+  app_name（桌面显示名）= "Cast In" / "Cast Out"：cast 是英文里"投屏"的通用词，
+  In/Out 表示方向且与图标箭头一致；再长就会被桌面截断成 "Cast Re..."。
+-->
 <resources>
-    <string name="app_name">UAV Host</string>
+    <string name="app_name">Cast In</string>
 
     <string name="host_title">USB Screen Mirror</string>
     <string name="host_btn_collapse">Collapse panel</string>

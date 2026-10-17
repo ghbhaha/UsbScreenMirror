@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 图标底色：白色（用户要求）。前景内容已内缩到 86%，白底上要用更深的蓝/绿保证对比度 -->
+    <color name="ic_launcher_bg">#FFFFFF</color>
+</resources>

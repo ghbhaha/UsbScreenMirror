@@ -9,10 +9,12 @@
 
   英文用户由 values-en/ 覆盖（系统按语言自动选择），两边键名必须一一对应。
 
-  产品名 app_name 不翻译。
+  app_name 是**桌面显示名**：中文用「投屏接收」/「投屏发送」，英文用 Cast In / Cast Out
+  （cast = 投屏的通用词，In/Out 表方向且与图标箭头一致）。
+  ⚠️ 名字要短：桌面格子窄，实测 6 个字符就会被截断（旧名 UAV Host 在平板上显示成 "UAV Hos…"）。
 -->
 <resources>
-    <string name="app_name">UAV Host</string>
+    <string name="app_name">投屏接收</string>
 
     <!-- 面板标题栏 -->
     <string name="host_title">USB 投屏</string>
