@@ -186,6 +186,15 @@ class HostSession(
     @Volatile
     private var rendering = true
 
+    /**
+     * 宿主是否在后台（声音暂停中，10.22）。
+     *
+     * 与 [rendering] 分开记：两者都由 Surface 生命周期驱动，但语义不同 ——
+     * `rendering=false` 是"不喂解码器"，`audioPaused=true` 是"不喂音频"。
+     * 分开的好处是万一将来只想静音不黑屏（或反之），改一处即可。
+     */
+    private val audioPaused = AtomicBoolean(false)
+
     /** 需要在（新的）Surface 上重建解码器；由消费线程执行，保证与帧处理同序。 */
     @Volatile
     private var pendingRebuild = false
@@ -278,6 +287,7 @@ class HostSession(
         lastAudioPlayedNanos = 0L
         audioStallFrames.set(0)
         avSyncDisabled = false
+        audioPaused.set(false)
 
         val conn = Connection(transport, logger, TAG, connectionListener)
         conn.registerSink(StreamId.VIDEO, videoQueue)
@@ -503,7 +513,10 @@ class HostSession(
      * 音频消费循环。
      *
      * 与视频循环的三处刻意差异：
-     *  1. **不因 Surface 消失而停** —— 音频与显示无关，切后台时声音继续（像普通播放器）；
+     *  1. **不因 Surface 消失而停会话，但会停喂帧**（10.22）—— 链路照常跑（否则手机进
+     *     空闲看门狗会释放 fd，见 [suspendRendering] 的说明），只是把声音暂停；
+     *     ⚠️ 停喂是**必须的**：`AudioPlayer.feed` 里是 `write(WRITE_BLOCKING)`，
+     *     `AudioTrack` 暂停后不再消费缓冲，继续喂会把这条线程永久阻塞。
      *  2. **不做关键帧等待** —— 音频帧没有依赖关系，随时可开始；
      *  3. **不重建解码器** —— AAC 没有"尺寸随旋转变化"的问题。
      */
@@ -520,6 +533,9 @@ class HostSession(
                 handleAudioConfig(frame)
                 continue
             }
+
+            // 后台暂停中：只消费、不喂（AudioTrack 暂停时不能写，否则线程会被钉死）
+            if (audioPaused.get()) continue
 
             // 没启用 / 还没 configure 时静默丢弃（手机端正常情况下根本不会发）
             audio?.feed(frame)
@@ -642,6 +658,7 @@ class HostSession(
             logger.i(TAG, "Surface 已销毁：已释放解码器、停止渲染（链路保持）")
         }
         decoder = null
+        suspendAudio()
     }
 
     /** Surface 回来了 → 让消费线程用缓存的 CONFIG 在新 Surface 上重建解码器。 */
@@ -654,6 +671,50 @@ class HostSession(
             if (pendingRebuild) "Surface 已恢复：准备用缓存的 CONFIG 重建解码器"
             else "Surface 已恢复（尚未收到 CONFIG，等它到达）",
         )
+        resumeAudio()
+    }
+
+    // ------------------------------------------------------------------ 音频的后台暂停（10.22）
+
+    /**
+     * 切后台 → **暂停声音**（10.22）。
+     *
+     * ## 为什么跟着 Surface 生命周期走，而不是 `onPause`
+     * `surfaceDestroyed` 是"真的没有画面可画了"这个事实的**权威信号**，而且它已经在
+     * 驱动 [rendering]；再挂一份 `onPause` 就会出现"有时暂停、有时不暂停"的双状态。
+     * 代价是**屏幕熄灭也会静音** —— 这与系统行为一致（ Music 播放器锁屏后通常也停），
+     * 且比"锁屏后手机声音继续外放"更符合预期。
+     *
+     * ⚠️ **顺序很重要**：必须**先置 [audioPaused] 再 `pause()`**。
+     *   反过来的话，音频消费线程可能正在 `write()` 的中途看到 track 变暂停，
+     *   而那一写会一直阻塞到缓冲排空 —— 而缓冲永远不会排空（已暂停，没人消费）。
+     */
+    private fun suspendAudio() {
+        if (!audioPaused.compareAndSet(false, true)) return
+        audio?.pauseForBackground()
+    }
+
+    /**
+     * 回前台 → **恢复声音**（10.22）。
+     *
+     * ⚠️ 恢复后**必须重置 A/V 学习状态**：后台那几十秒里手机一直在采集编码，
+     *   回前台后新帧的 pts 已经跳到"当前时刻"，而 [AudioPlayer] 的播放头刚重新锚定 ——
+     *   若让 [AvSyncGate] 带着旧 offset 继续判，每一帧都会被算成"偏早几十秒"而触发等待。
+     *   这里与 [AvSyncGate.reset] 的既有语义一致（播放头恢复前进时也是这么处理的）。
+     */
+    private fun resumeAudio() {
+        if (!audioPaused.compareAndSet(true, false)) return
+        val player = audio
+        if (player == null || !player.isRunning) {
+            // 没有音频可恢复（宿主关了音频，或还没 configure）：只把 A/V 状态清干净
+            avSync.reset()
+            return
+        }
+        player.resumeFromBackground()
+        avSync.reset()
+        lastAudioPlayedNanos = 0L
+        audioStallFrames.set(0)
+        avSyncDisabled = false
     }
 
     /**
@@ -952,7 +1013,7 @@ class HostSession(
             (if (negotiatedDisplayArea.isEmpty()) "" else "(显示区 $negotiatedDisplayArea)") +
             " | ${connection?.stats?.snapshot() ?: "-"} | " +
             "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | avsync=${avSync.stats()} | " +
-            "resumeTailDropped=${resumeTailDropped.get()} | " +
+            "resumeTailDropped=${resumeTailDropped.get()} | audioPaused=$audioPaused | " +
             "audioQueue=$audioQueue | ${audio?.stats() ?: "no audio"} | ${latencyLine()}"
 
     /**
@@ -1003,6 +1064,8 @@ class HostSession(
         val a = audio
         when {
             a == null -> sb.append(if (audioEnabled) "未起（等待中）" else "未启用")
+            // 后台暂停时电平是"暂停前最后一帧"的残留值，照报会让人以为还在放声
+            audioPaused.get() -> sb.append("已暂停（宿主在后台）")
             else -> sb.append(a.configuredSampleRate / 1000).append("k/").append(a.configuredChannels)
                 .append("ch · 电平 ").append(String.format(Locale.US, "%.1f", a.lastRms)).append("dBFS")
         }

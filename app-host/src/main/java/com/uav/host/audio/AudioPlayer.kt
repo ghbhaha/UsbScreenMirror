@@ -43,6 +43,13 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * ⚠️ 任何音频侧失败都只影响声音，**绝不能让视频会话跟着挂** —— 所以这里的异常
  * 一律收敛成"停用音频 + 记日志"。
+ *
+ * ## 后台暂停（10.22）
+ * 宿主切后台时 [pauseForBackground] 暂停播放、回前台时 [resumeFromBackground] 恢复。
+ * ⚠️ **暂停期间调用方必须停止喂帧**（`feed` 内部也有一道兜底）：`AudioTrack` 暂停后不再
+ * 消费缓冲，而写出是 `WRITE_BLOCKING` ⇒ 继续喂会把音频消费线程永久阻塞。
+ * ⚠️ 恢复时必须**重锚音频时钟**：后台期间手机一直在采集，回前台后帧 pts 已跳到当前时刻，
+ * 而播放头还停在暂停处，两者会错开几十秒。
  */
 class AudioPlayer(
     private val logger: Logger = AndroidLogger,
@@ -59,6 +66,10 @@ class AudioPlayer(
 
     @Volatile
     private var started = false
+
+    /** 宿主切后台导致的暂停（10.22）；与"没在跑/出错"是两回事，所以单独记。 */
+    @Volatile
+    private var paused = false
 
     @Volatile
     var isRunning: Boolean = false
@@ -192,6 +203,10 @@ class AudioPlayer(
 
     /** 喂一帧 AAC（在音频消费线程调用；内部会阻塞以维持实时节拍）。 */
     fun feed(frame: Frame) {
+        // ⚠️ 兜底：后台暂停期间**绝不能喂**。`AudioTrack` 暂停后不再消费缓冲，
+        //   而下面是 `write(WRITE_BLOCKING)` —— 缓冲写满会把这线程永久钉死。
+        //   调用方（HostSession.audioLoop）本来就该拦，这里再挡一层，防止将来漏改。
+        if (paused) return
         val c = codec ?: return
         val t = track ?: return
 
@@ -254,6 +269,11 @@ class AudioPlayer(
                             if (n > 0) {
                                 pcmBytesWritten.addAndGet(n.toLong())
                                 framesDecoded.incrementAndGet()
+                            } else if (paused) {
+                                // ★ 暂停瞬间撞上正在进行的 write：会返回 0/负数，这是**预期**的。
+                                //   `pauseForBackground` 已经先置 `audioPaused` 再 `pause()`，
+                                //   所以这里绝不能阻塞重试（缓冲永远排不空），直接放掉即可。
+                                //   不记日志 —— 每次切后台都会命中一条 warn，纯噪音。
                             } else {
                                 logger.w(TAG, "AudioTrack.write 返回 $n")
                             }
@@ -302,9 +322,80 @@ class AudioPlayer(
         }
     }
 
+    /**
+     * 宿主切到后台：**暂停播放**（10.22），但**不释放**解码器与 `AudioTrack`。
+     *
+     * ## 为什么是 pause 而不是 release
+     * - `release` 掉 `AudioTrack` 再重建要走一遍 `AudioTrack.Builder`，回到前台会有一小段
+     *   空档，而且重建失败的风险比 `pause()` 高得多；
+     * - `MediaCodec`（AAC）本来就没有"输出 surface 不能改绑"那类问题，配置还在就能继续解。
+     *
+     * ⚠️ **调用方必须同时停止喂帧**（见 `HostSession.audioLoop`）：`AudioTrack` 暂停后
+     *   就不再消费缓冲，而 `feed()` 里是 `write(..., WRITE_BLOCKING)` ——
+     *   一旦继续喂，缓冲写满后**这条线程会永久阻塞**，把音频消费线程钉死。
+     *   （这正是"置 null 不等于关闭"之外的另一类坑：暂停了却不管上游。）
+     */
+    fun pauseForBackground() {
+        val t = track ?: return
+        if (!isRunning) return
+        // ⚠️ **必须先置 `paused` 再 `pause()`**：反过来的话，音频消费线程可能正好在
+        //   `write()` 的中途撞上 track 变暂停 → 返回 0 → 走进 warn 分支刷一条无意义的日志，
+        //   而这在每次切后台时都必现。
+        paused = true
+        runCatching {
+            if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.pause()
+        }.onFailure { logger.w(TAG, "AudioTrack.pause 失败: ${it.message}") }
+        logger.i(TAG, "宿主切后台：音频已暂停（解码器与 AudioTrack 保留）")
+    }
+
+    /**
+     * 回前台：**丢掉暂停期间积压的缓冲，从"现在"重新起播**（10.22）。
+     *
+     * ## 为什么必须 flush
+     * 暂停期间上游已经在继续解码/送数据，`AudioTrack` 里可能压着几十毫秒的**旧** PCM；
+     * 直接 `play()` 会先把这批过期声音播出去（能听出来是一小段"回声/延迟"）。
+     * `flush()` 把缓冲丢掉、`playbackHeadPosition` 归零，正好和下面重设时钟起点配套。
+     *
+     * ## 为什么必须重设 [playbackStartedAtNanos]
+     * A/V 同步把"音频已播到哪一刻"算成 `playbackStartedAtNanos + 播放头帧数/采样率`。
+     * 后台这几十秒里手机**一直在采集编码**，回前台后新帧的 pts 已经跳到当前时刻，
+     * 而音频播放头还停在暂停处 ⇒ 两者错开几十秒，门控会把每一帧都判成"早几十秒"。
+     * 所以恢复时必须**重新锚定**音频时钟，并让调用方重置 A/V 学习状态。
+     */
+    fun resumeFromBackground() {
+        val t = track ?: return
+        if (!paused) return
+        runCatching {
+            if (t.playState == AudioTrack.PLAYSTATE_PAUSED) {
+                t.flush()
+                t.play()
+            } else if (t.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                // 少见：暂停期间被别处恢复了，flush 仍要执行以清掉积压
+                t.flush()
+            } else {
+                // STOPPED：flush 之后无法直接 play，退回重建整条输出
+                logger.w(TAG, "AudioTrack 处于 STOPPED，无法原地恢复")
+                return
+            }
+        }.onFailure {
+            logger.w(TAG, "AudioTrack 恢复失败: ${it.message}")
+            return
+        }
+        // 时钟重新锚定：播放头已归零，起点取"此刻"
+        playbackStartedAtNanos = System.nanoTime()
+        // A/V 粗补偿要重新生效（否则恢复后视频会领先音频一个固定量）
+        delayApplied = false
+        paused = false
+        logger.i(TAG, "宿主回前台：音频已恢复（丢弃暂停期间积压的缓冲，时钟重新锚定）")
+    }
+
+    /** 是否处于"后台暂停"状态。 */
+    val isPaused: Boolean get() = paused
+
     fun release() {
         isRunning = false
         started = false
+        paused = false
         codec?.let { c ->
             runCatching { c.stop() }.onFailure { logger.w(TAG, "audio codec.stop 失败: ${it.message}") }
             runCatching { c.release() }.onFailure { logger.w(TAG, "audio codec.release 失败: ${it.message}") }
