@@ -227,6 +227,15 @@ class HostSession(
     var negotiatedDisplayArea: String = ""
         private set
 
+    /**
+     * 本次协商实际下发的**视频码率**（bps，10.20 起按编码面积缩放）。
+     *
+     * 只用于日志/统计显示 —— 真实码率要看 `connection.stats` 的字节计数。
+     */
+    @Volatile
+    var negotiatedBitRate: Int = 0
+        private set
+
     val isReplay: Boolean get() = replay
 
     fun start() {
@@ -322,7 +331,25 @@ class HostSession(
         }
         negotiatedMaxSize = maxSize
         negotiatedDisplayArea = if (availW > 0 && availH > 0) "${availW}x$availH" else ""
-        val options = Options.defaultOptions(maxSize, availW, availH).apply { audio = audioEnabled }
+
+        // ★ 码率按**编码面积**缩放（10.20）：1:1 把面积降到旧口径的 ~27%，却仍按 8 Mbps 发
+        //   ⇒ 每秒字节数一点没降，只是把同样码率摊到更少像素上。要真省流就得按面积缩。
+        //   参考面积 = 旧口径（面板长边）下的面积，所以高清模式**保持 8 Mbps 不变**，
+        //   且与手机当前方向无关（旋转不会让码率跳变）。
+        val referenceMaxSize = Scale.computeMaxSize(phoneWidth, phoneHeight, localWidth, localHeight)
+        val bitrate = Scale.videoBitRate(
+            baseBitRate = Options.DEFAULT_VIDEO_BIT_RATE,
+            maxSize = maxSize,
+            srcW = phoneWidth,
+            srcH = phoneHeight,
+            referenceMaxSize = referenceMaxSize,
+        )
+        negotiatedBitRate = bitrate
+
+        val options = Options.defaultOptions(maxSize, availW, availH).apply {
+            audio = audioEnabled
+            videoBitRate = bitrate
+        }
 
         // ★ 换一只新闩再发：重协商时上一只可能已经被用掉/等待中
         val latch = CountDownLatch(1)
@@ -342,7 +369,8 @@ class HostSession(
         logger.i(
             TAG,
             "OPEN options: max_size=$maxSize display_area=${if (availW > 0) "${availW}x$availH" else "-"} " +
-                "phone=${phoneWidth}x$phoneHeight panel=${localWidth}x$localHeight"
+                "phone=${phoneWidth}x$phoneHeight panel=${localWidth}x$localHeight " +
+                "bitrate=$bitrate(${bitrate / 1000}kbps, 基准 ${Options.DEFAULT_VIDEO_BIT_RATE / 1000}kbps 按面积缩)"
         )
 
         if (!latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) return false
@@ -800,7 +828,7 @@ class HostSession(
 
     fun stats(): String =
         "phone=${if (phoneWidth > 0) "${phoneWidth}x$phoneHeight" else "-"} " +
-            "maxSize=$negotiatedMaxSize" +
+            "maxSize=$negotiatedMaxSize bitrate=${negotiatedBitRate / 1000}k" +
             (if (negotiatedDisplayArea.isEmpty()) "" else "(显示区 $negotiatedDisplayArea)") +
             " | ${connection?.stats?.snapshot() ?: "-"} | " +
             "queue=$videoQueue | ${decoder?.stats() ?: "no decoder"} | " +
@@ -828,6 +856,7 @@ class HostSession(
         sb.append("编码 ").append(decoder?.size?.let { "${it.first}x${it.second}" } ?: "-")
             .append(" · ")
             .append(if (negotiatedDisplayArea.isEmpty()) "高清(面板长边)" else "1:1 @$negotiatedDisplayArea")
+            .append(" · ").append(negotiatedBitRate / 1000).append("kbps")
 
         // 2) 帧 / 丢帧 / 队列
         sb.append('\n').append("帧 ").append(decoder?.framesDecoded?.get() ?: 0L)

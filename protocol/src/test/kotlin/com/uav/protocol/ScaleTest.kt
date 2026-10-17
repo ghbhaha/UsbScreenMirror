@@ -219,4 +219,57 @@ class ScaleTest {
             }
         }
     }
+
+    // ---------------------------------------------------------------- 码率按面积缩放（10.20）
+
+    @Test
+    fun `码率：1比1 实测 992 应降到约 2点1 Mbps`() {
+        // 真机参数：手机 1224x2700、宿主面板 1920x1080
+        val base = Options.DEFAULT_VIDEO_BIT_RATE
+        val ref = Scale.computeMaxSize(1224, 2700, 1920, 1080)   // = 1920（高清口径）
+        assertEquals(1920, ref)
+
+        val hd = Scale.videoBitRate(base, 1920, 1224, 2700, ref)
+        assertEquals("高清口径面积 = 参考面积，应保持基准码率", base, hd)
+
+        val oneToOne = Scale.videoBitRate(base, 992, 1224, 2700, ref)
+        // 实测 456x992 = 0.452 Mpx vs 872x1920 = 1.674 Mpx → 27.0%
+        assertTrue("1:1 码率应明显低于基准，实际=$oneToOne", oneToOne < base / 3)
+        assertTrue("1:1 码率应在 2.0~2.3 Mbps，实际=$oneToOne", oneToOne in 2_000_000..2_300_000)
+    }
+
+    @Test
+    fun `码率：与方向无关（横竖屏同参数同结果）`() {
+        val base = Options.DEFAULT_VIDEO_BIT_RATE
+        val a = Scale.videoBitRate(base, 992, 1224, 2700, 1920)   // 竖屏
+        val b = Scale.videoBitRate(base, 992, 2700, 1224, 1920)   // 横屏（同一台机器转过来）
+        assertEquals("旋转手机不应让码率跳变", a, b)
+    }
+
+    @Test
+    fun `码率：面积不小于参考时回到基准（永不超发）`() {
+        val base = Options.DEFAULT_VIDEO_BIT_RATE
+        assertEquals(base, Scale.videoBitRate(base, 2160, 1224, 2700, 1920))
+        assertEquals(base, Scale.videoBitRate(base, 1920, 1224, 2700, 1920))
+        // 参考比协商值还小（极端宿主面板）→ 也按基准
+        assertEquals(base, Scale.videoBitRate(base, 992, 1224, 2700, 992))
+    }
+
+    @Test
+    fun `码率：下限保护（极小显示区不会低到编不动）`() {
+        val base = Options.DEFAULT_VIDEO_BIT_RATE
+        val tiny = Scale.videoBitRate(base, Scale.MIN_ONE_TO_ONE_LONG_SIDE, 1224, 2700, 1920)
+        assertEquals(Scale.MIN_VIDEO_BIT_RATE, tiny)
+    }
+
+    @Test
+    fun `码率：对 maxSize 单调不减`() {
+        val base = Options.DEFAULT_VIDEO_BIT_RATE
+        var last = 0
+        for (m in listOf(240, 480, 720, 992, 1280, 1600, 1920)) {
+            val v = Scale.videoBitRate(base, m, 1224, 2700, 1920)
+            assertTrue("maxSize=$m 时码率不该回退：$last -> $v", v >= last)
+            last = v
+        }
+    }
 }

@@ -155,4 +155,56 @@ object Scale {
     /** 缩放是否实际发生了变化（用于日志：`virtualDisplay 1080x2400 -> scaled 1080x2400`）。 */
     fun isIdentity(srcW: Int, srcH: Int, outW: Int, outH: Int): Boolean =
         srcW == outW && srcH == outH
+
+    // ---------------------------------------------------------------- 码率按面积缩放（10.20）
+
+    /** 码率下限（bps）。面积再小也不能低于它 —— 太低时 MediaCodec 连静态画面都编不动。 */
+    const val MIN_VIDEO_BIT_RATE = 1_000_000
+
+    /**
+     * 按**编码面积**缩放码率（计划 10.20）。
+     *
+     * ## 为什么不能固定 8 Mbps
+     * 1:1 像素映射把编码面积从 1.67 Mpx 降到 0.45 Mpx（27%），但码率仍是 8 Mbps
+     * ⇒ **每秒字节数一点没降**，只是把同样的码率摊到更少像素上。
+     * 想要"1:1 真的省流"，码率必须跟着面积一起降。
+     *
+     * ## 面积怎么算（关键是"与方向无关"）
+     * 参考面积不取"当前方向的编码面积"，而取**长边 = [referenceMaxSize]** 时的面积
+     * （也就是旧口径 / 面板长边那个上限）。这样做有两个好处：
+     * - **旋转手机不会让码率跳变** —— 两个方向的面积上限相同；
+     * - 不会因为某一方向恰好更扁而"省"过头。
+     *
+     * @param baseBitRate      基准码率（通常是 [Options.DEFAULT_VIDEO_BIT_RATE]）
+     * @param maxSize          本次协商出来的编码**长边**上限
+     * @param srcW/srcH        手机屏幕尺寸（决定宽高比）
+     * @param referenceMaxSize 旧口径长边上限（[computeMaxSize]）
+     * @return 缩放后的码率，落在 `[MIN_VIDEO_BIT_RATE, baseBitRate]`
+     */
+    fun videoBitRate(
+        baseBitRate: Int,
+        maxSize: Int,
+        srcW: Int,
+        srcH: Int,
+        referenceMaxSize: Int,
+    ): Int {
+        require(srcW > 0 && srcH > 0) { "bad source size ${srcW}x$srcH" }
+        require(maxSize > 0 && referenceMaxSize > 0) { "bad maxSize $maxSize/$referenceMaxSize" }
+        require(baseBitRate > 0) { "bad baseBitRate $baseBitRate" }
+
+        // 宽高比取短边/长边（与方向无关），面积 = 长边 × 长边×ratio
+        val long = longSide(srcW, srcH).toLong()
+        val ratio = minOf(srcW, srcH).toDouble() / long.toDouble()
+
+        // "长边正好等于 m" 时的编码面积（两轴都按 m×ratio 推），即该口径下的**最大**面积
+        fun areaAt(m: Int): Long = m.toLong() * Math.round(m * ratio).toLong()
+
+        val refArea = areaAt(referenceMaxSize)
+        val area = areaAt(maxSize)
+        // 参考面积算不出来、或当前面积已经 ≥ 参考（也就是"不比旧口径小"）→ 不加码也不减码
+        if (refArea <= 0L || area >= refArea) return baseBitRate
+
+        val scaled = baseBitRate.toLong() * area / refArea
+        return scaled.coerceIn(MIN_VIDEO_BIT_RATE.toLong(), baseBitRate.toLong()).toInt()
+    }
 }
