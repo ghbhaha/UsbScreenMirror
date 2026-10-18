@@ -25,3 +25,4 @@ rootProject.name = "usbscreen"
 include(":protocol")
 include(":app-host")
 include(":app-accessory")
+include(":app-ios-qt")
