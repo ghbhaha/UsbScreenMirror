@@ -156,16 +156,7 @@ class IosActivity : Activity() {
         // ★ 必须在 setContentView 之后构造：IosPanel 在构造期就 findViewById
         panel = IosPanel(this)
         panel.bind(
-            onSurface = { ready ->
-                if (ready) {
-                    log("预览 Surface 就绪")
-                    ensureDecoder()
-                } else {
-                    decoder?.stop()
-                    decoder = null
-                    pendingCsd = null
-                }
-            },
+            onSurface = { ready -> if (ready) resumeRendering() else suspendRendering() },
             onRearm = { if (!running.get()) rearm() }
         )
         // 投屏期间别让屏幕自己熄掉（熄屏会连带把 Surface 收走）
@@ -393,6 +384,38 @@ class IosActivity : Activity() {
         if (decoder != null) return
         decoder = H264Decoder(sf, ::log) { w, h -> panel.setVideoSize(w, h) }
             .also { it.start(csd) }
+    }
+
+    /**
+     * Surface 消失（切后台 / 熄屏 / Activity 销毁中）→ **停渲染 + 静音，但保持链路**。
+     *
+     * 完全照 `aoa/session/HostSession.suspendRendering()` 的做法：
+     *  - 解码器绑定的是 `configure` 那一刻的 Surface，失效后既不能继续渲染也不能改绑，
+     *    所以直接放掉；
+     *  - **`pendingCsd` 必须留着** —— 它是重建解码器的唯一依据。
+     *
+     * ★★ 这里曾经多写了一行 `pendingCsd = null`，那就是「切后台再回来视频黑屏」的根因：
+     *   新的 CSD 只在**内容变化**时才回调（`deliverCsd` 去重），所以清掉之后
+     *   `ensureDecoder()` 会永远 `return`，画面再也不会出现。音频却是独立通道，
+     *   于是表现为"只有声音没有画面"。
+     *
+     * 为什么挂在 Surface 生命周期上而不是 `onPause`：`surfaceDestroyed` 才是
+     * "真的没有画面可画了"的权威信号，而且它已经在驱动渲染开关；
+     * 再挂一份 `onPause` 会出现"有时暂停、有时不暂停"的双状态（这条同样来自 AOA 10.22）。
+     */
+    private fun suspendRendering() {
+        if (decoder == null && audio?.isPaused == true) return
+        runCatching { decoder?.stop() }
+        decoder = null
+        audio?.pauseForBackground()
+        if (running.get()) log("画面不可见 ⇒ 已停渲染与音频（USB 链路保持）")
+    }
+
+    /** Surface 回来了 → 用缓存的 CSD 立刻重建解码器，并恢复音频。 */
+    private fun resumeRendering() {
+        log("预览 Surface 就绪")
+        audio?.resumeFromBackground()
+        ensureDecoder()
     }
 
     private fun log(msg: String) {

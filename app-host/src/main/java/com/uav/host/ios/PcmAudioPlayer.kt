@@ -43,6 +43,10 @@ internal class PcmAudioPlayer(private val log: (String) -> Unit) {
     private var bytesDropped = 0L
     private var firstPacket = true
 
+    /** 切后台期间暂停：`feed()` 直接丢弃，别把缓冲塞满。跨线程读写，必须 volatile。 */
+    @Volatile
+    private var paused = false
+
     /**
      * 建（或按新格式重建）轨道。
      *
@@ -116,6 +120,9 @@ internal class PcmAudioPlayer(private val log: (String) -> Unit) {
     /** 喂一包 PCM（调用方是收流的 worker 线程，本方法**不阻塞**）。 */
     fun feed(pcm: ByteArray, fmt: AudioParser.Format = DEFAULT_FORMAT) {
         if (pcm.isEmpty()) return
+        // 后台不喂：暂停的 AudioTrack 没人消费，继续写只会把缓冲填满、
+        // 让 `bytesDropped` 一路虚高（日志里看着像"丢了大量音频"）。
+        if (paused) return
         val t = ensure(fmt) ?: return
         val n = runCatching {
             t.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
@@ -143,7 +150,66 @@ internal class PcmAudioPlayer(private val log: (String) -> Unit) {
         bytesWritten = 0
         bytesDropped = 0
         firstPacket = true
+        paused = false
     }
+
+    // ---------------------------------------------------------------- 前后台（照 AOA 10.22）
+
+    /**
+     * 切后台 → **静音，但保留 AudioTrack 与解码沉淀**（参照 `aoa/audio/AudioPlayer.pauseForBackground`）。
+     *
+     * 为什么是 `pause()` 而不是 `release()`：回前台重建轨道要再走一遍 `AudioTrack.Builder`，
+     * 既有一段空档又多了失败可能；配置还在就没必要动它。
+     *
+     * ⚠️ **必须先置 [paused] 再 `pause()`**：反过来的话收流线程可能正卡在 `write()` 中间
+     *   撞上暂停状态，白记一次丢包。顺序反了在每次切后台时都必现。
+     */
+    fun pauseForBackground() {
+        val t = track ?: return
+        if (paused) return
+        paused = true
+        runCatching {
+            if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.pause()
+        }.onFailure { log("✗ 音频暂停失败：${it.message}") }
+        log("切到后台：音频已暂停（AudioTrack 保留）")
+    }
+
+    /**
+     * 回前台 → **丢掉暂停期间的积压，从"现在"重新起播**（参照 `resumeFromBackground`）。
+     *
+     * `flush()` 是必须的：后台这几十秒里设备一直在推 PCM，缓冲里可能压着一段**过期**音频，
+     * 直接 `play()` 会先把它放出来（能听出一段"回声"）。
+     *
+     * ⚠️ iOS 这条路**没有 A/V 同步**，所以不需要 AOA 那套重锚时钟 / `AvSyncGate.reset`；
+     *   恢复后从当前收到的包继续写即可。
+     */
+    fun resumeFromBackground() {
+        val t = track ?: return
+        if (!paused) return
+        runCatching {
+            when (t.playState) {
+                AudioTrack.PLAYSTATE_PAUSED -> {
+                    t.flush()
+                    t.play()
+                }
+                AudioTrack.PLAYSTATE_PLAYING -> t.flush()   // 少见：别处已恢复，仍要清积压
+                else -> {
+                    // STOPPED 下不能原地恢复；放掉让下一包重建（有 ensure 兜底）
+                    log("音频轨道处于 STOPPED，回前台后重建")
+                    releaseTrack()
+                    paused = false
+                    return
+                }
+            }
+        }.onFailure {
+            log("✗ 音频恢复失败：${it.message}")
+            return
+        }
+        paused = false
+        log("回到前台：音频已恢复（丢弃后台积压的缓冲）")
+    }
+
+    val isPaused: Boolean get() = paused
 
     private fun releaseTrack() {
         val t = track ?: return
