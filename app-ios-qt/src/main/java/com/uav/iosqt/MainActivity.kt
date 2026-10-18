@@ -39,6 +39,14 @@ class MainActivity : Activity() {
     /** 首帧只处理一次：到首帧就把面板收起来，把画面让出来 */
     private val firstFrameDone = AtomicBoolean(false)
 
+    /**
+     * 是否向设备声明音频接收能力（`ASYN/HPA1`）。
+     *
+     * ⚠️ 打开会让 iPad 把音频路由到 USB；**若本端收不到 EAT 帧，iPad 上点播放会立刻暂停**。
+     * 所以只在排查音频时临时置 true，验证完必须改回 false。
+     */
+    private val requestAudio = true
+
     /** 用户点了「停止投屏」 */
     @Volatile
     private var stopRequested = false
@@ -571,7 +579,8 @@ class MainActivity : Activity() {
                             panel.setMenuVisible(false)
                         }
                     },
-                    onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) }
+                    onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) },
+                    requestAudio = requestAudio
                 )
 
                 activeSession = session
@@ -607,7 +616,8 @@ class MainActivity : Activity() {
                             panel.setMenuVisible(false)
                         }
                     },
-                    onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) }
+                    onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) },
+                    requestAudio = requestAudio
                 )
                 activeSession = session
                 st = session.run(maxSeconds = 0, idleAbortSeconds = 12)

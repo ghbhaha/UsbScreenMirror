@@ -212,12 +212,13 @@ internal class QtSession(
                         log("AFMT → reply（设备要求 $want）")
                     }
 
-                    // ★ 设备问「当前音频时钟偏差多少」。**不回它就不推音频**。
-                    //   我们没做可靠的时钟标定，回 0 即可（quicktime_video_hack 也是这么起步的）。
+                    // ★ 设备问「当前音频时钟偏差多少」。
+                    //   参考实现（iPhoneMirror 的 QuickTimeSession.cpp）回的是 **48000.0**
+                    //   （= 采样率），而不是 0 —— 已按它对齐。
                     QtPacket.matches(p, 12, "skew") -> {
                         st.skew++
-                        write(QtPacket.skewReply(corr, 0.0))
-                        log("SKEW → reply(0.0)")
+                        write(QtPacket.skewReply(corr, 48_000.0))
+                        log("SKEW → reply(48000.0)")
                     }
 
                     // ★ 线上 fourcc 是 20 21 6F 67，读出来像 "go! "；含义未知，
@@ -304,6 +305,11 @@ internal class QtSession(
     private fun write(data: ByteArray) {
         val ep = epOut ?: return
         val w = conn.bulkTransfer(ep, data, data.size, 1000)
-        if (w < 0) log("写失败（$w），端点可能已 STALL")
+        // 写不出去必须报出来：视频的 NEED 每帧都写，一旦 OUT 拥塞，
+        // 排在后面的 HPA1/clock_reply 会静默丢掉 —— 表现就是"设备收不到我们的音频应答"。
+        if (w != data.size) {
+            log("✗ 写失败 ${QtPacket.fccString(data, 4)} 期望 ${data.size}B 实际 $w" +
+                if (w < 0) "（端点可能已 STALL）" else "")
+        }
     }
 }
