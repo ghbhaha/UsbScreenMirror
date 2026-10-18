@@ -208,7 +208,10 @@ internal class QtSession(
                             LinkLossGate.Cause.DEVICE_GONE ->
                                 "iPad 已从 USB 设备表消失（线被拔掉 / 设备断电）"
                             LinkLossGate.Cause.ENDPOINT_DEAD ->
-                                "USB 端点连续 ${lossGate.consecutiveErrors} 次读失败（端点已失效）"
+                                // 拔线也常落到这一支：USB 子系统清理设备表比端点失效慢几十毫秒，
+                                // 8 次失败（约 20ms）内 `findAppleDevice()` 往往还看得到它。
+                                // 所以别写死"端点失效"，否则日志会把人往错方向带。
+                                "USB 端点连续 ${lossGate.consecutiveErrors} 次读失败（设备无响应 / 可能已被拔掉）"
                         }
                         log("✗ 链路中断：$abortReason")
                         return st
