@@ -127,9 +127,52 @@ iPad 连这个热点 —— 不依赖家里路由器，延迟和稳定性都可�
 
 ---
 
+---
+
 ## 六、待确认
 
 1. 第 1 步的 APK 验证结果（决定这条路成不成立）；
 2. 若集成，许可证怎么处理（GPL-3.0 传染性）；
 3. 是否需要"点对点热点"（影响是否要申请 `NEARBY_WIFI_DEVICES` / `CHANGE_WIFI_STATE` 等权限）；
 4. 延迟目标：无线 AirPlay 在同热点下大概 40–80ms，若要求 <30ms 则这条路不满足。
+
+## 七、可参考的项目
+
+> 许可证一列：标 ✅ 的是我在仓库页面/README 上直接看到并确认过的；标「待核实」的不要直接当结论用。
+
+### 7.1 AirPlay 接收端（这条产品线的主参考）
+
+| # | 项目 | 语言 / 平台 | 许可 | 值得看什么 |
+|---|---|---|---|---|
+| 1 | **`jqssun/android-airplay-server`** | Kotlin + C(JNI) / Android | GPL-3.0 ✅ | **最直接的参考**。把 UxPlay 的 C 库用 JNI 桥到 Android：视频 `MediaCodec` + `SurfaceView`、音频 `MediaCodec`/软解 ALAC、自带 mDNS（`NsdServiceManager`）、PIN 认证、PiP、调试浮层（FPS/码率/丢帧）。**要移植就照它的分层抄** |
+| 2 | **`FDH2/UxPlay`** | C++ / Linux·macOS·BSD | GPL-3.0 ✅ | 协议逻辑的权威实现：RTSP/RAOP、FairPlay、HLS、mirror 与 audio 双模式。依赖链很清楚：`GStreamer + OpenSSL + libplist + dns_sd + playfair`。血统：RPiPlay → AirplayServer → shairplay + playfair |
+| 3 | `Guo-astro/android-airplay-server` | 同上（fork） | GPL-3.0 ✅ | 2026-10 起加 USB 支持，新增 **`UsbMdnsAdvertiser.kt`（415 行）**——在 USB tethering 网卡上做 mDNS。**蜂窝版设备**要"真有线"时可参考，对本机（WiFi 版）无用 |
+| 4 | `FDH2/RPiPlay` | C++ / 树莓派 | 待核实 | UxPlay 的前身。硬件解码路径与低延迟渲染的取舍，值得对照 |
+| 5 | `playfair` | C | 待核实 | FairPlay 握手 + AES 密钥解密。**镜像想解密就必须过这一关**，UxPlay 是 bundled 进来的 |
+| 6 | `shairport-sync` / `shairplay` | C | 待核实 | 纯音频 RAOP。RTSP 报文构造、ALAC 解码、时钟同步可参考（不含视频；`shairport-sync` 只做音频） |
+
+### 7.2 协议资料
+
+- **UxPlay README 里指向的两份公开 AirPlay2 协议整理**（原文措辞是 "details of what is publically known
+  about Apple's AirPlay2 protocol can be found here and here"）——顺着 README 里的链接点进去即可，
+  比二手博客准。
+- `android-airplay-server` 的 `app/src/main/cpp` 就是 UxPlay 源码 + 少量 JNI 胶水，
+  **读这一处等于同时读了协议实现和 Android 接线方式**。
+
+### 7.3 QuickTime USB 路线（这条已卡住，留作存档）
+
+| 项目 | 语言 | 用途 |
+|---|---|---|
+| `danielpaulus/quicktime_video_hack` | Go | QT USB 协议的事实标准；`make_ping()` / 状态机的出处 |
+| `RayrenSX/iPhoneMirror` | C++ / Windows | 实测能出画面的完整客户端（本项目 §0.24 的对照基准） |
+| `furruka/iPhoneMirror` | C++ / Linux | 同上 Linux 分支，`docs/LINUX_PORT.md` 里"采集配置摘不掉"那段是排查关键 |
+| `libimobiledevice` / `pymobiledevice3` | C / Python | 配对、lockdown、TLS 升级；本项目靠它们在 PC 上抓到了 ground truth |
+
+### 7.4 选型建议（如果真要自己实现）
+
+| 决策 | 建议 |
+|---|---|
+| 直接 fork 现成 APK 改 | 最快，但 **GPL-3.0 会把整个 APK 变成 GPL** |
+| 只借协议层（UxPlay 的 C 源码），渲染自己写 | 工作量可控；协议层没有替代品，绕不过 GPL |
+| 从零实现 RTSP + FairPlay | 不建议——FairPlay 那一段没有公开规范，只能照 `playfair` 逆推 |
+| 解码 | 一律用 `MediaCodec`（H.264/HEVC），不要走软解；软解只作兜底 |
