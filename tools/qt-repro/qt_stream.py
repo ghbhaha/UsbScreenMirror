@@ -13,6 +13,7 @@
         CLOK  → clock_reply
         TIME  → time_reply
         FEED  → ★ 视频样本，落盘
+        EAT!  → ★ 音频样本：抽出 sdat 段里的裸 PCM 落盘（用于对照安卓端拿不到音频的问题）
 
 注意：只在「配置 5 确实存在」时才 set_configuration(5)。切到不存在的配置会让驱动栈崩溃
 （本机曾因此蓝屏）。
@@ -116,6 +117,22 @@ def clock_reply(corr, clock):
     return u32(28) + fcc('rply') + u64(corr) + u32(0) + u64(clock)
 
 
+def extract_pcm(payload: bytes):
+    """从 EAT! 帧里抽出 sdat 段（裸 PCM）。
+
+    线上 fourcc 是反转的，所以源码里写的是 'tads'（'sdat' 的线上形式）。
+    段布局：[u32 长度（含 8B 头）]['tads'][PCM…]
+    """
+    at = payload.find(b'tads', 16)
+    if at < 4:
+        return None
+    ln = int.from_bytes(payload[at - 4:at], 'little')
+    if ln < 8:
+        return None
+    data = payload[at + 4: at - 4 + ln]
+    return data if data else None
+
+
 def afmt_reply(corr):
     d = dictionary([('Error', num_u32(0))])
     return u32(20 + len(d)) + fcc('rply') + u64(corr) + u32(0) + d
@@ -167,7 +184,8 @@ def main():
         n = U.lib.usb_control_msg(h, 0x40, 0x52, 0, 2, None, 0, 3000)
         print(f'activate => {n}')
         U.lib.usb_close(h)
-        for i in range(20):
+        # 实测重枚举可能延迟数分钟（本仓库真机记录过 200s+），窗口给足
+        for i in range(200):
             time.sleep(1)
             _, d2 = find()
             if d2 is None:
@@ -201,10 +219,12 @@ def main():
     # 5) 握手 + 收流
     t0 = time.time()
     buf_tail = b''
-    stats = dict(ping=0, cwpa=0, cvrp=0, afmt=0, clok=0, time=0, feed=0, other=0, bytes=0)
+    stats = dict(ping=0, cwpa=0, cvrp=0, afmt=0, clok=0, time=0, feed=0, eat=0, other=0, bytes=0)
     audio_clock = 0
     video_clock = 0
     feed_file = open(os.path.join(OUT_DIR, 'feed.bin'), 'wb')
+    eat_file = open(os.path.join(OUT_DIR, 'audio.pcm'), 'wb')
+    eat_bytes = [0]
     try:
         while time.time() - t0 < 25:
             n, data = U.bulk_read(h, EP_IN, 1 << 20, 500)
@@ -270,7 +290,16 @@ def main():
                         if video_clock:
                             U.bulk_write(h, EP_OUT, make_need(video_clock), 1000)
                     elif sub == fcc('eat!'):
-                        stats['other'] += 1
+                        stats['eat'] += 1
+                        pcm = extract_pcm(payload)
+                        if pcm:
+                            eat_file.write(pcm)
+                            eat_bytes[0] += len(pcm)
+                            if stats['eat'] <= 3 or stats['eat'] % 200 == 0:
+                                print(f'  ♪ EAT #{stats["eat"]} {len(payload)}B → PCM {len(pcm)}B'
+                                      f'（累计 {eat_bytes[0]}B）')
+                        else:
+                            print(f'  ♪ EAT #{stats["eat"]} 结构未识别（{len(payload)}B）')
                     else:
                         stats['other'] += 1
                         print(f'  · ASYN {sub!r} {len(payload)}B')
@@ -282,6 +311,7 @@ def main():
             buf_tail = buf
     finally:
         feed_file.close()
+        eat_file.close()
         try:
             U.lib.usb_release_interface(h, 2)
         except Exception:
@@ -291,6 +321,10 @@ def main():
     dt = time.time() - t0
     print(f'\n=== 结果（{dt:.1f}s）===')
     print(f'  字节 {stats["bytes"]}  包统计 { {k: v for k, v in stats.items() if k != "bytes"} }')
+    if stats['eat']:
+        print(f'  ♪♪ 收到音频：{stats["eat"]} 个 EAT 包 / {eat_bytes[0]} 字节 PCM → {OUT_DIR}/audio.pcm')
+    else:
+        print('  ✗ 一个 EAT 帧都没有（PC 侧也拿不到音频）')
     if stats['feed']:
         size = os.path.getsize(os.path.join(OUT_DIR, 'feed.bin'))
         print(f'  ★★★ 收到视频流：{stats["feed"]} 个 FEED 包，落盘 {size} 字节 → {OUT_DIR}/feed.bin')
