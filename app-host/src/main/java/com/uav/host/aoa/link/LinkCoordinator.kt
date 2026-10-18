@@ -158,6 +158,19 @@ class LinkCoordinator(
     private val consecutiveFailures = java.util.concurrent.atomic.AtomicInteger()
 
     /**
+     * 是否停在"对端没人应答（多半没装配套 App）"上。
+     *
+     * ★ 置位期间**停止自动重试**。这是必须的：缺 App 是个**不会自己变好**的状态，
+     *   自动重试只会以 5s 一轮无限空转 —— 每轮都要走一次 AOA 交互、打一条错误日志，
+     *   而用户看到的还是同一句话。退避在这里也救不了：链路层（`onReady`）每轮都成功，
+     *   计数会被清零（实测就是恒定 5.09s 一轮）。
+     *
+     * 解除条件只有三个，全是**外部的新情况**：用户点扫描/强制重握手、拔插、或会话真的跑通。
+     */
+    @Volatile
+    private var waitingForPeerApp = false
+
+    /**
      * 前台轮询兜底：实测宿主设备（BOE P40UCH）在手机重枚举后**只发 DETACHED、不发 ATTACHED**，
      * 只靠 `USB_DEVICE_ATTACHED` 广播会让"插线即投"彻底失效。
      *
@@ -167,7 +180,7 @@ class LinkCoordinator(
      */
     private val usbPoller = object : Runnable {
         override fun run() {
-            if (session == null && isSurfaceReady()) {
+            if (session == null && !waitingForPeerApp && isSurfaceReady()) {
                 runCatching { router?.pollOnce() }
                     .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
             }
@@ -209,6 +222,8 @@ class LinkCoordinator(
 
     /** Scan / Retry 按钮：普通扫描（已是配件则复用直连）。 */
     fun scan(forceHandshake: Boolean = false) {
+        // 用户主动点扫描/强制重握手 = 他大概刚把 App 装上，解除"等 App"状态重试
+        waitingForPeerApp = false
         if (forceHandshake) forceRetried = true
         else forceRetried = false
         if (forceHandshake) fastPathUnverified = false
@@ -217,12 +232,16 @@ class LinkCoordinator(
 
     /** USB 设备刚插上。 */
     fun onDeviceAttached(device: UsbDevice) {
+        // 重新插上 = 新情况（可能刚装好 App），解除"等 App"状态
+        waitingForPeerApp = false
         forceRetried = false
         restartSerial { router?.onDeviceAttached(device) }
     }
 
     /** 设备拔出。 */
     fun onDeviceDetached(device: UsbDevice?) {
+        // 拔插是"新情况"：用户可能刚在手机上装好 App，让他插回来就能重试。
+        waitingForPeerApp = false
         stopSession()
         listener.onProgress("USB 已拔出，请重新插线或点 Scan/Retry")
         listener.onClosed("USB 已拔出")
@@ -469,6 +488,7 @@ class LinkCoordinator(
 
                 override fun onFirstFrame() {
                     expectingRestart.set(false)
+                    waitingForPeerApp = false
                     mainHandler.removeCallbacks(clearExpectingRestart)
                     listener.onFirstFrame()
                 }
@@ -494,12 +514,10 @@ class LinkCoordinator(
                     // ★ 必须清掉会话：轮询的接管条件是 `session == null`，
                     //   不清就会一直挂着一个已经死掉的会话，用户装好 App 也接不回来。
                     mainHandler.post { stopSession() }
-                    // ★ 退避同样必须记上：缺 App 是个**不会自己好**的状态，
-                    //   不留计数就会以最快档（约 1s）反复重试，而每次重试都要让手机
-                    //   重新枚举 USB —— 对端只会一直在配件/普通之间来回跳。
-                    consecutiveFailures.incrementAndGet()
-                    // 断线算"新情况"（用户可能马上把 App 装上），重置自动重试配额。
-                    router?.resetAttempts()
+                    // ★ 并且**停掉自动重试**（见 waitingForPeerApp 的说明）：
+                    //   这里不计 consecutiveFailures 也没用 —— 链路层每轮都成功、
+                    //   计数会被 onReady 清零，退避永远停在最小档。
+                    waitingForPeerApp = true
                     listener.onPeerAppMissing()
 
                     // 自愈仍值得试一次：配件身份可能被"别的宿主 App"改写过，

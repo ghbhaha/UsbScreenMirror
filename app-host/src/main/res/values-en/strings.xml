@@ -29,7 +29,7 @@
     <string name="host_status_no_signal">No output</string>
     <string name="host_status_error">Link error</string>
     <string name="host_status_peer_app_missing">No reply from device</string>
-    <string name="host_detail_peer_app_missing">Switched into accessory mode, but the other side never replied — usually the companion app is not installed (a force-stopped app behaves the same). Tap the button below to download it.</string>
+    <string name="host_detail_peer_app_missing">Switched into accessory mode, but the other side never replied — usually the companion app is not installed (a force-stopped app behaves the same). After installing, tap Scan / Retry, or replug the cable.</string>
 
     <string name="host_btn_scan">Scan / Retry</string>
     <string name="host_btn_force">Rehandshake</string>
