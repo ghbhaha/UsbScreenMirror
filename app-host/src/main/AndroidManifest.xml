@@ -48,7 +48,7 @@
           仍然 exported：部分 ROM 在配件模式下会按 intent 直接拉起该页。
         -->
         <activity
-            android:name=".HostActivity"
+            android:name=".aoa.HostActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
             android:exported="true"
             android:launchMode="singleTask" />

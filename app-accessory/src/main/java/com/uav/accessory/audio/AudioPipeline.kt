@@ -9,7 +9,8 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Process
-import com.uav.accessory.AndroidLogger
+import com.uav.accessory.common.AndroidLogger
+import com.uav.accessory.video.VirtualDisplayEncoder
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.Flags
 import com.uav.protocol.aoa.StreamHeader

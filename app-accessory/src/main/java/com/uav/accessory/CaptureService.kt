@@ -20,6 +20,9 @@ import android.os.IBinder
 import android.view.Display
 import androidx.core.content.ContextCompat
 import com.uav.accessory.audio.AudioPipeline
+import com.uav.accessory.common.AndroidLogger
+import com.uav.accessory.common.DebugTools
+import com.uav.accessory.common.DisplaySize
 import com.uav.accessory.session.AccessorySession
 import com.uav.accessory.usb.FdByteChannel
 import com.uav.accessory.video.VirtualDisplayEncoder

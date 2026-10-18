@@ -12,8 +12,11 @@ import android.util.Log
 import android.view.View
 import android.widget.TextView
 import androidx.core.content.IntentCompat
+import com.uav.host.common.DebugTools
 import com.uav.host.ios.IosActivity
-import com.uav.host.usb.BulkPair
+import com.uav.host.aoa.HostActivity
+import com.uav.host.aoa.usb.BulkPair
+import com.uav.host.aoa.usb.UsbAttachRouter
 import com.uav.protocol.usb.UsbDeviceClassify
 import com.uav.protocol.usb.UsbDeviceKind
 

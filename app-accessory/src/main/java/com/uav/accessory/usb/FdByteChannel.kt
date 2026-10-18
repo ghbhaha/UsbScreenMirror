@@ -1,7 +1,7 @@
 package com.uav.accessory.usb
 
 import android.os.ParcelFileDescriptor
-import com.uav.accessory.AndroidLogger
+import com.uav.accessory.common.AndroidLogger
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
 import com.uav.protocol.e

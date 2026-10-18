@@ -1,6 +1,6 @@
 package com.uav.accessory.debug
 
-import com.uav.accessory.AndroidLogger
+import com.uav.accessory.common.AndroidLogger
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
 import com.uav.protocol.i

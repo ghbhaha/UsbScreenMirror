@@ -17,6 +17,8 @@ import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.uav.accessory.audio.TestTonePlayer
+import com.uav.accessory.common.AndroidLogger
+import com.uav.accessory.common.DebugTools
 import com.uav.protocol.i
 import com.uav.protocol.w
 

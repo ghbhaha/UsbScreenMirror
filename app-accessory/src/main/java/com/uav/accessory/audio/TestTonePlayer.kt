@@ -3,8 +3,8 @@ package com.uav.accessory.audio
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import com.uav.accessory.AndroidLogger
-import com.uav.accessory.DebugTools
+import com.uav.accessory.common.AndroidLogger
+import com.uav.accessory.common.DebugTools
 import com.uav.protocol.Logger
 import com.uav.protocol.e
 import com.uav.protocol.i

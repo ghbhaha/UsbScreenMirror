@@ -11,8 +11,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.Surface
-import com.uav.accessory.AndroidLogger
-import com.uav.accessory.DisplaySize
+import com.uav.accessory.common.AndroidLogger
+import com.uav.accessory.common.DisplaySize
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.Flags
 import com.uav.protocol.aoa.GopTailGate
