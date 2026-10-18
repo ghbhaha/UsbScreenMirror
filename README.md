@@ -1,10 +1,17 @@
 # UsbScreenMirror
 
-把一台安卓手机的屏幕，镜像到**另一台安卓设备**上——走 USB 配件协议（AOA v2），
-**运行时不需要 adb 授权、不需要开发者选项、不需要 root，也不需要往手机里推送任何服务端进程。**
+把**安卓手机**或 **iPad / iPhone** 的屏幕，镜像到**另一台安卓设备**（宿主）上，全程走 USB：
+手机走 AOA v2 配件协议，Apple 设备走 QuickTime USB 协议。
 
-插上线、点一两次系统弹窗，画面就出来了。目标场景是「手边有两台安卓设备，想让其中一台变成另一台的扩展屏」，
-而通常的做法（scrcpy 之类）要先开 USB 调试、配 adb 密钥、再往手机推一个服务端——这套东西在本项目里全部省掉。
+**两种设备都不需要 adb 授权、不需要开发者选项、不需要 root，也不需要往被投屏设备里推送任何进程。**
+
+宿主是一台安卓设备（本项目实测 BOE P40UCH / Android 14）。装上同一个 APK 后：
+
+- 插**安卓手机** → 走配件模式（AOA v2），带**真触摸回传**；
+- 插 **iPad** → 走 QuickTime USB，iPad 上点一次「信任」即可，**连电脑都不需要**。
+
+目标场景是「手边有各种设备，想让它们投到同一块屏上」，而通常的做法（scrcpy / 各种 iOS 投屏工具）
+要么要开 USB 调试、要么要装 PC 端软件、要么只支持一种设备——这些在本项目里都省掉。
 
 ---
 
@@ -15,11 +22,13 @@
 | | 说明 |
 | --- | --- |
 | ✅ **省掉的** | adb 授权、开发者选项、USB 调试开关、密钥协商、往手机推送服务端、root |
-| ✅ **用到的** | 一根 OTG 数据线；Android 系统自带的 USB 配件协议（AOA）与 MediaProjection / MediaCodec |
-| ⚠️ **省不掉的** | **Android 14+ 每次投屏仍要点一次录屏授权**——系统取消了 MediaProjection 的"记住选择"，无法绕过 |
-| ⚠️ **可能还要点一次** | 首次插线时系统**可能**弹「是否打开该 App 处理 USB 配件」，勾选默认后此后插线即达 |
+| ✅ **用到的** | 一根 OTG / 数据线；安卓手机侧用系统自带的 AOA 与 MediaProjection / MediaCodec；iPad 侧用 QuickTime USB（宿主当 USB 主机） |
+| ✅ **宿主只需一个 APK** | 插手机走 AOA、插 iPad 走 QuickTime，进哪个页面由选择页按 VID/PID 决定 |
+| ⚠️ **省不掉的（手机）** | **Android 14+ 每次投屏仍要点一次录屏授权**——系统取消了 MediaProjection 的"记住选择"，无法绕过 |
+| ⚠️ **可能还要点一次（手机）** | 首次插线时系统**可能**弹「是否打开该 App 处理 USB 配件」，勾选默认后此后插线即达 |
+| ⚠️ **省不掉的（iPad）** | 首次要在 **iPad 上点一次「信任」**（配对）；之后不再需要。会话开始时 iPad 上的播放会暂停一次，手动再点播放即可 |
 | ⚠️ **两端必须同版本** | 手机端与宿主端要一起升级（例如像素开关依赖手机端 10.17 的 `applyOptions`，旧包上切换不会生效）。目前**尚无版本/能力协商**，见路线图 |
-| ❌ **本期不做** | 鼠标/键盘输入（见「已知限制」） |
+| ❌ **本期不做** | 鼠标/键盘输入；iPad 侧的触摸回传（iOS 无 USB 输入通道） |
 
 一句话：**省掉的是"链路的准备工作"，不是"这一次点击"。**
 
@@ -49,6 +58,32 @@
 
 原理与选型的完整推导见 [`docs/配件投屏核心原理.md`](docs/配件投屏核心原理.md)。
 
+### iPad / iPhone：QuickTime USB（角色正好相反）
+
+手机那条路里宿主是**配件**；投 iPad 时宿主是**标准 USB 主机**，去认领平板的私有接口：
+
+```
+┌────────────────────────┐   ① lockdown 会话(mux)  ┌────────────────────────┐
+│ 宿主 app-host           │◄──────────────────────►│ iPad                   │
+│ ios.IosActivity        │   ② 证书配对 → 受信任    │ （不需要装任何 App）     │
+│                        │   ③ activate → 重枚举   │                        │
+│ QtSession ◄────────────┼───────────────────────┤ QT 接口 0xFF/0x2A       │
+│ H264Decoder + 音频      │   ④ FEED(视频) + EAT(音频)│ 0x86 IN / 0x05 OUT     │
+└────────────────────────┘◄───────────────────────┘                        │
+```
+
+三个和手机那条路**必须区别对待**的点：
+
+1. **配对**：走 lockdown 的 `Pair`，iPad 上点一次「信任」即可。配对记录存在宿主
+   `filesDir/ios_pair.properties`，之后不再需要点。
+2. **配对会清掉设备侧的采集武装态** ⇒ 配完必须再 `activate` 一次（要让设备真重枚举）。
+   判据只能是「配置集里从 4 个变成 5 个」，**不能**用"能不能找到采集接口"——
+   扁平接口表永远包含它，会导致 `activate` 一次都不发。
+3. **收尾必须做**：`hpa0`/`hpd0` → 等 2 个 `rels`（途中应答 `SYNC stop`）→ 再补 `hpd0`。
+   不做这步，设备侧会话一直挂着，**下一次会话只出 3 帧就卡死**。
+
+协议细节、踩坑与验证记录见 [`docs/iOS_USB投屏_安卓实现.md`](docs/iOS_USB投屏_安卓实现.md)。
+
 ---
 
 ## 架构
@@ -57,9 +92,20 @@
 
 | 模块 | 产物 | 职责 |
 | --- | --- | --- |
-| `:protocol` | 纯 Kotlin/JVM 库 | 报文编解码、常量、连接编排、队列、缩放。**零 Android 依赖** |
-| `:app-host` | `app-host-debug.apk` | 宿主：AOA 握手 → USB 通道 → 解码 → `SurfaceView` 渲染 |
+| `:protocol` | 纯 Kotlin/JVM 库 | 报文编解码、常量、连接编排、队列、缩放、**设备分类**、QuickTime 报文与音频解析、证书/配对。**零 Android 依赖** |
+| `:app-host` | `app-host-debug.apk` | 宿主：**选择页 + 两个投屏页**（AOA / QuickTime） |
 | `:app-accessory` | `app-accessory-debug.apk` | 手机：配件通道 → 虚拟屏采集 → 编码 → 推帧 |
+
+宿主的三个 Activity：
+
+| Activity | 职责 |
+| --- | --- |
+| `ChooserActivity` | **唯一入口**。两张卡片 + `USB_DEVICE_ATTACHED` 分类直达；按 VID/PID 判断，Apple 设备绝不会被送去走 AOA 握手 |
+| `HostActivity` | AOA 投屏页（`UsbAttachRouter` → `LinkCoordinator` → 解码 → 触摸回传） |
+| `ios.IosActivity` | QuickTime 投屏页（`MuxLink`/`QtTransport` → `QtSession` → `H264Decoder` + `PcmAudioPlayer`） |
+
+> 原先 iOS 是一条独立的 `:app-ios-qt` 分支（单独 APK）。2026-10-18 合并进 `:app-host`，
+> 合并方案见 [`docs/合入host_双协议方案.md`](docs/合入host_双协议方案.md)。
 
 `:protocol` 之所以必须是**纯 JVM 库**，是因为整个项目里唯一能在没有真机时真正验收的部分就是它——
 把纯逻辑（`AnnexB`、`AccessoryIdentity.encodeSendString`、`Scale` 等）全部下沉进来，
@@ -89,7 +135,7 @@
 | 项 | 要求 | 备注 |
 | --- | --- | --- |
 | JDK | **17+** | `gradle.properties` 里用 `org.gradle.java.home` 锁了 JDK 21 的**绝对路径**，换机器必须改 |
-| Android SDK | `compileSdk=36` / `buildTools=36.0.0` | `minSdk=24`、`targetSdk=36` |
+| Android SDK | `compileSdk=36` / `buildTools=36.0.0` | 宿主 `minSdk=23`、手机端 `minSdk=24`；`targetSdk=36` |
 | Gradle | 8.14.5（wrapper 已配） | 走腾讯云镜像，无需手动装 |
 | `local.properties` | **必须**有 `sdk.dir=<你的 SDK 路径>` | ⚠️ 本机 `ANDROID_HOME` 为空，不能靠环境变量 |
 | `GRADLE_USER_HOME` | 建议显式设成一个固定目录 | 依赖缓存按此目录复用；不设则用默认的 `~/.gradle`。另外**锁 JDK 建议写在 `$GRADLE_USER_HOME/gradle.properties`（用户级）**，别写进项目文件——绝对路径一旦入库，别的机器会构建失败 |
@@ -99,13 +145,19 @@
 ## 构建与验证
 
 ```bash
-# 协议层单测（唯一可纯本地验证的部分，当前 237 项）
+# 协议层单测（唯一可纯本地验证的部分，当前 339 项）
 ./gradlew :protocol:test
 
-# 两个 APK
+# 两个 APK（宿主一个、手机一个；iPad 不需要装任何东西）
 ./gradlew :app-host:assembleDebug :app-accessory:assembleDebug
 ./gradlew :app-host:assembleRelease :app-accessory:assembleRelease
+
+# lint（宿主 minSdk=23，iOS 代码是后并进来的，NewApi 靠它兜）
+./gradlew :app-host:lintDebug
 ```
+
+> 原先是三个 APK（多一个 iOS 专用的 `:app-ios-qt`）。2026-10-18 并入 `:app-host` 后，
+> 那个模块已删除——**需要单独跑纯 iOS 版本时从 git 历史恢复**。
 
 产物位置：
 
@@ -127,15 +179,28 @@ app-accessory/build/outputs/apk/debug/app-accessory-debug.apk
 adb -s <宿主设备>  install -r -g app-host/build/outputs/apk/debug/app-host-debug.apk
 adb -s <配件手机>  install -r -g app-accessory/build/outputs/apk/debug/app-accessory-debug.apk
 
-# 2) 启动宿主，然后把手机插到宿主上
-adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
+# 2) 打开宿主（也可以直接在桌面上点图标）
+adb -s <宿主设备> shell am start -n com.uav.host/.ChooserActivity
 ```
 
-接线的顺序与弹窗：
+宿主打开后是**选择页**：两张卡片「安卓手机」/「iPad / iPhone」。插线时系统会带着设备描述符拉起它，
+**能分类就直接进对应页面**，分不清才停在选择页让你点。
+
+### 安卓手机（AOA）
 
 1. 手机插上宿主 → 系统**可能**弹「**是否打开该 App 处理 USB 配件**」→ 勾选默认（此后插线即达）
 2. 手机弹「**开始录制或投放**」录屏授权 → 允许（Android 14+ 每次都要点）
 3. 宿主的 `SurfaceView` 上出现手机画面
+
+### iPad / iPhone（QuickTime USB）
+
+1. iPad 插上宿主 → 自动进入「iPad / iPhone」页
+2. **首次**：点「**配对**」→ iPad 上弹「信任此电脑」→ 点信任；再点「**重新唤醒**」等设备重枚举
+3. 点「**开始投屏**」→ 画面 + 声音都出来
+4. 之后再投只需点「开始投屏」（配对记录与配置切换都已就绪）
+
+⚠️ **会话一开始，iPad 上的播放会暂停**（设备把音频路由切到 USB 造成的，不是 bug）——
+在 iPad 上再点一次播放即可，之后声音由宿主扬声器输出。
 
 宿主界面是**左侧竖栏面板**（深色）—— 面板宽 300dp，横屏宿主下手机竖屏镜像只占中间一条、
 两侧都是信箱边，**侧栏正好落在左边黑边里，不挡画面**：
@@ -185,6 +250,8 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
 
 ## 协议速览
 
+### 安卓手机：AOA 上的私有流协议
+
 两端必须逐字一致，完整清单见 [`docs/实施计划.md`](docs/实施计划.md) 第 4 节。
 
 | 项 | 约定 |
@@ -207,22 +274,59 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
 
 ---
 
+### iPad：QuickTime USB 协议
+
+宿主当 USB 主机，claim 平板的 `0xFF/0x2A` 接口（`0x86` IN / `0x05` OUT），报文格式：
+
+| 项 | 约定 |
+| --- | --- |
+| 报文 | `u32 长度`（含 4B 头）+ 4B fourcc + 负载；**fourcc 线上是字节反转的**（`fcc()` 必用，禁止字面量） |
+| 会话 | `PING` → `CWPA`（音频时钟）→ `CVRP`（视频时钟）→ `FEED`/`EAT` |
+| 主机→设备 | 全部是 `RPLY`：`clock` / `afmt` / `skew` / `zero`，另有 `NEED`（要下一帧，带视频时钟） |
+| 视频 | `ASYN/FEED`：`CmSampleBuf`，`sdat` 段装 H.264 NAL |
+| 音频 | `ASYN/EAT!`：同构 sbuf，`sdat` 段装**裸 PCM**（`fdsc` 里给 ASBD，实机 `lpcm 48k/16bit/2ch`） |
+| 收尾 | `hpa0`/`hpd0` → 等 2 个 `ASYN/rels`（途中应答 `SYNC stop`）→ 再补 `hpd0` |
+| 启用采集 | `activate`（`0x40/0x52 wIndex=2`）只有在**当前配置为 3** 时才真重枚举；判据是「配置集 4→5」 |
+
+⚠️ 这套协议的坑集中在**字节级**：`lpcm` 写成裸 ASCII、`og! ` 与 `go! ` 搞反，都会让设备
+**静默不推音频**（不报错、不崩溃）。所以出站报文一律与真机样本做逐字节断言
+（`:protocol` 的 `QtPacketFixtureTest`），排查顺序见 `docs/iOS_USB投屏_安卓实现.md` §三·五。
+
+---
+
 ## 项目状态
 
 | 项 | 状态 |
 | --- | --- |
 | 端到端投屏（MVP） | ✅ **真机验证通过**——宿主 `SurfaceView` 上出现手机画面 |
-| 协议层单测 | ✅ **237 项全绿**（含两端 `Connection` 对跑的端到端协议联调） |
+| 协议层单测 | ✅ **339 项全绿**（含两端 `Connection` 对跑的端到端协议联调、QuickTime 报文/音频/配对、设备分类） |
 | 离线回放 | ✅ 28.7 MB 真机抓流按 PTS 配速回放，`dropped=1` |
 | release 构建 | ✅ 已端到端真机验证（功能完整，仅少了调试入口） |
 | 宿主内核 panic | ✅ **已定位并修复**——证明是**我们自己的 bug**（子包长 bulk 读触发 usercopy `BUG()`），见 10.16。⚠️ **长跑复验待做** |
 | 画质模式 | ✅ `1:1 像素` ↔ `高清` 可在宿主菜单切换，走**原地重协商**（不重连、约 2~3s），见 10.17 / 10.18 |
 | 宿主 UI | ✅ 左侧竖栏面板 + 常驻状态药丸 + 画质分段控件 + 紧凑统计，见 10.19 |
-| 实测机型 | 宿主 BOE **P40UCH** / Android 14；配件 HONOR **MAA-AN10** / Android 16 |
+| **iPad 投屏（QuickTime）** | ✅ **真机验证通过**——iPad8,9 / iPadOS 27.2：画面完整上屏、**音频出声**；App 自己配对，不依赖 PC |
+| iPad 视频规格 | 竖屏 **1200×1718** / 横屏 **1718×1200**，信箱适配；转屏会换编码分辨率，宿主自动重建解码器 |
+| iPad 音频 | 裸 PCM `lpcm 48000Hz/16bit/2ch`，每包 4096B（1024 采样）；宿主持久写 `AudioTrack` |
+| 实测机型 | 宿主 BOE **P40UCH** / Android 14；配件 HONOR **MAA-AN10** / Android 16；iPad **iPad8,9 / iPadOS 27.2** |
 | 实测输出 | `1:1`：`max_size=992` → 编码 **456×992**（按宿主显示区 1920x987 算出，10.15）；<br>`高清`：`max_size=1920` → 编码 **872×1920**，由宿主端缩下去（10.17） |
 | 端到端延迟 | p50 **64ms** / p95 **140ms** / p99 159ms（fresh 口径，n=300，且不含最后 1 个 vsync）<br>⚠️ 只在**时钟标定可靠**的会话里成立；标定不可靠时宿主面板会显示「标定不可靠」而不是给一个假数（10.19） |
 
 ### 已知限制
+
+#### iPad / iPhone（QuickTime USB）
+
+- **只读投屏，没有触摸回传**：iOS 侧不存在 USB 输入通道，要反过来控制 iPad 得走 BLE HID 或网络，
+  本期不做。
+- **没有 A/V 同步**：音频按 ~200ms 缓冲直接写 `AudioTrack`，没有和视频 PTS 对齐。
+  单看视频或单听音频都正常，长时间连看可能有几十毫秒漂移（手机那条路的 A/V 同步是完整的）。
+- **会话开始会让 iPad 上的播放暂停**：设备把音频路由切到 USB，播放器需手动再点一次播放。
+  这是设备行为（Windows 上的 iPhoneMirror 同样如此），不是本项目的 bug。
+- **首次要按两次按钮**：配对的 iPad 需要「配对 → 重新唤醒」再「开始投屏」。
+  配对会清掉设备侧的采集武装态，必须让它真重枚举一次。
+- **不支持同时投两台**：同一时刻只有一条链路（一个 Surface、一个 AudioTrack、一份 USB 带宽）。
+
+#### 安卓手机（AOA）
 
 - **旋转已支持**：手机侧需**开启自动旋转**。虚拟屏全程复用（`MediaProjection` 令牌
   只允许 `createVirtualDisplay` 一次）、编码器按新尺寸重建、新尺寸经**重发 12B 流头**
@@ -379,6 +483,8 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
 | ✅ 10.32 | 停止投屏主动告知宿主（`CLSE`）+ 停止后点授权可恢复（7 处修复，零拔插） |
 | ✅ 10.33 | 修停止投屏崩溃（`uav-audio` FATAL）+ 宿主 ANR，附带 3 个隐藏缺陷 |
 | ✅ 10.34 | 每帧少一次分配 + 一次整包拷贝（帧感知读）、读块 16→64KB |
+| ✅ 10.35 | **iPad 投屏（QuickTime USB）**：自建配对（lockdown `Pair`）、`activate` 重枚举、H.264 解码、PCM 音频回放、收尾（`hpa0`/`hpd0` + 2×`rels`） |
+| ✅ 10.36 | **双协议合并**：`ChooserActivity` 选择页 + `HostActivity`(AOA) / `IosActivity`(QT) 两页；`:protocol` 设备分类（`0x2D0x`→AOA、`0x05AC`→iOS）；`app-ios-qt` 模块并入 |
 | 待补验 | 宿主旋转/分屏触发的原地重协商；10.16 修复的**长跑复验**（判据：ramoops 无新增）；原地重协商的**回退路径**（从未触发过）；码率按面积缩放的**带宽 A/B**（需播放视频类内容才能受控测量）；10.21 的**多次/长时间切后台压力复验**（单次已闭环） |
 | P2 | 流健康监测、编码器死亡上报、低延迟调优、HID 鼠标、宿主真双指手势的硬件验收（见 10.12 末） |
 | P3 | 传输加密 |
@@ -392,6 +498,9 @@ adb -s <宿主设备> shell am start -n com.uav.host/.HostActivity
 | [`docs/配件投屏核心原理.md`](docs/配件投屏核心原理.md) | 项目定位、技术选型、AOA 与协议原理 |
 | [`docs/实施计划.md`](docs/实施计划.md) | 协议冻结清单 v2、分步实施、风险清单、**真机实测记录（10.4）** |
 | [`docs/排错手册.md`](docs/排错手册.md) | 症状速查表、二分定位法、adb 操作红线、日志判读 |
+| [`docs/iOS_USB投屏_安卓实现.md`](docs/iOS_USB投屏_安卓实现.md) | iPad 侧协议（lockdown/配对/QT/音频）、**协议排查优先级**、踩坑记录 |
+| [`docs/合入host_双协议方案.md`](docs/合入host_双协议方案.md) | 双协议合并的可行性、风险与落地形态 |
+| [`docs/QT协议Windows复现.md`](docs/QT协议Windows复现.md) | 在 PC 上复现 QT 协议的参考脚本与踩坑（含 `set_configuration` 蓝屏红线） |
 
 ---
 
