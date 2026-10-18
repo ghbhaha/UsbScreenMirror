@@ -129,6 +129,47 @@ iPad 连这个热点 —— 不依赖家里路由器，延迟和稳定性都可�
 
 ---
 
+## 5.5 实测结果（2026-10-18 13:04–13:06）
+
+装了 `jqssun/android-airplay-server` v0.0.33 到宿主（BOE P40UCH / Android 14），结论如下。
+
+### 开源实现本身能跑
+
+```
+界面：Android AirPlay / Waiting for connection...   （服务名 Android AirPlay）
+端口：7000 LISTEN（0x1B58）
+日志：13:04:48.483  AirPlayService: Client connected (2)
+      13:04:48.485  AirPlayService: Client disconnected (1)
+```
+
+⇒ **协议栈工作正常**，iPad 侧连上过一次。
+但随后进程被回收（`13:05:44 SurfaceView disconnect`，之后 7000 不再监听）——
+这台宿主是教育管控设备，启动时会弹「孩子已使用【AirPlay Server】0 分钟了，超出了您设置的使用时长」，
+后台存活需要额外处理。
+
+### ★ 更重要的发现：这台宿主**出厂就带 AirPlay 接收**
+
+用户"可以投了"时，实际前台是：
+
+```
+topResumedActivity = com.boe.yplayer / com.boe.lebo.yplayer.MainPanelActivity
+包路径 = /system/app/BoeLebo/BoeLebo.apk        ← 系统预装，非 root 不可卸载
+界面    = 「乐播投屏」引导页，设备名 P40_LBF8
+```
+
+⇒ **「iPad 投屏到这台 Android 设备」不需要我们自己实现**——BOE 定制 ROM 集成了乐播 SDK，
+它就是一个可用的 AirPlay 接收端（WiFi）。我们装的开源 App 是**另一个**服务
+（`Android AirPlay`），两套并存。
+
+### 对产品决策的影响
+
+| 需求 | 结论 |
+|---|---|
+| 只要能投上 | ✅ **系统自带已满足**，无需开发 |
+| 要自主可控 / 去广告 / 可定制 | 需要自研或集成（GPL-3.0 约束见 §7.4） |
+| 要与本项目其他能力打通（录屏落盘、反向控制、码率自适应） | 需要自研，系统乐播不提供接口 |
+| 要"物理有线" | 仍受 §2 的 CDC-NCM 限制，本机不可行 |
+
 ## 六、待确认
 
 1. 第 1 步的 APK 验证结果（决定这条路成不成立）；
