@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  选择页：决定走哪条投屏链路。
+
+  ★ 这里的两个入口对应两套**完全不同**的 USB 协议，不是"同一件事的两种设备"：
+    - 安卓手机 → AOA v2：宿主把手机变成"配件"，再走 accessory fd，**支持触摸回传**
+    - iPad     → QuickTime USB：反过来，宿主是 USB 主机，去 claim 平板的 0xFF/0x2A 接口，
+                 按 VT 的约定只做**只读投屏**（无触摸通道）
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/host_bg"
+    android:orientation="vertical"
+    android:paddingStart="28dp"
+    android:paddingTop="48dp"
+    android:paddingEnd="28dp"
+    android:paddingBottom="28dp">
+
+    <!-- 强调竖条 + 标题，沿用 host 面板的视觉语言 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <View
+            android:layout_width="3dp"
+            android:layout_height="match_parent"
+            android:layout_marginEnd="10dp"
+            android:background="@drawable/accent_bar" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/chooser_title"
+                android:textColor="@color/host_text"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/chooser_subtitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/chooser_subtitle"
+                android:textColor="@color/host_text_dim"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 入口 1：安卓手机（AOA） -->
+    <LinearLayout
+        android:id="@+id/card_aoa"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="32dp"
+        android:background="@drawable/bg_card"
+        android:clickable="true"
+        android:focusable="true"
+        android:orientation="vertical"
+        android:padding="18dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/chooser_aoa_title"
+            android:textColor="@color/host_text"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/chooser_aoa_desc"
+            android:textColor="@color/host_text_dim"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 入口 2：iPad（QuickTime USB） -->
+    <LinearLayout
+        android:id="@+id/card_ios"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_card"
+        android:clickable="true"
+        android:focusable="true"
+        android:orientation="vertical"
+        android:padding="18dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/chooser_ios_title"
+            android:textColor="@color/host_text"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/chooser_ios_desc"
+            android:textColor="@color/host_text_dim"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 当前插着的设备（只是一行事实，不做决策） -->
+    <TextView
+        android:id="@+id/chooser_detected"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:textColor="@color/host_text_faint"
+        android:textSize="12sp" />
+</LinearLayout>

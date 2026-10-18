@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 /**
  * FEED 样本解析（纯函数，便于离线回放自测）。

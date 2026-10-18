@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 import android.app.PendingIntent
 import android.content.Context
@@ -29,7 +29,7 @@ internal class QtTransport(
     companion object {
         const val APPLE_VID = 0x05AC
         const val IPAD_PID = 0x12AB
-        const val ACTION_USB_PERMISSION = "com.uav.iosqt.USB_PERMISSION"
+        const val ACTION_USB_PERMISSION = "com.uav.host.ios.USB_PERMISSION"
         const val CTRL_TIMEOUT_MS = 3000
     }
 

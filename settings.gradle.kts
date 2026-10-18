@@ -25,4 +25,5 @@ rootProject.name = "usbscreen"
 include(":protocol")
 include(":app-host")
 include(":app-accessory")
-include(":app-ios-qt")
+// app-ios-qt 已整体并入 :app-host（选择页 →「iPad / iPhone」即为原来的调试入口）。
+// 需要单独跑纯 iOS 版本时，从 git 历史恢复该模块即可。

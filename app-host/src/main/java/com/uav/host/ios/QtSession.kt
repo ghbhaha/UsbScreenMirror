@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 import android.hardware.usb.UsbDeviceConnection
 import com.uav.protocol.ios.QtPacket
@@ -314,7 +314,7 @@ internal class QtSession(
                                 "（累计 ${st.audioBytes} B，${AudioParser.sampleCount(p)} 样本，" +
                                 "pts=${"%.3f".format(AudioParser.ptsSeconds(p))}s）")
                         }
-                        onAudio?.invoke(pcm, AudioParser.format(p) ?: AudioPlayer.DEFAULT_FORMAT)
+                        onAudio?.invoke(pcm, AudioParser.format(p) ?: PcmAudioPlayer.DEFAULT_FORMAT)
                     } else {
                         log("EAT #${st.eat} 结构未识别（${p.size}B）")
                     }

@@ -66,4 +66,41 @@
       "自动旋转"是已支持功能（计划 10.7）的前提条件，写出来避免"转不动"被当成 bug。
     -->
     <string name="host_hint">点画面外的空白处显示 / 隐藏此面板 · 手机上需开启自动旋转</string>
+<string name="ios_title">iOS 投屏</string>
+<string name="ios_btn_collapse">收起面板</string>
+<string name="ios_btn_expand">展开面板</string>
+<string name="ios_chip_idle">空闲</string>
+<string name="ios_chip_pairing">配对中</string>
+<string name="ios_chip_connecting">连接中</string>
+<string name="ios_chip_mirroring">投屏中</string>
+<string name="ios_chip_rearm">唤醒中</string>
+<string name="ios_chip_replay">回放</string>
+<string name="ios_chip_error">出错</string>
+<string name="ios_status_idle">空闲中 —— 把 iPad 用数据线插到本机</string>
+<string name="ios_status_unpaired">这台 iPad 还没被本机信任</string>
+<string name="ios_status_pairing">等待你在 iPad 上点「信任」…</string>
+<string name="ios_status_connecting">正在建立连接…</string>
+<string name="ios_status_mirroring">投屏中</string>
+<string name="ios_status_rearm">正在唤醒 iPad 的采集通道…</string>
+<string name="ios_status_replay">回放录制流</string>
+<string name="ios_status_error">链路出错</string>
+<string name="ios_btn_start">开始投屏</string>
+<string name="ios_btn_stop">停止投屏</string>
+<string name="ios_btn_pair">配对（信任本机）</string>
+<string name="ios_btn_rearm">重新唤醒采集通道</string>
+<string name="ios_section_device">设备</string>
+<string name="ios_section_log">运行日志</string>
+<string name="ios_detail_no_device">未检测到 Apple 设备（VID 0x05AC）</string>
+<string name="ios_detail_pair_hint">配对成功后本机即成为受信任主机，以后不用再点</string>
+<string name="ios_detail_rearm_hint">配对完成后第一次投屏、或长时间无数据时才需要</string>
+<string name="ios_hint">点画面空白处或左上角药丸可显示 / 隐藏此面板 · 长按「开始投屏」回放上次录制的流</string>
+    <string name="chooser_title">USB 投屏</string>
+    <string name="chooser_subtitle">选择要投屏的设备类型（插线后会自动识别）</string>
+    <string name="chooser_aoa_title">安卓手机</string>
+    <string name="chooser_aoa_desc">USB 配件模式（AOA v2）· 支持触摸回传与 1:1 显示</string>
+    <string name="chooser_ios_title">iPad / iPhone</string>
+    <string name="chooser_ios_desc">QuickTime USB · 只读投屏（iOS 无 USB 输入通道）</string>
+    <string name="chooser_detected_aoa">已检测到 %1$d 个配件设备（安卓手机已就绪）</string>
+    <string name="chooser_detected_ios">已检测到 %1$d 台 Apple 设备（可走 iPad 投屏）</string>
+    <string name="chooser_detected_none">当前未检测到可用于投屏的设备，插线后会自动识别</string>
 </resources>

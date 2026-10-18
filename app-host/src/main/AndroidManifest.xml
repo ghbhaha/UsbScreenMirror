@@ -14,13 +14,17 @@
         android:theme="@android:style/Theme.Material.NoActionBar">
 
         <!--
-          计划 2.1 / 0.7：
-          - exported=true 必须显式声明（带 intent-filter 的组件在 API 31+ 否则安装即失败）
-          - launchMode=singleTask + onNewIntent：插线复用同一实例
-          - configChanges：投屏期间避免旋转重建 Activity
+          选择页 = 唯一入口。
+
+          ★ 插线过滤器为什么挂在这里、而不是 HostActivity：
+            iPad 也有 bulk 端点对（if2 的 0x86/0x05），挂在 AOA 页会让平板一插上
+            就去走 AOA 握手。本页只读设备描述符做分类：能确定类型就直接跳对应页面，
+            不确定就停在这里让用户点。
+          计划 2.1 / 0.7：exported 必须显式（带 intent-filter 在 API 31+ 否则装不上）；
+          launchMode=singleTask + onNewIntent：插线复用同一实例，不叠 Activity。
         -->
         <activity
-            android:name=".HostActivity"
+            android:name=".ChooserActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
             android:exported="true"
             android:launchMode="singleTask">
@@ -38,6 +42,27 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          AOA 投屏页：行为与合并前完全一致（exported + singleTask + 同一套 configChanges）。
+          仍然 exported：部分 ROM 在配件模式下会按 intent 直接拉起该页。
+        -->
+        <activity
+            android:name=".HostActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:exported="true"
+            android:launchMode="singleTask" />
+
+        <!--
+          iPad / iPhone 投屏页（QuickTime USB）。
+          configChanges 必须带 orientation|screenSize：iPad 转屏会改变编码分辨率，
+          Activity 重建会把 USB 会话连根拔掉（面板/药丸状态也会丢）。
+        -->
+        <activity
+            android:name=".ios.IosActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:exported="true"
+            android:launchMode="singleTask" />
     </application>
 
 </manifest>

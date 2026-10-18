@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 import com.uav.protocol.ios.CertKit
 import com.uav.protocol.ios.PairRecord

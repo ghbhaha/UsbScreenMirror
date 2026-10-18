@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 import android.app.Activity
 import com.uav.protocol.ios.QtPacket
@@ -11,7 +11,7 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.view.WindowManager
-import com.uav.iosqt.ui.IosPanel
+import com.uav.host.ios.ui.IosPanel
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -19,6 +19,8 @@ import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import androidx.core.content.ContextCompat
+import com.uav.host.R
 
 /**
  * 最小宿主：一个按钮跑完「激活 → 等采集配置 → claim → 握手 → 收流」。
@@ -26,7 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 逻辑完全照 Windows 上已验证通过的那份（tools/qt-repro），
  * 不做双配置仪式、不做 clearHalt、不做控制 kick。
  */
-class MainActivity : Activity() {
+class IosActivity : Activity() {
 
     private lateinit var usb: UsbManager
     private lateinit var transport: QtTransport
@@ -35,7 +37,7 @@ class MainActivity : Activity() {
     /** 解码器要等 Surface 和 SPS/PPS 都就绪才能起 */
     private var pendingCsd: ByteArray? = null
     private var decoder: H264Decoder? = null
-    private var audio: AudioPlayer? = null
+    private var audio: PcmAudioPlayer? = null
 
     /** 首帧只处理一次：到首帧就把面板收起来，把画面让出来 */
     private val firstFrameDone = AtomicBoolean(false)
@@ -116,10 +118,14 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         transport = QtTransport(this, usb, ::log)
-        registerReceiver(
+        // ★ 必须走 ContextCompat：三分量 registerReceiver 是 API 26+ 的，
+        //   而本模块 minSdk = 23（合并进 app-host 时统一成 23）。ContextCompat 会在
+        //   低版本上退化成两分量调用，并自动补 exported 语义。
+        ContextCompat.registerReceiver(
+            this,
             permissionReceiver,
             IntentFilter(QtTransport.ACTION_USB_PERMISSION),
-            RECEIVER_NOT_EXPORTED
+            ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
         log("QuickTime USB 采集（Android）")
@@ -582,7 +588,7 @@ class MainActivity : Activity() {
         val outFile = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
         log("落盘：${outFile.absolutePath}")
         // 音频：第一包 PCM 到才真正建轨道（没声音就不占音频资源）
-        val audioPlayer = AudioPlayer(::log)
+        val audioPlayer = PcmAudioPlayer(::log)
         audio = audioPlayer
         return outFile.outputStream().use { out ->
             var session: QtSession? = null

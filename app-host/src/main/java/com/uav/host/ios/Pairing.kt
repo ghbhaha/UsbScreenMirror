@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbInterface

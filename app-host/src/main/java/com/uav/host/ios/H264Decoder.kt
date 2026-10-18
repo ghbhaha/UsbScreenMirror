@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 import android.media.MediaCodec
 import android.media.MediaFormat

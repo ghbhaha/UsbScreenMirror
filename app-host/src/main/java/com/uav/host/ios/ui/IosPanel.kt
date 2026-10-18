@@ -1,4 +1,4 @@
-package com.uav.iosqt.ui
+package com.uav.host.ios.ui
 
 import android.app.Activity
 import android.content.res.ColorStateList
@@ -10,8 +10,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.uav.iosqt.R
-import com.uav.iosqt.video.AspectRatioSurfaceView
+import com.uav.host.R
+import com.uav.host.video.AspectRatioSurfaceView
 
 /**
  * iOS 采集端的**纯 View 层**（视觉与分层照 `app-host` 的 `HostPanel`）。

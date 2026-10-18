@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.host.ios
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -22,7 +22,7 @@ import com.uav.protocol.ios.AudioParser
  *    队列满时**丢这一包**，代价是几十毫秒空洞，比整条链路停住强得多。
  * 2. **先置 `playing=false` 再 `pause/flush`**：顺序反了会写进已暂停的轨道。
  */
-internal class AudioPlayer(private val log: (String) -> Unit) {
+internal class PcmAudioPlayer(private val log: (String) -> Unit) {
 
     companion object {
         /** `fdsc` 缺失时的兜底（与 HPA1 里声明的候选一致） */
