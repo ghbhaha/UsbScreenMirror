@@ -85,7 +85,7 @@ internal object SampleParser {
         return null
     }
 
-    private fun be32(b: ByteArray, off: Int): Int =
+    internal fun be32(b: ByteArray, off: Int): Int =
         ((b[off].toInt() and 0xFF) shl 24) or ((b[off + 1].toInt() and 0xFF) shl 16) or
             ((b[off + 2].toInt() and 0xFF) shl 8) or (b[off + 3].toInt() and 0xFF)
 

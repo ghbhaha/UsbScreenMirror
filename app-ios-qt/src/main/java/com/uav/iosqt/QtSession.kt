@@ -1,6 +1,7 @@
 package com.uav.iosqt
 
 import android.hardware.usb.UsbDeviceConnection
+import com.uav.protocol.ios.AudioParser
 import android.hardware.usb.UsbEndpoint
 import java.io.OutputStream
 
@@ -28,7 +29,9 @@ internal class QtSession(
     /** 收到 SPS/PPS（Annex-B）时回调：用于配置解码器 */
     private val onCsd: ((ByteArray) -> Unit)? = null,
     /** 收到一帧（Annex-B）时回调：用于送解码器 */
-    private val onFrame: ((ByteArray) -> Unit)? = null
+    private val onFrame: ((ByteArray) -> Unit)? = null,
+    /** 收到一包音频 PCM 时回调（裸 PCM + 该帧在 fdsc 里声明的真实格式） */
+    private val onAudio: ((ByteArray, AudioParser.Format) -> Unit)? = null
 ) {
 
     data class Stats(
@@ -36,6 +39,10 @@ internal class QtSession(
         var cwpa: Int = 0,
         var cvrp: Int = 0,
         var afmt: Int = 0,
+        var og: Int = 0,
+        var skew: Int = 0,
+        var eat: Int = 0,
+        var audioBytes: Long = 0,
         var clok: Int = 0,
         var time: Int = 0,
         var feed: Int = 0,
@@ -182,6 +189,22 @@ internal class QtSession(
                         log("AFMT → reply")
                     }
 
+                    // ★ 设备问「当前音频时钟偏差多少」。**不回它就不推音频**。
+                    //   我们没做可靠的时钟标定，回 0 即可（quicktime_video_hack 也是这么起步的）。
+                    QtPacket.matches(p, 12, "skew") -> {
+                        st.skew++
+                        write(QtPacket.skewReply(corr, 0.0))
+                        log("SKEW → reply(0.0)")
+                    }
+
+                    // ★ 线上 fourcc 是 20 21 6F 67，读出来像 "go! "；含义未知，
+                    //   但它是音频开始推的前置之一（不回它，设备只推视频）。
+                    QtPacket.matches(p, 12, "og! ") -> {
+                        st.og++
+                        write(QtPacket.ogReply(corr))
+                        log("OG → reply")
+                    }
+
                     QtPacket.matches(p, 12, "clok") -> {
                         st.clok++
                         write(QtPacket.clockReply(corr, QtPacket.u64At(p, 4) + 0x10000))
@@ -225,6 +248,21 @@ internal class QtSession(
                         if (frame != null) onFrame.invoke(frame)
                     }
                     if (videoClock != 0L) write(QtPacket.need(videoClock))
+                } else if (QtPacket.matches(p, 12, "eat!")) {
+                    // 音频样本：与 FEED 同构的 sbuf，只是 sdat 里装裸 PCM
+                    st.eat++
+                    val pcm = AudioParser.pcm(p)
+                    if (pcm != null) {
+                        st.audioBytes += pcm.size
+                        if (st.eat <= 3 || st.eat % 200 == 0) {
+                            log("EAT #${st.eat}  ${p.size}B → PCM ${pcm.size}B " +
+                                "（累计 ${st.audioBytes} B，${AudioParser.sampleCount(p)} 样本，" +
+                                "pts=${"%.3f".format(AudioParser.ptsSeconds(p))}s）")
+                        }
+                        onAudio?.invoke(pcm, AudioParser.format(p) ?: AudioPlayer.DEFAULT_FORMAT)
+                    } else {
+                        log("EAT #${st.eat} 结构未识别（${p.size}B）")
+                    }
                 } else {
                     st.other++
                     log("ASYN ${QtPacket.fccString(p, 12)} ${p.size}B")

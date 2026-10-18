@@ -110,6 +110,20 @@ internal object QtPacket {
         return u32(20 + body.size) + fcc("rply") + u64(correlation) + u32(0) + body
     }
 
+    /**
+     * RPLY：`OG` 应答（24B，值恒 0）。
+     *
+     * `OG` 的线上 fourcc 是 `20 21 6F 67`（读出来像 "go! "），含义未知 ——
+     * 但 quicktime_video_hack 对每个 OG 都回一包，且**这是音频真正开始推的前置**：
+     * 不回它，设备只推视频、一个 EAT 帧都不发。
+     */
+    fun ogReply(correlation: Long): ByteArray =
+        u32(24) + fcc("rply") + u64(correlation) + u64(0)
+
+    /** RPLY：`SKEW` 应答（音频时钟偏差，秒）。没有可靠标定时就回 0。 */
+    fun skewReply(correlation: Long, skew: Double): ByteArray =
+        u32(28) + fcc("rply") + u64(correlation) + u32(0) + f64(skew)
+
     /** RPLY：时间应答。 */
     fun timeReply(correlation: Long, nanos: Long): ByteArray =
         u32(44) + fcc("rply") + u64(correlation) + u32(0) +

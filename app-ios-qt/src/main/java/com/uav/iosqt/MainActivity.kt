@@ -34,6 +34,7 @@ class MainActivity : Activity() {
     /** 解码器要等 Surface 和 SPS/PPS 都就绪才能起 */
     private var pendingCsd: ByteArray? = null
     private var decoder: H264Decoder? = null
+    private var audio: AudioPlayer? = null
 
     /** 首帧只处理一次：到首帧就把面板收起来，把画面让出来 */
     private val firstFrameDone = AtomicBoolean(false)
@@ -401,7 +402,8 @@ class MainActivity : Activity() {
         )
         if (stats != null) {
             log("=== 结束：PING ${stats.ping} / CWPA ${stats.cwpa} / CVRP ${stats.cvrp} / " +
-                "FEED ${stats.feed}（${stats.feedBytes} B） / 共 ${stats.bytes} B ===")
+                "FEED ${stats.feed}（${stats.feedBytes} B） / EAT ${stats.eat}（${stats.audioBytes} B）" +
+                " / 共 ${stats.bytes} B ===")
         }
     }
 
@@ -540,6 +542,9 @@ class MainActivity : Activity() {
         // 8) 收流：**一直投到用户点停止**（原先是跑 60s 就结束，那是采集测试、不是投屏）
         val outFile = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
         log("落盘：${outFile.absolutePath}")
+        // 音频：第一包 PCM 到才真正建轨道（没声音就不占音频资源）
+        val audioPlayer = AudioPlayer(::log)
+        audio = audioPlayer
         return outFile.outputStream().use { out ->
             var session: QtSession? = null
             try {
@@ -556,7 +561,8 @@ class MainActivity : Activity() {
                             panel.render(IosPanel.Stage.MIRRORING, null)
                             panel.setMenuVisible(false)
                         }
-                    }
+                    },
+                    onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) }
                 )
 
                 activeSession = session
@@ -591,7 +597,8 @@ class MainActivity : Activity() {
                             panel.render(IosPanel.Stage.MIRRORING, null)
                             panel.setMenuVisible(false)
                         }
-                    }
+                    },
+                    onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) }
                 )
                 activeSession = session
                 st = session.run(maxSeconds = 0, idleAbortSeconds = 12)
@@ -606,6 +613,8 @@ class MainActivity : Activity() {
                 runCatching {
                     transport.normalConfiguration(dev, cfg.id)?.let { transport.setConfiguration(connQt, it) }
                 }
+                runCatching { audioPlayer.stop() }
+                audio = null
                 runCatching { connMux?.close() }
                 runCatching { connQt.close() }
                 log("收尾完成：配置已还回普通态，可直接再次开始（无需重启 iPad）")
