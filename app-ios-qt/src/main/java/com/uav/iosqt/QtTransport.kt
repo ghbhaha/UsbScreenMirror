@@ -115,6 +115,21 @@ internal class QtTransport(
         return null
     }
 
+    /**
+     * 挑一个「普通」配置用于复原（不是承载 0x2A 的那个）。
+     *
+     * 设备开机默认活动配置是 **id=3**（iPhoneMirror 日志里 `active_config=3`），
+     * 所以优先 3，其次 1、2，最后退而求其次选任意非采集配置。
+     */
+    fun normalConfiguration(dev: UsbDevice, captureId: Int): UsbConfiguration? {
+        val all = (0 until dev.configurationCount).mapNotNull { i ->
+            runCatching { dev.getConfiguration(i) }.getOrNull()
+        }
+        return all.firstOrNull { it.id == 3 && it.id != captureId }
+            ?: all.firstOrNull { it.id == 1 && it.id != captureId }
+            ?: all.firstOrNull { it.id != captureId }
+    }
+
     /** 按配置 id 取配置（找不到返回 null）。只返回描述符里真实存在的，绝不凭空构造。 */
     fun configurationById(dev: UsbDevice, id: Int): UsbConfiguration? {
         for (i in 0 until dev.configurationCount) {

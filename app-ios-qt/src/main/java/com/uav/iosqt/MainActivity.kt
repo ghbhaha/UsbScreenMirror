@@ -225,7 +225,20 @@ class MainActivity : Activity() {
             return null
         }
 
-        // 3) 已有采集接口就直接用；否则 activate 并等重枚举
+        // 3) ★ 若设备仍停在采集配置（上次会话的残留），**先复原再激活**。
+        //    这就是「每次都要重启 iPad」的根因：设备一直留在配置 5，activate 就成了空操作。
+        //    iPhoneMirror 每次收流结束都会做 usb_configuration_restore，所以它能反复开。
+        if (dev.configurationCount >= 5) {
+            // ★ 复用上次会话的关键：把配置从 5 切回 3，再切回 5 —— 设备侧的 QT 会话就重新武装了。
+            //   实测（14:30）这一步之后 PING 又来了两次，**完全不用重启 iPad**。
+            //   不用等重枚举：设备不会重枚举，配置来回一次就够（约 0.3s）。
+            log("设备停在采集配置（${dev.configurationCount} 个配置 = 上次会话残留）⇒ 配置 3→5 重新武装")
+            restoreToNormal(dev)
+            Thread.sleep(300)
+            log("  已切回普通配置，准备重新进入采集配置")
+        }
+
+        // 4) 没有采集接口就 activate 并等重枚举
         if (transport.findCaptureInterface(dev) == null) {
             val conn0 = transport.open(dev) ?: return null
             try {
@@ -366,12 +379,51 @@ class MainActivity : Activity() {
                     onFrame = { f -> decoder?.submit(f) }
                 ).run(maxSeconds = 30)
             } finally {
+                // ★ 收尾必须「还原配置」，否则设备留在配置 5，下次 activate 变空操作
+                //   —— 这正是「必须重启 iPad」的真正原因。
                 keepAlive.set(false)
                 runCatching { muxThread?.interrupt() }
+                runCatching { itfMux?.let { transport.release(connMux!!, it) } }
+                runCatching { transport.release(connQt, itf) }
+                runCatching {
+                    transport.normalConfiguration(dev, cfg.id)?.let { transport.setConfiguration(connQt, it) }
+                }
                 runCatching { connMux?.close() }
                 runCatching { connQt.close() }
+                log("收尾完成：配置已还回普通态，可直接再次开始（无需重启 iPad）")
             }
         }
+    }
+
+    /** 把设备从采集配置切回普通配置（收尾用）。 */
+    private fun restoreToNormal(dev: UsbDevice): Boolean {
+        val conn = transport.open(dev)
+        if (conn == null) {
+            log("  复原失败：openDevice 返回 null")
+            return false
+        }
+        return try {
+            val target = transport.normalConfiguration(dev, 5)
+            if (target == null) {
+                log("  复原失败：找不到普通配置")
+                false
+            } else {
+                transport.setConfiguration(conn, target)
+            }
+        } finally {
+            runCatching { conn.close() }
+        }
+    }
+
+    /** 轮询直到设备不再带采集配置（bNumConfigurations < 5）。 */
+    private fun waitForNormalConfig(maxSeconds: Int): UsbDevice? {
+        val deadline = System.currentTimeMillis() + maxSeconds * 1000L
+        while (System.currentTimeMillis() < deadline) {
+            val d = transport.findAppleDevice()
+            if (d != null && d.configurationCount < 5) return d
+            Thread.sleep(300)
+        }
+        return null
     }
 
     /** 轮询直到设备上出现 0xFF/0x2A 采集接口，返回新的 UsbDevice。 */
