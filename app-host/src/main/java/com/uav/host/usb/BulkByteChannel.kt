@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * 1. **读侧拼流**：`bulkTransfer` 是**包**语义，可能短读、可能返回 0/负值。
  *    本类在 [readPollWindowMs] 窗口内反复重试，凑到至少 1 字节就返回；
- *    窗口内无数据则返回 `0`（**非致命**），由 [com.uav.protocol.Transport] 决定后续重试或超时。
+ *    窗口内无数据则返回 `0`（**非致命**），由 [com.uav.protocol.aoa.Transport] 决定后续重试或超时。
  *    ⚠️ 这里绝不能把"0 字节完成"当成 EOF —— 那正是"投屏间歇性断流"的经典成因。
  *
  * 2. **写侧防 ZLP**：当一次写出的总长度恰为 `maxPacketSize` 整数倍时，

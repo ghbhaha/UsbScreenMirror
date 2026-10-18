@@ -4,7 +4,7 @@ import android.content.Context
 import android.util.AttributeSet
 import android.view.SurfaceView
 import android.view.View
-import com.uav.protocol.Scale
+import com.uav.protocol.media.Scale
 
 /**
  * 按视频宽高比自适应的 `SurfaceView`（计划 4.7）。
@@ -15,7 +15,7 @@ import com.uav.protocol.Scale
  * 1:1 像素映射（10.15）**不是靠这个视图**做到的，而是靠让**编码尺寸 = 这个视图的尺寸**：
  * 宿主把本视图的可用区（根视图尺寸）经 `OPEN` 的 `display_width/height` 告诉手机，
  * 手机按 `Scale.oneToOneMaxSize` 算出编码尺寸。所以这里的几何必须与
- * [com.uav.protocol.Scale.fitInside] 完全一致 —— 现在直接调用它。
+ * [com.uav.protocol.media.Scale.fitInside] 完全一致 —— 现在直接调用它。
  *
  * 尺寸权威来源是**流头**的 `width/height`（不是 SPS 解析结果）。
  */

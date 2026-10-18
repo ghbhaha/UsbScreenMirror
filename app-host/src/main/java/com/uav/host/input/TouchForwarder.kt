@@ -5,9 +5,9 @@ import com.uav.host.DebugTools
 import com.uav.host.input.HidTouchController
 import com.uav.host.video.AspectRatioSurfaceView
 import com.uav.protocol.Logger
-import com.uav.protocol.TouchMapper
-import com.uav.protocol.TouchPoint
 import com.uav.protocol.i
+import com.uav.protocol.input.TouchMapper
+import com.uav.protocol.input.TouchPoint
 import com.uav.protocol.w
 
 /**

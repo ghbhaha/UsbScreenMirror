@@ -4,8 +4,8 @@ import android.content.Context
 import com.uav.host.HostPrefs
 import com.uav.host.session.HostSession
 import com.uav.protocol.Logger
-import com.uav.protocol.Scale
 import com.uav.protocol.i
+import com.uav.protocol.media.Scale
 import kotlin.math.abs
 
 /**

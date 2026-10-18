@@ -24,14 +24,14 @@ import com.uav.accessory.session.AccessorySession
 import com.uav.accessory.usb.FdByteChannel
 import com.uav.accessory.video.VirtualDisplayEncoder
 import com.uav.protocol.ByteChannel
-import com.uav.protocol.CloseReason
-import com.uav.protocol.Flags
-import com.uav.protocol.ParsedOpen
-import com.uav.protocol.StreamHeader
-import com.uav.protocol.StreamId
-import com.uav.protocol.Transport
+import com.uav.protocol.aoa.CloseReason
+import com.uav.protocol.aoa.Flags
+import com.uav.protocol.aoa.StreamHeader
+import com.uav.protocol.aoa.StreamId
+import com.uav.protocol.aoa.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
+import com.uav.protocol.media.ParsedOpen
 import com.uav.protocol.w
 
 /** 手机端状态发布（Activity 轮询显示；无第三方依赖，够用即可）。 */
@@ -633,7 +633,7 @@ class CaptureService : Service(), AccessorySession.Listener, VirtualDisplayEncod
 
     override fun onConfig(payload: ByteArray) {
         // CONFIG 帧：宿主据此 configure 解码器（永不吞掉）
-        session?.sendFrame(com.uav.protocol.Flags.pack(0, config = true), payload)
+        session?.sendFrame(com.uav.protocol.aoa.Flags.pack(0, config = true), payload)
     }
 
     override fun onFrame(ptsAndFlags: Long, data: ByteArray) {

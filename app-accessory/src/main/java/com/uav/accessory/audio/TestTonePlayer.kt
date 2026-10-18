@@ -5,14 +5,14 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import com.uav.accessory.AndroidLogger
 import com.uav.accessory.DebugTools
-import com.uav.protocol.AudioSpec
 import com.uav.protocol.Logger
 import com.uav.protocol.e
 import com.uav.protocol.i
+import com.uav.protocol.media.AudioSpec
 import com.uav.protocol.w
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.sin
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 调试用测试音（计划 10.13）—— **探测模式**，只在 debug 包生效。

@@ -3,8 +3,8 @@ package com.uav.host.usb
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
-import com.uav.protocol.AccessoryIdentity
 import com.uav.protocol.Logger
+import com.uav.protocol.aoa.AccessoryIdentity
 import com.uav.protocol.e
 import com.uav.protocol.i
 import com.uav.protocol.w

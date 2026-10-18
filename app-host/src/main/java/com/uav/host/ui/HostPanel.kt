@@ -13,7 +13,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.uav.host.R
 import com.uav.host.video.AspectRatioSurfaceView
-import com.uav.protocol.HostUiState
+import com.uav.protocol.ui.HostUiState
 
 /**
  * 宿主面板的**纯 View 层**（10.24 分层重构，从 [com.uav.host.HostActivity] 抽出）。

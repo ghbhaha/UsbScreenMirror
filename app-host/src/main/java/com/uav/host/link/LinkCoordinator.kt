@@ -14,7 +14,7 @@ import com.uav.host.usb.UsbAttachRouter
 import com.uav.protocol.BufferedByteChannel
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
-import com.uav.protocol.Transport
+import com.uav.protocol.aoa.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
 import com.uav.protocol.w

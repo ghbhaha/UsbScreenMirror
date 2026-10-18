@@ -26,13 +26,13 @@ import com.uav.host.ui.HostPanel
 import com.uav.host.usb.BulkPair
 import com.uav.host.usb.UsbAttachRouter
 import com.uav.host.video.QualityController
-import com.uav.protocol.CloseReason
-import com.uav.protocol.HostUiState
-import com.uav.protocol.Protocol
-import com.uav.protocol.StreamHealth
-import com.uav.protocol.Transport
+import com.uav.protocol.aoa.CloseReason
+import com.uav.protocol.aoa.Protocol
+import com.uav.protocol.aoa.StreamHealth
+import com.uav.protocol.aoa.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
+import com.uav.protocol.ui.HostUiState
 import com.uav.protocol.w
 import java.io.File
 

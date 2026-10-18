@@ -7,9 +7,9 @@ import java.security.SecureRandom
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLEngineResult
-import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLException
 import javax.net.ssl.X509TrustManager
 

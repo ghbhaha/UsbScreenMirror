@@ -6,13 +6,13 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
 import com.uav.host.AndroidLogger
-import com.uav.protocol.AudioLevel
-import com.uav.protocol.AudioSpec
-import com.uav.protocol.Frame
 import com.uav.protocol.Logger
-import com.uav.protocol.StreamHeader
+import com.uav.protocol.aoa.Frame
+import com.uav.protocol.aoa.StreamHeader
 import com.uav.protocol.e
 import com.uav.protocol.i
+import com.uav.protocol.media.AudioLevel
+import com.uav.protocol.media.AudioSpec
 import com.uav.protocol.w
 import java.nio.ByteBuffer
 import java.util.Locale

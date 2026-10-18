@@ -1,22 +1,22 @@
 package com.uav.accessory.session
 
 import com.uav.accessory.AndroidLogger
-import com.uav.protocol.AdbMessage
 import com.uav.protocol.Bytes
-import com.uav.protocol.Command
-import com.uav.protocol.Connection
-import com.uav.protocol.ConnectionListener
-import com.uav.protocol.FrameCodec
 import com.uav.protocol.Logger
-import com.uav.protocol.Options
-import com.uav.protocol.ParsedOpen
-import com.uav.protocol.Protocol
-import com.uav.protocol.StreamHeader
-import com.uav.protocol.StreamId
-import com.uav.protocol.Transport
+import com.uav.protocol.adb.AdbMessage
+import com.uav.protocol.aoa.Command
+import com.uav.protocol.aoa.Connection
+import com.uav.protocol.aoa.ConnectionListener
+import com.uav.protocol.aoa.FrameCodec
+import com.uav.protocol.aoa.Protocol
+import com.uav.protocol.aoa.StreamHeader
+import com.uav.protocol.aoa.StreamId
+import com.uav.protocol.aoa.Transport
 import com.uav.protocol.d
 import com.uav.protocol.e
 import com.uav.protocol.i
+import com.uav.protocol.media.Options
+import com.uav.protocol.media.ParsedOpen
 import com.uav.protocol.w
 import java.util.concurrent.atomic.AtomicBoolean
 

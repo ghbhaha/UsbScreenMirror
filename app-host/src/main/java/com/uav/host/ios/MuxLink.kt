@@ -3,8 +3,8 @@ package com.uav.host.ios
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import com.uav.protocol.ios.Lockdown
-import com.uav.protocol.ios.PlistXml
 import com.uav.protocol.ios.PValue
+import com.uav.protocol.ios.PlistXml
 
 /**
  * usbmux + lockdownd 会话（跑在接口 `0xFF/0xFE/02` 上），可选升级 TLS。

@@ -25,7 +25,7 @@ interface ByteChannel : Closeable {
      * 读取至多 [len] 字节。
      *
      * @return 实际读到的字节数，`0..len`；**-1 表示 EOF / 对端关闭**。
-     *         允许返回 0（超时或 ZLP），这是**非致命**的，由 [Transport] 决定重试策略。
+     *         允许返回 0（超时或 ZLP），这是**非致命**的，由 [com.uav.protocol.aoa.Transport] 决定重试策略。
      */
     fun read(dst: ByteArray, off: Int, len: Int): Int
 

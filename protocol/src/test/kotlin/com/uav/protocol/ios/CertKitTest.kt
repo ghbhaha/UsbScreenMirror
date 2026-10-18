@@ -1,12 +1,12 @@
 package com.uav.protocol.ios
 
+import java.security.Signature
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.security.Signature
-import java.security.cert.CertificateFactory
-import java.security.cert.X509Certificate
 
 /**
  * 配对材料自检。

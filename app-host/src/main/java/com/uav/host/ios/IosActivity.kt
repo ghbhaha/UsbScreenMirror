@@ -1,7 +1,6 @@
 package com.uav.host.ios
 
 import android.app.Activity
-import com.uav.protocol.ios.QtPacket
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -11,7 +10,10 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.view.WindowManager
+import androidx.core.content.ContextCompat
+import com.uav.host.R
 import com.uav.host.ios.ui.IosPanel
+import com.uav.protocol.ios.QtPacket
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -19,8 +21,6 @@ import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import androidx.core.content.ContextCompat
-import com.uav.host.R
 
 /**
  * 最小宿主：一个按钮跑完「激活 → 等采集配置 → claim → 握手 → 收流」。

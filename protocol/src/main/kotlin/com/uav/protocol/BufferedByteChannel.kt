@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicLong
  * ## 解法
  *
  * 本类对外仍满足 [ByteChannel] 契约（短读 / 0 / -1），但对底层**永远整块读**：
- * 每次向 [delegate] 申请 [scratchSize] 字节（须 ≥ 端点包长，推荐 = [com.uav.protocol.Transport]
+ * 每次向 [delegate] 申请 [scratchSize] 字节（须 ≥ 端点包长，推荐 = [com.uav.protocol.aoa.Transport]
  * 上层用的 readChunkSize，即 16KB），一次到货多于上层要的，**多余字节留在内部残留缓冲**
  * 供下次 `read` 续上 —— 绝不能丢，否则字节流错位（表现会是"流头乱码/解码器配错"）。
  *

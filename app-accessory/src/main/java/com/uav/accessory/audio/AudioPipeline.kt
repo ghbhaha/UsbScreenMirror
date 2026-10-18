@@ -10,13 +10,13 @@ import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Process
 import com.uav.accessory.AndroidLogger
-import com.uav.protocol.AudioLevel
-import com.uav.protocol.AudioSpec
-import com.uav.protocol.Flags
 import com.uav.protocol.Logger
-import com.uav.protocol.StreamHeader
+import com.uav.protocol.aoa.Flags
+import com.uav.protocol.aoa.StreamHeader
 import com.uav.protocol.e
 import com.uav.protocol.i
+import com.uav.protocol.media.AudioLevel
+import com.uav.protocol.media.AudioSpec
 import com.uav.protocol.w
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean

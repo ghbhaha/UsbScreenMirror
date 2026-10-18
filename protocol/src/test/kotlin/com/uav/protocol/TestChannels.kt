@@ -1,5 +1,8 @@
 package com.uav.protocol
 
+import com.uav.protocol.adb.AdbMessage
+import com.uav.protocol.aoa.Command
+import com.uav.protocol.aoa.Transport
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock

@@ -1,11 +1,12 @@
 package com.uav.protocol
 
+import com.uav.protocol.aoa.Transport
+import java.io.IOException
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.IOException
 
 /**
  * [BufferedByteChannel] 单测 —— 守住"宿主 usercopy 内核 panic"（实施计划 10.16）的修复。

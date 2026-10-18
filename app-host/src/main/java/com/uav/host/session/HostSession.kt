@@ -5,27 +5,27 @@ import android.view.Surface
 import com.uav.host.AndroidLogger
 import com.uav.host.audio.AudioPlayer
 import com.uav.host.video.VideoDecoder
-import com.uav.protocol.AdbMessage
-import com.uav.protocol.AvSyncGate
 import com.uav.protocol.Bytes
-import com.uav.protocol.ClockOffset
-import com.uav.protocol.ClockSync
-import com.uav.protocol.Command
-import com.uav.protocol.Connection
-import com.uav.protocol.ConnectionListener
-import com.uav.protocol.Frame
-import com.uav.protocol.FrameQueue
-import com.uav.protocol.GopTailGate
-import com.uav.protocol.LatencyStats
 import com.uav.protocol.Logger
-import com.uav.protocol.Options
-import com.uav.protocol.Protocol
-import com.uav.protocol.Scale
-import com.uav.protocol.StreamId
-import com.uav.protocol.Transport
+import com.uav.protocol.adb.AdbMessage
+import com.uav.protocol.aoa.Command
+import com.uav.protocol.aoa.Connection
+import com.uav.protocol.aoa.ConnectionListener
+import com.uav.protocol.aoa.Frame
+import com.uav.protocol.aoa.FrameQueue
+import com.uav.protocol.aoa.GopTailGate
+import com.uav.protocol.aoa.Protocol
+import com.uav.protocol.aoa.StreamId
+import com.uav.protocol.aoa.Transport
 import com.uav.protocol.d
 import com.uav.protocol.e
 import com.uav.protocol.i
+import com.uav.protocol.media.AvSyncGate
+import com.uav.protocol.media.ClockOffset
+import com.uav.protocol.media.ClockSync
+import com.uav.protocol.media.LatencyStats
+import com.uav.protocol.media.Options
+import com.uav.protocol.media.Scale
 import com.uav.protocol.w
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
@@ -215,7 +215,7 @@ class HostSession(
     /**
      * 宿主侧的"等 IDR"门控（10.21）。
      *
-     * 与手机端的 [com.uav.protocol.GopTailGate] 同理，但作用点不同：手机端 arm 是为了
+     * 与手机端的 [com.uav.protocol.aoa.GopTailGate] 同理，但作用点不同：手机端 arm 是为了
      * **不推**缺 IDR 的 P 帧；这里 arm 是为了**即使手机端没配合**（老版本 App / RQID 丢失），
      * 也不把这些无主的 P 帧喂进刚建好的解码器 —— 喂进去轻则花屏，重则 `MediaCodec` 报错。
      *
@@ -232,7 +232,7 @@ class HostSession(
     /**
      * 手机在 `CNXN` 里上报的**屏幕尺寸**。
      *
-     * ★ 这是**触摸坐标**该用的空间：HID 触摸屏的逻辑上限（[com.uav.protocol.HidTouchPanel]）
+     * ★ 这是**触摸坐标**该用的空间：HID 触摸屏的逻辑上限（[com.uav.protocol.input.HidTouchPanel]）
      *   要按它来声明，而不是按编码后的视频尺寸（`max_size` 那个是缩放过的）。
      */
     val peerWidth: Int get() = phoneWidth

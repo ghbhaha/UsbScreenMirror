@@ -1,11 +1,11 @@
 package com.uav.host.debug
 
-import com.uav.protocol.Bytes
 import com.uav.protocol.ByteChannel
-import com.uav.protocol.Command
-import com.uav.protocol.Flags
+import com.uav.protocol.Bytes
 import com.uav.protocol.Logger
-import com.uav.protocol.StreamId
+import com.uav.protocol.aoa.Command
+import com.uav.protocol.aoa.Flags
+import com.uav.protocol.aoa.StreamId
 import com.uav.protocol.i
 import com.uav.protocol.w
 import java.io.File
@@ -20,7 +20,7 @@ import java.io.IOException
  *
  * 文件格式就是**原样的报文流**（24B 头 + payload，逐条拼接），
  * 也就是把 USB 上收到的字节直接落盘，不做任何封装 —— 这样回放路径与实时路径
- * 走的是同一套 [com.uav.protocol.AdbMessage] 解析代码，不存在"两套解析"的漂移风险。
+ * 走的是同一套 [com.uav.protocol.adb.AdbMessage] 解析代码，不存在"两套解析"的漂移风险。
  *
  * ## 为什么配速必须做在**这里**（真机实测教训）
  * 最初把配速放在宿主的消费线程上，结果完全无效：读线程是**磁盘速度**灌进深度为 4 的

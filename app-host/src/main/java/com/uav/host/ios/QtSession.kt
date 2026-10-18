@@ -1,9 +1,9 @@
 package com.uav.host.ios
 
 import android.hardware.usb.UsbDeviceConnection
-import com.uav.protocol.ios.QtPacket
-import com.uav.protocol.ios.AudioParser
 import android.hardware.usb.UsbEndpoint
+import com.uav.protocol.ios.AudioParser
+import com.uav.protocol.ios.QtPacket
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock

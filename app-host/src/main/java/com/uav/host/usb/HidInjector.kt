@@ -2,15 +2,15 @@ package com.uav.host.usb
 
 import android.hardware.usb.UsbDeviceConnection
 import com.uav.host.AndroidLogger
-import com.uav.protocol.AoaHid
 import com.uav.protocol.Logger
+import com.uav.protocol.aoa.AoaHid
 import com.uav.protocol.e
 import com.uav.protocol.i
 import com.uav.protocol.w
 
 /**
  * AOA **HID 注入**执行器（宿主侧；纯逻辑见 `:protocol` 的 [AoaHid] 与
- * `com.uav.protocol.HidTouchPanel`）。
+ * `com.uav.protocol.input.HidTouchPanel`）。
  *
  * ⚠️ 所有方法都是**阻塞**的，必须在 worker 线程调用（红线：USB 操作不放 UI 线程）。
  *

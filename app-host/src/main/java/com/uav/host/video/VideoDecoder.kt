@@ -4,8 +4,8 @@ import android.media.MediaCodec
 import android.media.MediaFormat
 import android.view.Surface
 import com.uav.host.AndroidLogger
-import com.uav.protocol.Frame
 import com.uav.protocol.Logger
+import com.uav.protocol.aoa.Frame
 import com.uav.protocol.e
 import com.uav.protocol.i
 import com.uav.protocol.w
@@ -292,8 +292,8 @@ class VideoDecoder(
          * 按 Annex-B 起始码切分 NAL。
          *
          * **只在整体注入 csd-0 失败时作为回退路径使用**，不是主路径。
-         * 真正的实现在 `:protocol` 的 [com.uav.protocol.AnnexB] —— 纯字节运算放那里才能被 JVM 单测覆盖。
+         * 真正的实现在 `:protocol` 的 [com.uav.protocol.media.AnnexB] —— 纯字节运算放那里才能被 JVM 单测覆盖。
          */
-        fun splitAnnexB(data: ByteArray): List<ByteArray> = com.uav.protocol.AnnexB.split(data)
+        fun splitAnnexB(data: ByteArray): List<ByteArray> = com.uav.protocol.media.AnnexB.split(data)
     }
 }
