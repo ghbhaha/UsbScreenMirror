@@ -24,7 +24,11 @@ internal class QtSession(
     private val epIn: UsbEndpoint,
     private val epOut: UsbEndpoint?,
     private val sink: OutputStream?,
-    private val log: (String) -> Unit
+    private val log: (String) -> Unit,
+    /** 收到 SPS/PPS（Annex-B）时回调：用于配置解码器 */
+    private val onCsd: ((ByteArray) -> Unit)? = null,
+    /** 收到一帧（Annex-B）时回调：用于送解码器 */
+    private val onFrame: ((ByteArray) -> Unit)? = null
 ) {
 
     data class Stats(
@@ -43,6 +47,7 @@ internal class QtSession(
     private var audioClock = 0L
     private var videoClock = 0L
     private var tail = ByteArray(0)
+    private var csdSent = false
 
     /** 持续收流，直到超时或收到 maxFrames 帧。返回统计。 */
     fun run(maxSeconds: Int, maxFrames: Int = Int.MAX_VALUE): Stats {
@@ -156,7 +161,16 @@ internal class QtSession(
             }
 
             QtPacket.matches(p, 0, "asyn") && p.size >= 16 -> {
-                if (QtPacket.matches(p, 12, "feed")) {
+                if (QtPacket.matches(p, 12, "sprp")) {
+                    st.other++
+                    val body = if (p.size > 16) p.copyOfRange(16, p.size) else ByteArray(0)
+                    log("ASYN sprp ${p.size}B hex=${body.joinToString(" ") { "%02x".format(it) }}")
+                    val csd = SampleParser.csd(body)
+                    if (csd != null) {
+                        log("★ 从 sprp 解出 SPS/PPS ${csd.size}B")
+                        onCsd?.invoke(csd)
+                    }
+                } else if (QtPacket.matches(p, 12, "feed")) {
                     st.feed++
                     st.feedBytes += p.size
                     sink?.let {
@@ -165,6 +179,22 @@ internal class QtSession(
                     }
                     if (st.feed <= 3 || st.feed % 60 == 0) {
                         log("FEED #${st.feed}  ${p.size} B")
+                    }
+                    // ★ SPS/PPS 不在 ASYN/sprp 里（那条只是 ObeyEmptyMediaMarkers 之类的键值），
+                    //   而是嵌在 **FEED 样本尾部的字典**里：
+                    //   `… 'datv' | 4B 长度 | 01 64 00 2a ff e1 00 10 <SPS16> 01 00 04 <PPS4>`
+                    //   ⇒ 每个 FEED 都试一次，拿到就不再试。
+                    if (!csdSent && onCsd != null) {
+                        val csd = SampleParser.csd(p)
+                        if (csd != null) {
+                            csdSent = true
+                            log("★ 从 FEED 尾部解出 SPS/PPS ${csd.size}B")
+                            onCsd.invoke(csd)
+                        }
+                    }
+                    if (onFrame != null) {
+                        val frame = SampleParser.frame(p)
+                        if (frame != null) onFrame.invoke(frame)
                     }
                     if (videoClock != 0L) write(QtPacket.need(videoClock))
                 } else {

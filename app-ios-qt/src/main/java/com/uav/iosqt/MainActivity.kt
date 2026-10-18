@@ -12,6 +12,9 @@ import android.os.Bundle
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
@@ -34,6 +37,12 @@ class MainActivity : Activity() {
     private lateinit var transport: QtTransport
     private lateinit var logView: TextView
     private lateinit var btn: Button
+    private lateinit var preview: SurfaceView
+
+    /** 预览用的 Surface；解码器要等它和 SPS/PPS 都就绪才能起 */
+    private var surface: Surface? = null
+    private var pendingCsd: ByteArray? = null
+    private var decoder: H264Decoder? = null
 
     private val running = AtomicBoolean(false)
     private var permissionLatch: CountDownLatch? = null
@@ -66,8 +75,31 @@ class MainActivity : Activity() {
         btn = Button(this).apply {
             text = "开始采集"
             setOnClickListener { if (!running.get()) start() }
+            // 长按 = 离线回放已录制的 feed.bin（验证解码/渲染链路，不依赖设备）
+            setOnLongClickListener { if (!running.get()) { replay(); true } else false }
+        }
+        preview = SurfaceView(this).apply {
+            holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(h: SurfaceHolder) {
+                    surface = h.surface
+                    log("预览 Surface 就绪")
+                    ensureDecoder()
+                }
+                override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
+                override fun surfaceDestroyed(h: SurfaceHolder) {
+                    surface = null
+                    decoder?.stop()
+                    decoder = null
+                }
+            })
         }
         root.addView(btn)
+        root.addView(
+            preview,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f
+            )
+        )
         root.addView(
             scroll,
             LinearLayout.LayoutParams(
@@ -84,11 +116,69 @@ class MainActivity : Activity() {
         )
         log("QuickTime USB 采集（Android）")
         log("用法：iPad 重启 → 解锁亮屏 → 插线 → 点「开始采集」")
+        log("（长按按钮 = 回放已录制的 feed.bin，用于离线验证解码）")
     }
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(permissionReceiver) }
         super.onDestroy()
+    }
+
+    /** 离线回放 filesDir/feed.bin：验证「解析 → 解码 → 上屏」整条链路。 */
+    private fun replay() {
+        running.set(true)
+        Thread({
+            val f = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
+            if (!f.exists() || f.length() < 1024) {
+                log("没有可回放的 feed.bin（先采一次）")
+                running.set(false); return@Thread
+            }
+            log("回放 ${f.absolutePath}（${f.length()} B）")
+            runCatching {
+                f.inputStream().buffered().use { ins ->
+                    var n = 0
+                    var sent = 0
+                    while (true) {
+                        val hdr = ByteArray(4)
+                        if (ins.read(hdr) != 4) break
+                        // 落盘时用的是 QtPacket.u32（**小端**），这里必须按小端读回
+                        val total = ((hdr[3].toInt() and 0xFF) shl 24) or ((hdr[2].toInt() and 0xFF) shl 16) or
+                            ((hdr[1].toInt() and 0xFF) shl 8) or (hdr[0].toInt() and 0xFF)
+                        if (total <= 0 || total > (8 shl 20)) break
+                        val payload = ByteArray(total)
+                        var off = 0
+                        while (off < total) {
+                            val r = ins.read(payload, off, total - off)
+                            if (r <= 0) break
+                            off += r
+                        }
+                        if (off < total) break
+                        n++
+                        if (pendingCsd == null) SampleParser.csd(payload)?.let {
+                            pendingCsd = it
+                            log("★ 回放中解出 SPS/PPS ${it.size}B")
+                            ensureDecoder()
+                        }
+                        SampleParser.frame(payload)?.let { fr ->
+                            decoder?.submit(fr)
+                            sent++
+                        }
+                        if (sent % 30 == 0) Thread.sleep(16)
+                        if (sent >= 600) break
+                    }
+                    log("回放结束：包 $n / 送解码 $sent")
+                }
+            }.onFailure { log("回放异常：${it.message}") }
+            running.set(false)
+        }, "replay").start()
+    }
+
+    /** Surface 与 SPS/PPS 都到位时启动解码器。 */
+    private fun ensureDecoder() {
+        val sf = surface ?: return
+        val csd = pendingCsd ?: return
+        if (decoder != null) return
+        decoder = H264Decoder(sf, ::log).also { it.start(csd) }
     }
 
     private fun log(msg: String) {
@@ -242,7 +332,14 @@ class MainActivity : Activity() {
         log("落盘：${outFile.absolutePath}")
         return outFile.outputStream().use { out ->
             try {
-                val st = QtSession(connQt, epIn, epOut, out, ::log).run(maxSeconds = 12)
+                val st = QtSession(
+                    connQt, epIn, epOut, out, ::log,
+                    onCsd = { csd ->
+                        pendingCsd = csd
+                        ensureDecoder()
+                    },
+                    onFrame = { f -> decoder?.submit(f) }
+                ).run(maxSeconds = 60)
                 if (st.ping > 0 || st.bytes > 0) return@use st
 
                 log("12s 内没有 PING ⇒ 用配置 4→5 重新武装一次")
@@ -263,7 +360,11 @@ class MainActivity : Activity() {
                     log("  重新武装后没有 bulk IN")
                     return@use st
                 }
-                QtSession(connQt, in2, out2, out, ::log).run(maxSeconds = 25)
+                QtSession(
+                    connQt, in2, out2, out, ::log,
+                    onCsd = { csd -> pendingCsd = csd; ensureDecoder() },
+                    onFrame = { f -> decoder?.submit(f) }
+                ).run(maxSeconds = 30)
             } finally {
                 keepAlive.set(false)
                 runCatching { muxThread?.interrupt() }
