@@ -31,7 +31,15 @@ internal class QtSession(
     /** 收到一帧（Annex-B）时回调：用于送解码器 */
     private val onFrame: ((ByteArray) -> Unit)? = null,
     /** 收到一包音频 PCM 时回调（裸 PCM + 该帧在 fdsc 里声明的真实格式） */
-    private val onAudio: ((ByteArray, AudioParser.Format) -> Unit)? = null
+    private val onAudio: ((ByteArray, AudioParser.Format) -> Unit)? = null,
+    /**
+     * 是否向设备声明"本机有音频接收能力"（`ASYN/HPA1`）。
+     *
+     * ⚠️ **默认关闭**，这是真机踩出来的：发了 HPA1 之后，iPad 会把音频输出路由到 USB，
+     * 但本端收不到 EAT 帧，结果就是 **iPad 上点播放立刻暂停**（播放器在等一个永远不来的声道）。
+     * 在没有把握真正消费掉音频之前，宁可不要音频，也不能让设备放不出声。
+     */
+    private val requestAudio: Boolean = false
 ) {
 
     data class Stats(
@@ -180,8 +188,12 @@ internal class QtSession(
                             write(QtPacket.hpd1())
                         }
                         write(QtPacket.clockReply(corr, audioClock + 0x1000))
-                        write(QtPacket.hpa1(audioClock))
-                        log("CWPA audio=$audioClock → ${if (hpd1Sent) "HPD1×2+" else ""}clock+HPA1")
+                        if (requestAudio) {
+                            write(QtPacket.hpa1(audioClock))
+                            log("CWPA audio=$audioClock → clock+HPA1（已声明音频）")
+                        } else {
+                            log("CWPA audio=$audioClock → clock（未声明音频，避免 iPad 播放被掐）")
+                        }
                     }
 
                     QtPacket.matches(p, 12, "cvrp") && p.size >= 32 -> {
