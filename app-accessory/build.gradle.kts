@@ -14,6 +14,14 @@ val ksKeyPass = providers.gradleProperty("usbscreen.release.keyPassword").orNull
 val hasReleaseKey = ksPath != null && ksPass != null && ksAlias != null &&
     ksKeyPass != null && file(ksPath).exists()
 
+// ---- 应用版本 ----
+// ⚠️ 只改根目录 gradle.properties 的 `usbscreen.versionName` / `usbscreen.versionCode`：
+//    :app-host 与 :app-accessory 读的是同一处，避免两端版本号对不上。
+val appVersionName = providers.gradleProperty("usbscreen.versionName").orNull
+    ?: error("缺少 usbscreen.versionName —— 检查根目录 gradle.properties")
+val appVersionCode = providers.gradleProperty("usbscreen.versionCode").orNull?.toIntOrNull()
+    ?: error("缺少或非法的 usbscreen.versionCode —— 检查根目录 gradle.properties")
+
 android {
     namespace = "com.uav.accessory"
     compileSdk = 36
@@ -24,8 +32,8 @@ android {
         applicationId = "com.uav.accessory"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
     }
 
     compileOptions {

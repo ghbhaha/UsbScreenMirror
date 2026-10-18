@@ -154,8 +154,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 只在推 v* 标签时创建 Release。
-      # ⚠️ 附的是 **debug 签名** 的包：仓库里的 release 构建未签名，直接 adb install 会失败。
+      # 只在推 v* 标签时创建 Release（注意是 `v` 开头，`0.1.0` 这种纯版本号不会触发）。
+      # 配了签名 secret 时 release 包才会出现；debug 与 release 用同一张证书，两者可互换。
       - name: 发布 Release（仅 tag）
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
