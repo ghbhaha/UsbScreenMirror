@@ -46,8 +46,9 @@ class MainActivity : Activity() {
      * 所以只在排查音频时临时置 true，验证完必须改回 false。
      *
      * 本次置 true 是为验证「HPD1 恢复成每个 CWPA 都发」后音频是否出现，验完按结果决定去留。
-     * 结果（2026-10-18 17:03，iPad 正在放音频）：两个 CWPA 都回了 HPD1×2+clock+HPA1、AFMT 也回了，
-     * **仍然零 EAT** ⇒ 本机组合下设备就是不推 QT 音频帧。已改回 false。
+     * 结果（2026-10-18 17:03 与 17:15，两次都在 iPad 正放音频时测）：HPD1×2+clock+HPA1 与
+     * AFMT 应答全齐、写路径也已改成独立线程（读路径不再被写阻塞），**仍然零 EAT**
+     * ⇒ 本机这台 iPad8,9 / iOS 27.2 就是不推 QT 音频帧。已改回 false。
      */
     private val requestAudio = false
 

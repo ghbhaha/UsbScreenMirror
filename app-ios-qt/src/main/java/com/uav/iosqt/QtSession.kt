@@ -4,6 +4,8 @@ import android.hardware.usb.UsbDeviceConnection
 import com.uav.protocol.ios.AudioParser
 import android.hardware.usb.UsbEndpoint
 import java.io.OutputStream
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * QuickTime 会话状态机 + 收流。
@@ -69,6 +71,24 @@ internal class QtSession(
     @Volatile
     var stopRequested = false
 
+    // ── 写路径：接收线程只入队，绝不等待 ────────────────────────────────────────
+    // 参考实现（iPhoneMirror CaptureSession.cpp）的注释说得很直白：这是 USB 接收线程，
+    // 绝不能在这里等——哪怕 20ms 的等待都会让 NEED/clock 应答变慢，某些 iOS 版本
+    // 会因此直接结束 QuickTime 流。我们原来是同步写，一次 bulkTransfer 最多阻塞 1000ms。
+    private val writeLock = ReentrantLock()
+    private val writeCond = writeLock.newCondition()
+    private val writeQueue = ArrayDeque<ByteArray>()
+    private val writeQueueCap = 256
+    @Volatile
+    private var writerStop = false
+    private var writerThread: Thread? = null
+
+    /** 诊断：写队列满而丢弃的包数 / 单次写最长阻塞时间 */
+    private var writeDropped = 0
+    private var writeFailures = 0
+    @Volatile
+    private var writeMaxBlockMs = 0L
+
     /**
      * 持续收流。
      *
@@ -79,6 +99,20 @@ internal class QtSession(
      *                         的决定权交回上层；`<= 0` = 不提前放弃
      */
     fun run(
+        maxSeconds: Int,
+        maxFrames: Int = Int.MAX_VALUE,
+        idleAbortSeconds: Int = 0
+    ): Stats {
+        // 写线程与读循环同生共死：任何一条返回路径（含异常）都要收掉它
+        startWriter()
+        try {
+            return runInner(maxSeconds, maxFrames, idleAbortSeconds)
+        } finally {
+            stopWriter()
+        }
+    }
+
+    private fun runInner(
         maxSeconds: Int,
         maxFrames: Int = Int.MAX_VALUE,
         idleAbortSeconds: Int = 0
@@ -298,14 +332,81 @@ internal class QtSession(
         }
     }
 
+    /**
+     * 把一包数据交给写线程 —— **本函数不会阻塞**。
+     *
+     * 调用点全在接收线程里（PING/CWPA/CVRP/FEED…），同步写会让读侧跟着停。
+     */
     private fun write(data: ByteArray) {
-        val ep = epOut ?: return
-        val w = conn.bulkTransfer(ep, data, data.size, 1000)
-        // 写不出去必须报出来：视频的 NEED 每帧都写，一旦 OUT 拥塞，
-        // 排在后面的 HPA1/clock_reply 会静默丢掉 —— 表现就是"设备收不到我们的音频应答"。
-        if (w != data.size) {
-            log("✗ 写失败 ${QtPacket.fccString(data, 4)} 期望 ${data.size}B 实际 $w" +
-                if (w < 0) "（端点可能已 STALL）" else "")
+        if (epOut == null) return
+        writeLock.lock()
+        try {
+            // 队列满说明 OUT 已经跟不上：丢最老的（NEED 可以重发，时钟应答也会重来），
+            // 保住最新的一包，别让新应答排在几百个旧包后面。
+            if (writeQueue.size >= writeQueueCap) {
+                writeQueue.removeFirst()
+                writeDropped++
+            }
+            writeQueue.addLast(data)
+            writeCond.signalAll()
+        } finally {
+            writeLock.unlock()
         }
+    }
+
+    private fun startWriter() {
+        val ep = epOut ?: return
+        writerStop = false
+        writerThread = Thread({
+            while (true) {
+                var item: ByteArray? = null
+                writeLock.lock()
+                try {
+                    while (writeQueue.isEmpty() && !writerStop) {
+                        writeCond.await(200, TimeUnit.MILLISECONDS)
+                    }
+                    if (writeQueue.isNotEmpty()) item = writeQueue.removeFirst()
+                } catch (_: InterruptedException) {
+                    // 收尾时被打断：按停止处理
+                } finally {
+                    writeLock.unlock()
+                }
+                if (item == null) {
+                    if (writerStop) break else continue
+                }
+                val t0 = System.currentTimeMillis()
+                val w = conn.bulkTransfer(ep, item, item.size, 1000)
+                val dt = System.currentTimeMillis() - t0
+                if (dt > writeMaxBlockMs) writeMaxBlockMs = dt
+                if (w != item.size) {
+                    writeFailures++
+                    if (writeFailures <= 5) {
+                        log("✗ 写失败 ${QtPacket.fccString(item, 4)} 期望 ${item.size}B 实际 $w" +
+                            if (w < 0) "（端点可能已 STALL）" else "")
+                    }
+                }
+            }
+        }, "qt-writer").apply { start() }
+    }
+
+    private fun stopWriter() {
+        if (writerThread == null) return
+        writeLock.lock()
+        try {
+            writerStop = true
+            writeCond.signalAll()
+        } finally {
+            writeLock.unlock()
+        }
+        writerThread?.join(2000)
+        writerThread = null
+        val left = writeLock.withLockCount()
+        log("写线程收尾：最长单次阻塞 ${writeMaxBlockMs}ms / 丢弃 $writeDropped / " +
+            "失败 $writeFailures / 残余队列 $left")
+    }
+
+    private fun ReentrantLock.withLockCount(): Int {
+        lock()
+        return try { writeQueue.size } finally { unlock() }
     }
 }
