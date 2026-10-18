@@ -2,6 +2,7 @@ package com.uav.host.ios
 
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
+import com.uav.protocol.Bytes
 import com.uav.protocol.ios.Lockdown
 import com.uav.protocol.ios.PValue
 import com.uav.protocol.ios.PlistXml
@@ -104,22 +105,6 @@ internal class MuxLink(
 
     // ---------- 字节工具（大端） ----------
 
-    private fun be32(b: ByteArray, off: Int, v: Int) {
-        b[off] = (v ushr 24).toByte(); b[off + 1] = (v ushr 16).toByte()
-        b[off + 2] = (v ushr 8).toByte(); b[off + 3] = v.toByte()
-    }
-
-    private fun be16(b: ByteArray, off: Int, v: Int) {
-        b[off] = (v ushr 8).toByte(); b[off + 1] = v.toByte()
-    }
-
-    private fun u32be(b: ByteArray, off: Int): Int =
-        ((b[off].toInt() and 0xFF) shl 24) or ((b[off + 1].toInt() and 0xFF) shl 16) or
-            ((b[off + 2].toInt() and 0xFF) shl 8) or (b[off + 3].toInt() and 0xFF)
-
-    private fun u16be(b: ByteArray, off: Int): Int =
-        ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
-
     private fun hex(b: ByteArray, n: Int): String =
         b.copyOfRange(0, minOf(n, b.size)).joinToString(" ") { "%02x".format(it) }
 
@@ -132,19 +117,19 @@ internal class MuxLink(
         th[1] = 1                                                    // sport=1
         th[2] = (LOCKDOWN_PORT shr 8).toByte()
         th[3] = (LOCKDOWN_PORT and 0xFF).toByte()                    // dport=62078
-        be32(th, 4, connTx)
-        be32(th, 8, connAck)
+        Bytes.putIntBE(th, 4, connTx)
+        Bytes.putIntBE(th, 8, connAck)
         th[12] = (5 shl 4).toByte()                                  // data offset=5 ⇒ 0x50
         th[13] = flags.toByte()
-        be16(th, 14, 512)
+        Bytes.putShortBE(th, 14, 512)
 
         val total = 16 + th.size + payload.size
         val pkt = ByteArray(total)
-        be32(pkt, 0, PROTO_TCP)
-        be32(pkt, 4, total)
-        be32(pkt, 8, MAGIC)
-        be16(pkt, 12, devTx)
-        be16(pkt, 14, devRx)
+        Bytes.putIntBE(pkt, 0, PROTO_TCP)
+        Bytes.putIntBE(pkt, 4, total)
+        Bytes.putIntBE(pkt, 8, MAGIC)
+        Bytes.putShortBE(pkt, 12, devTx)
+        Bytes.putShortBE(pkt, 14, devRx)
         devTx = (devTx + 1) and 0xFFFF
         th.copyInto(pkt, 16)
         payload.copyInto(pkt, 36)
@@ -157,7 +142,7 @@ internal class MuxLink(
     /** 发一条 lockdownd 请求：加密后走 TLS，否则明文 `[u32 BE 长度][plist]`。 */
     private fun sendLockdown(plist: ByteArray) {
         val framed = ByteArray(4 + plist.size)
-        be32(framed, 0, plist.size)
+        Bytes.putIntBE(framed, 0, plist.size)
         plist.copyInto(framed, 4)
         val t = tls
         if (t == null) {
@@ -179,9 +164,9 @@ internal class MuxLink(
     fun openRaw(): Boolean {
         // --- A) VERSION（8B 头 + major/minor/padding） ---
         val ver = ByteArray(20)
-        be32(ver, 0, PROTO_VERSION)
-        be32(ver, 4, 20)
-        be32(ver, 8, 2)
+        Bytes.putIntBE(ver, 0, PROTO_VERSION)
+        Bytes.putIntBE(ver, 4, 20)
+        Bytes.putIntBE(ver, 8, 2)
         val wv = conn.bulkTransfer(epOut, ver, ver.size, 1000)
         if (wv < 0) { failed = "VERSION 写入失败（$wv）"; return false }
 
@@ -192,21 +177,21 @@ internal class MuxLink(
             if (n > 0) pre += readBuf.copyOfRange(0, n)
         }
         if (pre.size < 20) { failed = "2s 内无有效 VERSION 回复（${pre.size}B）"; return false }
-        val hdr16 = pre.size >= 12 && u32be(pre, 8) == MAGIC
+        val hdr16 = pre.size >= 12 && Bytes.getIntBE(pre, 8) == MAGIC
         val off = if (hdr16) 16 else 8
-        val major = u32be(pre, off)
+        val major = Bytes.getIntBE(pre, off)
         log("← mux VERSION major=$major（${hex(pre, 32)}）")
         if (major !in 1..2) { failed = "设备 mux 版本 $major 不在 1..2"; return false }
-        val flen = u32be(pre, 4)
+        val flen = Bytes.getIntBE(pre, 4)
         if (pre.size > flen) acc = pre.copyOfRange(flen, pre.size)
 
         // --- B) SETUP ---
         val setup = ByteArray(17)
-        be32(setup, 0, PROTO_SETUP)
-        be32(setup, 4, 17)
-        be32(setup, 8, MAGIC)
-        be16(setup, 12, 0)
-        be16(setup, 14, 0xFFFF)
+        Bytes.putIntBE(setup, 0, PROTO_SETUP)
+        Bytes.putIntBE(setup, 4, 17)
+        Bytes.putIntBE(setup, 8, MAGIC)
+        Bytes.putShortBE(setup, 12, 0)
+        Bytes.putShortBE(setup, 14, 0xFFFF)
         setup[16] = 0x07
         devTx = 1
         conn.bulkTransfer(epOut, setup, setup.size, 1000)
@@ -323,7 +308,7 @@ internal class MuxLink(
         var handled = 0
         while (true) {
             if (acc.size < 16) break
-            val flen = u32be(acc, 4)
+            val flen = Bytes.getIntBE(acc, 4)
             if (flen < 16 || flen > 65536) {
                 log("  非法 mux 帧长 $flen，清空重同步")
                 acc = ByteArray(0)
@@ -332,8 +317,8 @@ internal class MuxLink(
             if (acc.size < flen) break
             val frame = acc.copyOfRange(0, flen)
             acc = acc.copyOfRange(flen, acc.size)
-            devRx = u16be(frame, 12)
-            when (u32be(frame, 0)) {
+            devRx = Bytes.getShortBE(frame, 12)
+            when (Bytes.getIntBE(frame, 0)) {
                 PROTO_CONTROL -> {
                     val p = if (frame.size > 16) frame.copyOfRange(16, frame.size) else ByteArray(0)
                     val code = if (p.isNotEmpty()) p[0].toInt() and 0xFF else -1
@@ -344,7 +329,7 @@ internal class MuxLink(
                 }
                 PROTO_TCP -> {
                     if (frame.size < 36) continue
-                    val sport = u16be(frame, 16)
+                    val sport = Bytes.getShortBE(frame, 16)
                     val flags = frame[29].toInt() and 0xFF
                     val payload = if (frame.size > 36) frame.copyOfRange(36, frame.size) else ByteArray(0)
                     if (sport != LOCKDOWN_PORT) continue
@@ -390,7 +375,7 @@ internal class MuxLink(
         var handled = 0
         while (true) {
             if (tunnel.size < 4) break
-            val mlen = u32be(tunnel, 0)
+            val mlen = Bytes.getIntBE(tunnel, 0)
             if (mlen <= 0 || mlen > 0x200000 || tunnel.size < 4 + mlen) break
             val msg = tunnel.copyOfRange(4, 4 + mlen)
             tunnel = tunnel.copyOfRange(4 + mlen, tunnel.size)

@@ -2,6 +2,7 @@ package com.uav.host.ios
 
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
+import com.uav.protocol.ios.SampleParser
 import com.uav.protocol.ios.AudioParser
 import com.uav.protocol.ios.QtPacket
 import java.io.OutputStream

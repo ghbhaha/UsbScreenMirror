@@ -1,5 +1,7 @@
 package com.uav.protocol.ios
 
+import com.uav.protocol.Bytes
+
 /**
  * QuickTime USB 报文的构造。
  *
@@ -133,15 +135,10 @@ object QtPacket {
 
     // ---- 解析辅助 ----
 
-    fun u32At(b: ByteArray, off: Int): Int =
-        (b[off].toInt() and 0xFF) or
-            ((b[off + 1].toInt() and 0xFF) shl 8) or
-            ((b[off + 2].toInt() and 0xFF) shl 16) or
-            ((b[off + 3].toInt() and 0xFF) shl 24)
+    /** ⚠️ QuickTime 报文的多字节字段是**小端**，别被 "u32" 这个名字骗了。 */
+    fun u32At(b: ByteArray, off: Int): Int = Bytes.getIntLE(b, off)
 
-    fun u64At(b: ByteArray, off: Int): Long =
-        (u32At(b, off).toLong() and 0xFFFFFFFFL) or
-            (u32At(b, off + 4).toLong() shl 32)
+    fun u64At(b: ByteArray, off: Int): Long = Bytes.getLongLE(b, off)
 
     /** 判断某个偏移处的 4 字节是否等于 fourcc（内部做反转）。 */
     fun matches(b: ByteArray, off: Int, name: String): Boolean {
