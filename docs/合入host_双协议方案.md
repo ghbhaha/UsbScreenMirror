@@ -197,3 +197,26 @@ app-ios-qt           已删除（"选择页 → iPad" 就是原来的调试入�
 ⚠️ 一个必须记住的行为细节：普通模式手机的 PID 是厂商自己的，分类器只能判成 IGNORE
 ⇒ ChooserActivity 里**退回合并前的老启发式**（有 bulk 端点对就当候选，交给 AOA 去试），
 否则"插线即达"会退化成"每次手点一下"。内建 HID 触摸屏/键鼠是中断端点，不会被误挑。
+
+## 十、合并后实测（2026-10-18 18:2x）
+
+**iPad 走完合并路径：通。** 同一个 APK，插 iPad8,9 → `ChooserActivity` 按 VID `0x05AC`
+判成 iOS 直达 `IosActivity` → 画面完整上屏、**音频出声**，与合并前 `app-ios-qt` 行为一致。
+
+这说明三件容易出岔子的事都没坏：
+
+1. **清单迁移**：`LAUNCHER` 与 `USB_DEVICE_ATTACHED` 过滤器从 `HostActivity` 摘到
+   `ChooserActivity` 后，attach 派发仍然只到一处，没有互相抢；
+2. **资源改名**：12 个 drawable 加 `ios_` 前缀、layout 里 `com.uav.host.video.AspectRatioSurfaceView`
+   的全限定名替换，运行时没有 `Resources$NotFoundException` / `ClassNotFoundException`；
+3. **写线程与解码器**：`QtSession` 的 `qt-writer` 单线程、`H264Decoder.restart(csd)` 在新 Activity
+   里照旧工作 —— 转屏后的解码器重建链路没被搬家打断。
+
+**还没验的（不能默认通过）：**
+
+- **AOA 路径的入口复验**：`HostActivity` 内部一行未改，但它在清单里不再是 LAUNCHER，
+  `ChooserActivity` 的 IGNORE 分支要靠 `BulkPair.hasBulkPair()` 兜底。这一条**只影响"插上手机
+  能不能自动进投屏页"**，不影响投屏本身，但必须实测一次才算证完 —— 记忆里的硬结论是
+  「删掉/搬走的代码不会自己报错」，清单搬家属于同一类。
+- 两台设备先后插拔时的分类（iPad 拔掉立刻插手机、反之）。
+
