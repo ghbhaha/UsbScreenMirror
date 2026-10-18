@@ -86,6 +86,11 @@ class ChooserActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refreshDetected()
+        // ★ 每次可见都对齐基线，不能只在 onCreate 建一次：
+        //   iPad 在 iOS 页里被拔插过会拿到**新的 deviceId**，若基线还停在进去之前的值，
+        //   一按返回键回到本页就会被判成"新插入"，立刻又被推回 iOS 页 —— 用户退不出来。
+        //   反过来也不破坏插线直达：本页可见期间插上的设备仍然不在基线里。
+        seenDeviceIds.addAll(usbDevices().map { it.deviceId })
         // ★ 前台轮询兜底：本机型（BOE P40UCH）的 USB host 栈在设备插入时**不派发**
         //   `USB_DEVICE_ATTACHED`，只派发 DETACHED（AOA 侧早就因此加了轮询，见
         //   `UsbAttachRouter.startForegroundPolling`）。合并后入口搬到这里，

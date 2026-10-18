@@ -4,6 +4,7 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import com.uav.protocol.ios.SampleParser
 import com.uav.protocol.ios.AudioParser
+import com.uav.protocol.ios.LinkLossGate
 import com.uav.protocol.ios.QtPacket
 import com.uav.protocol.ios.QtProtocolCore
 import com.uav.protocol.ios.QtStats
@@ -45,7 +46,15 @@ internal class QtSession(
      * 但本端收不到 EAT 帧，结果就是 **iPad 上点播放立刻暂停**（播放器在等一个永远不来的声道）。
      * 在没有把握真正消费掉音频之前，宁可不要音频，也不能让设备放不出声。
      */
-    private val requestAudio: Boolean = false
+    private val requestAudio: Boolean = false,
+    /**
+     * 设备**是否还在系统设备表里**（拔线检测的权威判据）。
+     *
+     * 读循环只能看到「端点返回 -1」，而 Android 对超时和端点错误都用 -1 表示，
+     * 靠耗时区分也只是启发式。真正能一锤定音的是 `UsbManager.deviceList` 里还有没有它。
+     * 不给（null）时退化成纯计数判据。
+     */
+    private val linkAlive: (() -> Boolean)? = null
 ) {
 
     private var tail = ByteArray(0)
@@ -53,6 +62,16 @@ internal class QtSession(
     /** 外部停止信号（点「停止投屏」时置位）。 */
     @Volatile
     var stopRequested = false
+
+    /**
+     * 非正常结束的原因（设备被拔 / 端点连续失效）；`null` = 正常停止或因 idle 提前返回。
+     *
+     * 上层用它决定 UI 文案：拔线是**用户的动作**（回空闲 + 提示插回），
+     * 端点坏了才是**错误**（红药丸）。两者混在一起会让"拔线"看起来像故障。
+     */
+    @Volatile
+    var abortReason: String? = null
+        private set
 
     // ── 写路径：接收线程只入队，绝不等待 ────────────────────────────────────────
     // 参考实现（iPhoneMirror CaptureSession.cpp）的注释说得很直白：这是 USB 接收线程，
@@ -87,6 +106,7 @@ internal class QtSession(
         idleAbortSeconds: Int = 0
     ): QtStats {
         // 写线程与读循环同生共死：任何一条返回路径（含异常）都要收掉它
+        abortReason = null
         startWriter()
         try {
             return runInner(maxSeconds, maxFrames, idleAbortSeconds)
@@ -99,8 +119,7 @@ internal class QtSession(
         maxSeconds: Int,
         maxFrames: Int = Int.MAX_VALUE,
         idleAbortSeconds: Int = 0
-    ): QtStats {
-        // ★ 读缓冲必须小：1 MiB 的 bulk IN 在 xHCI 上会排成一长串传输描述符，
+    ): QtStats {        // ★ 读缓冲必须小：1 MiB 的 bulk IN 在 xHCI 上会排成一长串传输描述符，
         //   而设备最先发的是 16B 的 PING（短包）——短包会让整串立即取消，
         //   取消 URB 正是会把设备端点弄坏的动作（本项目已踩过）。
         //   Windows 上 libusb0 没有这种语义，所以 1 MiB 在那边照样能跑。
@@ -145,6 +164,10 @@ internal class QtSession(
 
         var timeouts = 0
         var lastReport = start
+        var totalErrors = 0
+        var lastErrorLog = 0L
+        // 判据在 `:protocol`（阈值边界必须可单测，见 LinkLossGateTest）
+        val lossGate = LinkLossGate()
 
         while (!stopRequested && System.currentTimeMillis() < deadline) {
             val t0 = System.currentTimeMillis()
@@ -155,15 +178,45 @@ internal class QtSession(
                 // Android 的 bulkTransfer 对「超时」和「端点错误」都返回 -1，
                 // 只能用耗时区分：接近 timeout 的是超时，明显更短的是错误。
                 val isTimeout = dt >= 450
+                val now = System.currentTimeMillis()
+
                 if (isTimeout) {
                     timeouts++
+                    lossGate.onTimeout()
                 } else {
-                    log("读错误 n=$n（${dt}ms）")
+                    // ★★ 这里是「拔掉 iPad 后界面卡死」的现场：
+                    //    设备消失后 bulkTransfer 会以 ~0ms 返回 -1，若不加限流和出口，
+                    //    这个分支就变成 1ms 一次的死循环 —— 而且每次都 log() 一次，
+                    //    每条 log 都要在 UI 线程把上百行文本重新拼接 + fullScroll，
+                    //    几秒内就把主线程消息队列彻底淹掉 ⇒ 界面看起来完全卡死。
+                    totalErrors++
+                    val cause = lossGate.onFastFailure(
+                        // 只在失败时才查一次设备表（一次遍历，几微秒），
+                        // 拿到就足以区分"拔线"和"端点坏了"
+                        devicePresent = linkAlive?.invoke()
+                    )
+                    // 前 3 条如实打印，之后每 3 秒汇总一次（排障够用，且不会刷屏）
+                    if (totalErrors <= 3 || now - lastErrorLog >= 3000) {
+                        lastErrorLog = now
+                        log(
+                            "读错误 n=$n（${dt}ms，连续 ${lossGate.consecutiveErrors} 次" +
+                                " / 累计 $totalErrors 次）"
+                        )
+                    }
+                    if (cause != null) {
+                        abortReason = when (cause) {
+                            LinkLossGate.Cause.DEVICE_GONE ->
+                                "iPad 已从 USB 设备表消失（线被拔掉 / 设备断电）"
+                            LinkLossGate.Cause.ENDPOINT_DEAD ->
+                                "USB 端点连续 ${lossGate.consecutiveErrors} 次读失败（端点已失效）"
+                        }
+                        log("✗ 链路中断：$abortReason")
+                        return st
+                    }
                 }
-                val now = System.currentTimeMillis()
                 if (now - lastReport >= 3000) {
                     lastReport = now
-                    log("  …空闲 ${(now - start) / 1000}s：超时 $timeouts 次 / 已收 ${st.bytes} B")
+                    log("  …空闲 ${(now - start) / 1000}s：超时 $timeouts 次 / 错误 $totalErrors 次 / 已收 ${st.bytes} B")
                 }
                 // 开头一直没有数据 ⇒ 设备侧没武装，别在这里空等
                 if (st.bytes == 0L && now >= idleDeadline) {
@@ -172,6 +225,7 @@ internal class QtSession(
                 }
                 continue
             }
+            lossGate.onData()
             st.bytes += n
             var buf = tail + readBuf.copyOf(n)
             while (buf.size >= 4) {

@@ -175,31 +175,19 @@
                 android:textSize="11sp" />
         </LinearLayout>
 
-        <!-- 操作：竖排（图标在左、文字在右） -->
-        <Button
-            android:id="@+id/btn_start"
-            style="@style/IosTileRow"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:drawableStart="@drawable/ios_ic_play"
-            android:text="@string/ios_btn_start" />
+        <!--
+          操作：只留一个「重新唤醒」。
 
-        <Button
-            android:id="@+id/btn_pair"
-            style="@style/IosTileRow"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:drawableStart="@drawable/ios_ic_sync"
-            android:text="@string/ios_btn_pair" />
-
+          开始/停止与配对都已自动化（插上即配对、即投屏；拔线即停），
+          人工只需要一个兜底入口：设备侧 QT 没被武装、一个字节都不来时用它。
+          长按它可回放已录制的 feed.bin（离线验证"解析→解码→上屏"）。
+        -->
         <Button
             android:id="@+id/btn_rearm"
             style="@style/IosTileRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="12dp"
             android:drawableStart="@drawable/ios_ic_refresh"
             android:text="@string/ios_btn_rearm" />
 

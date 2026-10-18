@@ -9,8 +9,11 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowManager
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import com.uav.host.R
 import com.uav.host.ios.ui.IosPanel
 import com.uav.protocol.ios.QtStats
@@ -79,8 +82,26 @@ class IosActivity : Activity() {
     @Volatile
     private var activeSession: QtSession? = null
 
+    /**
+     * 收流期间 iPad 被拔掉过。
+     *
+     * 用来把「用户拔线」和「链路出错」区分开：前者回空闲态并提示插回，
+     * 后者才是红药丸。混成一种，用户会以为是自己把程序弄坏了。
+     */
+    private val deviceDetached = AtomicBoolean(false)
+
     private val running = AtomicBoolean(false)
     private var permissionLatch: CountDownLatch? = null
+
+    /** 自动开始用的前台轮询（见 [autoPoller]）。只在页面可见时跑。 */
+    private val handler = Handler(Looper.getMainLooper())
+
+    @Volatile
+    private var polling = false
+
+    /** 上一次见到的 Apple 设备 deviceId；-1 = 当前没有设备（拔掉即复位） */
+    @Volatile
+    private var lastSeenDeviceId = -1
 
     private val logFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
@@ -90,6 +111,27 @@ class IosActivity : Activity() {
             val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
             log("权限广播：granted=$granted")
             permissionLatch?.countDown()
+        }
+    }
+
+    /**
+     * 拔出广播：立刻打断读线程。
+     *
+     * 读循环自己也能发现（端点连续失败 + 设备从设备表消失），但那要等一次
+     * `bulkTransfer` 返回。广播会先到，用户感知更干净；
+     * 而且两条判据互相兜底 —— 广播在个别 ROM 上不派发时，读循环仍然能退出。
+     */
+    private val detachReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            if (intent?.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+            val dev = IntentCompat.getParcelableExtra(
+                intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java
+            )
+            // 不认识的厂商设备（U 盘、鼠标）不该打断我们的会话
+            if (dev != null && dev.vendorId != QtTransport.APPLE_VID) return
+            log("USB 拔出广播：${dev?.deviceName ?: "(未携带设备描述符)"}")
+            deviceDetached.set(true)
+            activeSession?.stopRequested = true
         }
     }
 
@@ -111,10 +153,9 @@ class IosActivity : Activity() {
                     pendingCsd = null
                 }
             },
-            onStart = { toggleStart() },
-            onStartLongClick = { if (!running.get()) { replay(); true } else false },
-            onPair = { if (!running.get()) pairDevice() },
-            onRearm = { if (!running.get()) rearm() }
+            onRearm = { if (!running.get()) rearm() },
+            // 长按「重新唤醒」= 回放上次录制的流（离线验证"解析→解码→上屏"）
+            onRearmLongClick = { if (!running.get()) { replay(); true } else false }
         )
         // 投屏期间别让屏幕自己熄掉（熄屏会连带把 Surface 收走）
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -129,16 +170,82 @@ class IosActivity : Activity() {
             IntentFilter(QtTransport.ACTION_USB_PERMISSION),
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        // 拔出广播：收流时拔线要立刻停下，不能等读循环自己发现
+        ContextCompat.registerReceiver(
+            this,
+            detachReceiver,
+            IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
 
-        log("QuickTime USB 采集（Android）")
+        log("QuickTime USB 采集（Android）—— 插上 iPad 即自动配对并投屏，拔线即停")
         refreshDeviceInfo(state = "空闲")
-        if (!Pairing.hasRecord(filesDir)) {
-            panel.render(IosPanel.Stage.UNPAIRED, getString(R.string.ios_detail_pair_hint))
-            log("配对记录：无 ⇒ 首次请先点「配对」，在 iPad 上点一次「信任」")
-        } else {
-            panel.render(IosPanel.Stage.IDLE, null)
+        panel.render(IosPanel.Stage.IDLE, null)
+        if (Pairing.hasRecord(filesDir)) {
             log("配对记录：已有（${Pairing.loadRecord(filesDir)?.hostId ?: "读取失败"}）")
+        } else {
+            log("配对记录：无 ⇒ 首次会自动发起配对，请留意 iPad 上的「信任」弹窗")
         }
+    }
+
+    /**
+     * 插上就自动开跑。
+     *
+     * 为什么用轮询而不是等广播：**本机（P40UCH）插入时根本不派发 `USB_DEVICE_ATTACHED`**
+     * （只发 DETACHED，这是已记录在案的机型缺陷）。合并前 AOA 侧的"插线即达"一直靠
+     * `UsbAttachRouter` 的前台轮询，iOS 这边照同样的办法补上。
+     *
+     * 只认 **deviceId 基线之外的新设备**：拔掉时把基线复位成 -1，
+     * 于是"拔了再插"能再次触发，而同一次插入不会因为失败而无限重试
+     * （重试手段是拔插一次，或点「重新唤醒」）。
+     */
+    private val autoPoller = object : Runnable {
+        override fun run() {
+            if (!polling) return
+            val dev = transport.findAppleDevice()
+            if (dev == null) {
+                // 设备消失 ⇒ 复位基线，这样再插回来一定会重新触发
+                lastSeenDeviceId = -1
+            } else if (!running.get() && dev.deviceId != lastSeenDeviceId) {
+                lastSeenDeviceId = dev.deviceId
+                log("检测到 iPad（deviceId=${dev.deviceId}）⇒ 自动开始")
+                autoRun()
+            }
+            handler.postDelayed(this, POLL_MS)
+        }
+    }
+
+    /**
+     * 全自动流程：**配对（如需要）→ 投屏**。
+     *
+     * 没有「开始」按钮了，所以进度与失败原因全靠主行/副行 + 日志说清楚。
+     * `running` 用 `compareAndSet` 防重入（轮询与「重新唤醒」可能撞在一起）。
+     */
+    private fun autoRun() {
+        if (!running.compareAndSet(false, true)) return
+        stopRequested = false
+        deviceDetached.set(false)
+        firstFrameDone.set(false)
+        panel.setMirroring(true)
+        panel.render(IosPanel.Stage.CONNECTING, null)
+        refreshDeviceInfo(state = "启动中")
+
+        Thread({
+            var stats: QtStats? = null
+            runCatching {
+                // ① 没有配对记录 ⇒ 先配对（iPad 上点一次「信任」）
+                if (!Pairing.hasRecord(filesDir)) {
+                    panel.render(IosPanel.Stage.PAIRING, getString(R.string.ios_detail_pair_hint))
+                    if (!pairNow()) {
+                        log("配对未完成，本次不投屏 —— 拔插一次或点「重新唤醒」可再试")
+                        return@runCatching
+                    }
+                }
+                // ② 投屏：激活 / 切配置 / 建 lockdown / claim QT / 收流，全在 capture 里
+                stats = capture()
+            }.onFailure { log("自动流程异常：${it.javaClass.simpleName}: ${it.message}") }
+            finishRun(stats)
+        }, "ios-auto").start()
     }
 
     /**
@@ -164,8 +271,29 @@ class IosActivity : Activity() {
         panel.setDeviceInfo(sb.toString())
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 页面可见时才开始"插上即投"的轮询：后台跑它没有意义，还会误触发
+        polling = true
+        handler.removeCallbacks(autoPoller)
+        handler.post(autoPoller)
+    }
+
+    override fun onPause() {
+        polling = false
+        handler.removeCallbacks(autoPoller)
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        polling = false
+        handler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(permissionReceiver) }
+        runCatching { unregisterReceiver(detachReceiver) }
+        // ★ Activity 销毁时必须让读线程自己停下来：它正在跑一个无限循环，
+        //   而且每轮都可能往已经销毁的 Activity 上 post UI 任务。
+        activeSession?.stopRequested = true
+        stopRequested = true
         super.onDestroy()
     }
 
@@ -241,31 +369,12 @@ class IosActivity : Activity() {
     private fun log(msg: String) {
         // 同时打到 logcat：UI 文本要 uiautomator dump 才读得到，logcat 一条命令就能跟
         android.util.Log.i("UAV-IosQt", msg)
+        // ★ UI 日志只留"能讲故事"的行。
+        //   SKEW 应答每秒 4 条、FEED/渲染计数每秒数条 —— 面板只有 50 条缓冲，
+        //   几秒就被它们冲干净，真正要看的握手/错误/中断反而被挤没了。
+        //   这些高频计数在 logcat 里一条不少，需要逐包对账时看那边。
+        if (msg.startsWith("SKEW") || msg.startsWith("FEED #") || msg.startsWith("渲染 ")) return
         panel.log("${logFmt.format(Date())}  $msg")
-    }
-
-    /**
-     * 开始 / 停止投屏（同一个按钮）。
-     *
-     * 投屏是**持续**的：`QtSession.run(maxSeconds = 0)` 一直读到用户点停止。
-     * 停止走的是置位 [QtSession.stopRequested]，读循环在 500ms 的 bulkTransfer 超时后就会退出，
-     * 所以点下去是秒停，不需要强杀线程。
-     */
-    private fun toggleStart() {
-        if (running.get()) {
-            stopRequested = true
-            activeSession?.stopRequested = true
-            log("正在停止投屏…")
-            panel.render(IosPanel.Stage.MIRRORING, "正在停止…")
-            return
-        }
-        stopRequested = false
-        running.set(true)
-        firstFrameDone.set(false)
-        panel.setMirroring(true)
-        panel.render(IosPanel.Stage.CONNECTING, null)
-        refreshDeviceInfo(state = "启动中")
-        Thread({ runCapture() }, "ios-qt").start()
     }
 
     /**
@@ -273,49 +382,54 @@ class IosActivity : Activity() {
      *
      * 这是「不依赖 PC 导凭证」的那一步：配对记录会存进 `filesDir/ios_pair.properties`，
      * 之后 [Identity.load] 优先用它。配对必须在**普通配置**下做，所以这里不 activate。
+     *
+     * **同步版本**：自动流程要按「配对 → 投屏」的顺序串起来，所以这里不再自己开线程，
+     * 由 [autoRun] 的 `ios-auto` 线程调用。返回 true 才继续投屏。
      */
-    private fun pairDevice() {
-        running.set(true)
-        panel.setBusy(true)
-        panel.render(IosPanel.Stage.PAIRING, getString(R.string.ios_detail_pair_hint))
-        Thread({
-            runCatching {
-                val dev = transport.findAppleDevice()
-                if (dev == null) {
-                    log("未找到 Apple 设备（VID 05ac）。请先插线。")
-                    return@Thread
-                }
-                log("配对目标：${dev.deviceName} pid=0x${dev.productId.toString(16)}")
-                if (!ensurePermission(dev)) {
-                    log("未取得 USB 权限，中止")
-                    return@Thread
-                }
-                transport.dumpConfigs(dev)
+    private fun pairNow(): Boolean {
+        val dev = transport.findAppleDevice()
+        if (dev == null) {
+            log("未找到 Apple 设备（VID 05ac），请先插线")
+            return false
+        }
+        log("配对目标：${dev.deviceName} pid=0x${dev.productId.toString(16)}")
+        if (!ensurePermission(dev)) {
+            log("未取得 USB 权限，中止")
+            return false
+        }
+        transport.dumpConfigs(dev)
 
-                val pairing = Pairing(transport, filesDir, ::log)
-                // 上一轮若留在采集配置，先还原到普通态再配对
-                if (dev.configurationCount >= 5) {
-                    log("设备停在采集配置 ⇒ 先还原到普通配置")
-                    restoreToNormal(dev)
-                    Thread.sleep(400)
-                    transport.findAppleDevice()?.let { dev2 ->
-                        if (!ensurePermission(dev2)) { log("还原后未取得权限"); return@Thread }
-                        if (pairing.run(dev2) == null) { log("配对未完成"); return@Thread }
-                    } ?: run { log("还原后设备消失"); return@Thread }
-                } else if (pairing.run(dev) == null) {
-                    log("配对未完成")
-                    return@Thread
-                }
+        val pairing = Pairing(transport, filesDir, ::log)
+        // 上一轮若留在采集配置，先还原到普通态再配对
+        if (dev.configurationCount >= 5) {
+            log("设备停在采集配置 ⇒ 先还原到普通配置")
+            restoreToNormal(dev)
+            Thread.sleep(400)
+            val dev2 = transport.findAppleDevice()
+            if (dev2 == null) {
+                log("还原后设备消失")
+                return false
+            }
+            if (!ensurePermission(dev2)) {
+                log("还原后未取得权限")
+                return false
+            }
+            if (pairing.run(dev2) == null) {
+                log("配对未完成")
+                return false
+            }
+        } else if (pairing.run(dev) == null) {
+            log("配对未完成")
+            return false
+        }
 
-                // 配对成功后立刻自证一次：StartSession → TLS → GetValue
-                Pairing.loadRecord(filesDir)?.let { rec ->
-                    log("自检：用刚配好的身份走一次 StartSession + TLS…")
-                    verifyTrust(rec.hostId)
-                }
-            }.onFailure { log("配对异常：${it.javaClass.simpleName}: ${it.message}") }
-            running.set(false)
-            panel.setBusy(false); refreshDeviceInfo(state = "空闲")
-        }, "ios-pair").start()
+        // 配对成功后立刻自证一次：StartSession → TLS → GetValue
+        val rec = Pairing.loadRecord(filesDir)
+        if (rec != null) {
+            log("自检：用刚配好的身份走一次 StartSession + TLS…")
+            verifyTrust(rec.hostId)
+        }
+        return Pairing.hasRecord(filesDir)
     }
 
     /**
@@ -423,19 +537,46 @@ class IosActivity : Activity() {
         }.onFailure { log("自检异常：${it.message}") }
     }
 
-    private fun runCapture() {
-        val stats = runCatching { capture() }.getOrElse { t ->
-            log("异常：${t.javaClass.simpleName}: ${t.message}")
-            null
-        }
+    /**
+     * 一次「配对 + 投屏」跑完后的统一收尾（成功、失败、被拔线都走这里）。
+     *
+     * 之所以收在这里而不是散在 [autoRun] 里：**收尾顺序有依赖** ——
+     * 必须先取 `abortReason` 再清 `activeSession`，必须先停解码器再改状态文案，
+     * 否则「为什么停了」这条信息就丢了。
+     */
+    private fun finishRun(stats: QtStats?) {
+        // 会话给出的中断原因要在清引用之前取出来
+        val lostReason = activeSession?.abortReason
+        val detached = deviceDetached.get()
+
         running.set(false)
         activeSession = null
+        // ★ 解码器停在最后一帧会让人以为"界面卡死了"：主动收掉，把画面让回黑底。
+        //   下次开始时 QtSession 会重新收到 csd，`onCsdArrived` 会自己重建解码器。
+        runCatching { decoder?.stop() }
+        decoder = null
+        pendingCsd = null
+
         panel.setMirroring(false)
+        panel.setBusy(false)
         refreshDeviceInfo(state = "空闲")
-        panel.render(
-            IosPanel.Stage.IDLE,
-            if (stats == null) getString(R.string.ios_status_error) else null
-        )
+
+        val devicePresent = transport.findAppleDevice() != null
+        when {
+            // 拔线是**用户的动作**，不是故障：回空闲态、自动展开面板把话说清楚。
+            // 投屏期间面板是收起的，若不展开，用户只会看到画面冻住 + 没有任何入口，
+            // 那才是真正的"看起来卡死"。
+            detached || lostReason != null -> {
+                log("=== 已中断：${lostReason ?: "iPad 被拔掉"} ===")
+                panel.render(IosPanel.Stage.IDLE, getString(R.string.ios_detail_link_lost))
+                panel.setMenuVisible(true)
+            }
+            stats == null -> panel.render(
+                if (devicePresent) IosPanel.Stage.ERROR else IosPanel.Stage.IDLE,
+                if (devicePresent) null else getString(R.string.ios_detail_no_device)
+            )
+            else -> panel.render(IosPanel.Stage.IDLE, null)
+        }
         if (stats != null) {
             log("=== 结束：PING ${stats.ping} / CWPA ${stats.cwpa} / CVRP ${stats.cvrp} / " +
                 "FEED ${stats.feed}（${stats.feedBytes} B） / EAT ${stats.eat}（${stats.audioBytes} B）" +
@@ -610,13 +751,16 @@ class IosActivity : Activity() {
                         }
                     },
                     onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) },
-                    requestAudio = requestAudio
+                    requestAudio = requestAudio,
+                    // 读循环靠它判断"设备是不是已经不在设备表里了"（拔线检测的权威判据）
+                    linkAlive = { transport.findAppleDevice() != null }
                 )
 
                 activeSession = session
                 // 用短窗口探一下：一字节都没有 = 设备侧没武装，交回上层重新唤醒
                 var st = session.run(maxSeconds = 0, idleAbortSeconds = 12)
-                if (st.bytes > 0 || stopRequested) return@use st
+                // abortReason 非空 = 设备被拔 / 端点失效，此时再"重新武装"毫无意义
+                if (st.bytes > 0 || stopRequested || session.abortReason != null) return@use st
 
                 log("12s 内没有任何数据 ⇒ 用配置 4→5 重新武装一次")
                 transport.release(connQt, itf)
@@ -647,7 +791,8 @@ class IosActivity : Activity() {
                         }
                     },
                     onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) },
-                    requestAudio = requestAudio
+                    requestAudio = requestAudio,
+                    linkAlive = { transport.findAppleDevice() != null }
                 )
                 activeSession = session
                 st = session.run(maxSeconds = 0, idleAbortSeconds = 12)
@@ -737,5 +882,15 @@ class IosActivity : Activity() {
         val has = transport.hasPermission(dev)
         log("权限结果：broadcast=${ok && true} hasPermission=$has")
         return has
+    }
+
+    private companion object {
+        /**
+         * 自动开始的轮询周期。
+         *
+         * 1s 是实测过的折中：本机型插入不派发 ATTACHED（只能轮询），
+         * 而 1s 足够让"插上线 → 画面出来"的感知是连续的；再密只是白耗电。
+         */
+        const val POLL_MS = 1000L
     }
 }

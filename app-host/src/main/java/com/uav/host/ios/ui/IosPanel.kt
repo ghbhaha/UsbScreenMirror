@@ -53,8 +53,6 @@ class IosPanel(private val activity: Activity) {
     private val chipText: TextView = view(R.id.chip_state)
     private val logView: TextView = view(R.id.log)
     private val logScroll: ScrollView = view(R.id.log_scroll)
-    private val btnStart: Button = view(R.id.btn_start)
-    private val btnPair: Button = view(R.id.btn_pair)
     private val btnRearm: Button = view(R.id.btn_rearm)
     private val btnCollapse: View = view(R.id.btn_collapse)
 
@@ -64,8 +62,6 @@ class IosPanel(private val activity: Activity) {
 
     var menuShown = true
         private set
-
-    private val logLines = ArrayDeque<String>()
 
     /** 阶段 → 药丸文案 / 圆点颜色 / 主行文案。 */
     enum class Stage(val chip: Int, val dot: Int, val status: Int) {
@@ -82,14 +78,15 @@ class IosPanel(private val activity: Activity) {
     /**
      * 装配（`setContentView` 之后调用一次）。
      *
+     * 界面已经没有「开始 / 配对」按钮了：插上就自动配对、自动投屏，拔掉就停。
+     * 人工只剩一个兜底入口 [onRearm]（设备侧没武装时用），长按它触发离线回放。
+     *
      * @param onSurface 参数为 true=Surface 就绪 / false=消失。建链前必须等它为 true。
      */
     fun bind(
         onSurface: (Boolean) -> Unit,
-        onStart: () -> Unit,
-        onStartLongClick: () -> Boolean,
-        onPair: () -> Unit,
-        onRearm: () -> Unit
+        onRearm: () -> Unit,
+        onRearmLongClick: () -> Boolean
     ) {
         surfaceView.holder.addCallback(object : android.view.SurfaceHolder.Callback {
             override fun surfaceCreated(holder: android.view.SurfaceHolder) {
@@ -105,10 +102,8 @@ class IosPanel(private val activity: Activity) {
             }
         })
 
-        btnStart.setOnClickListener { onStart() }
-        btnStart.setOnLongClickListener { onStartLongClick() }
-        btnPair.setOnClickListener { onPair() }
         btnRearm.setOnClickListener { onRearm() }
+        btnRearm.setOnLongClickListener { onRearmLongClick() }
         btnCollapse.setOnClickListener { setMenuVisible(false) }
         chipView.setOnClickListener { toggleMenu() }
 
@@ -123,6 +118,14 @@ class IosPanel(private val activity: Activity) {
         setMenuVisible(true, animate = false)
         render(Stage.IDLE, null)
         hideSystemBars()
+
+        // ★ 日志「插入即贴底」的真正收口在这里。
+        //   `logView.text = …` 之后立刻 fullScroll 是滚不动的（滚动范围还没随布局更新），
+        //   表现为"新日志被切在底部看不见"。内容高度一变就滚 —— 这时范围才是对的。
+        //   只在布局真变化时触发，所以用户往上翻看历史不会被反复打断。
+        logView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            logScroll.fullScroll(View.FOCUS_DOWN)
+        }
     }
 
     /** 隐藏系统栏（沉浸式）。投屏工具的默认姿态。 */
@@ -161,37 +164,88 @@ class IosPanel(private val activity: Activity) {
         deviceInfo.text = text
     }
 
-    /** 配对 / 唤醒进行中：三个按钮全禁用（同一时刻只能有一个线程碰 USB）。 */
+    /** 配对 / 唤醒进行中：唯一的兜底按钮也禁用（同一时刻只能有一个线程碰 USB）。 */
     fun setBusy(busy: Boolean) = onUi {
-        btnStart.isEnabled = !busy
-        btnPair.isEnabled = !busy
         btnRearm.isEnabled = !busy
-        btnStart.alpha = if (busy) 0.5f else 1f
-        btnPair.alpha = if (busy) 0.5f else 1f
         btnRearm.alpha = if (busy) 0.5f else 1f
     }
 
     /**
-     * 投屏进行中：主按钮变成「停止投屏」且**保持可点**，
-     * 另外两个禁用（投屏期间动配置会直接把流打断）。
+     * 投屏进行中：**重新唤醒要禁用** —— 它会在收流中途动 USB 配置，直接把流打断。
+     *
+     * 注意界面已经没有「停止」按钮了：停止的方式是拔线（拔掉即停，见 QtSession 的断开判定）。
      */
     fun setMirroring(mirroring: Boolean) = onUi {
-        btnStart.setText(if (mirroring) R.string.ios_btn_stop else R.string.ios_btn_start)
-        btnStart.isEnabled = true
-        btnStart.alpha = 1f
-        btnPair.isEnabled = !mirroring
         btnRearm.isEnabled = !mirroring
-        btnPair.alpha = if (mirroring) 0.5f else 1f
         btnRearm.alpha = if (mirroring) 0.5f else 1f
     }
 
     // ---------------------------------------------------------------- 日志
 
-    /** 追加一行日志（自动滚到底，最多保留 [MAX_LINES] 行）。 */
-    fun log(line: String) = onUi {
-        logLines.addLast(line)
-        while (logLines.size > MAX_LINES) logLines.removeFirst()
+    /**
+     * 日志环形缓冲（**只保留最近 [MAX_LINES] 条**）。
+     *
+     * ⚠️ 只允许 UI 线程访问 —— 跨线程读 `ArrayDeque` 会读到 null 槽位（本项目已踩过 NPE）。
+     */
+    private val logLines = ArrayDeque<String>()
+
+    /** 待刷入的日志，任何线程都可写（用 [logLock] 保护） */
+    private val logQueue = ArrayDeque<String>()
+    private val logLock = Any()
+    private var flushScheduled = false
+
+    /**
+     * 追加一行日志。
+     *
+     * ## 为什么不是直接改 TextView
+     *
+     * 这条路径曾经把界面彻底卡死：收流线程在设备被拔后进入忙循环，每毫秒调一次，
+     * 而每次调用都在 UI 线程做「拼接上百行文本 + fullScroll」。几秒内消息队列被淹，
+     * 界面就再也不响应了。
+     *
+     * 现在改成：**调用方只入队**（代价是一次加锁），UI 线程每 [LOG_FLUSH_MS] 最多刷一次。
+     * 这样无论上游多高频，主线程的日志开销都是恒定的 —— 这是"防淹"的结构性保证，
+     * 而不是寄希望于上游不刷屏。
+     */
+    fun log(line: String) {
+        val needSchedule = synchronized(logLock) {
+            logQueue.addLast(line)
+            // 积压超过上限就丢最旧的：反正最终也只显示 MAX_LINES 条
+            while (logQueue.size > MAX_LINES) logQueue.removeFirst()
+            if (flushScheduled) {
+                false
+            } else {
+                flushScheduled = true
+                true
+            }
+        }
+        if (!needSchedule) return
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            flushLog()
+        } else {
+            logView.postDelayed({ flushLog() }, LOG_FLUSH_MS)
+        }
+    }
+
+    /** UI 线程执行：把积压的日志一次搬进环形缓冲并刷新一次文本。 */
+    private fun flushLog() {
+        var batch: List<String>? = null
+        synchronized(logLock) {
+            flushScheduled = false
+            if (logQueue.isNotEmpty()) {
+                batch = logQueue.toList()
+                logQueue.clear()
+            }
+        }
+        val lines = batch ?: return
+        for (l in lines) {
+            logLines.addLast(l)
+            while (logLines.size > MAX_LINES) logLines.removeFirst()
+        }
         logView.text = logLines.joinToString("\n")
+        // ★ 只在这里调 fullScroll 是不够的：text 刚换掉时 ScrollView 的滚动范围
+        //   还是上一版的高度，滚过去会停在"旧底部"，新日志被切掉一截 ——
+        //   看起来就像"没有自动跟到底"。真正的收口在 layout 监听里（见 bind）。
         logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
@@ -275,7 +329,18 @@ class IosPanel(private val activity: Activity) {
 
     private companion object {
         const val ANIM_MS = 180L
-        const val MAX_LINES = 400
+
+        /**
+         * 日志只保留最近这么多条。
+         *
+         * 投屏的握手日志集中在开头十几行，之后全是 FEED/NEED 噪音；
+         * 50 条足够看清"走到哪一步、为什么失败"，再多只是让每次刷新更贵。
+         */
+        const val MAX_LINES = 50
+
+        /** 日志刷新节流：多次 log 合并成一次 UI 刷新（最长延迟一帧多一点） */
+        const val LOG_FLUSH_MS = 120L
+
         /** 与 layout 里 overlay 的宽度一致（动画位移用它兜底，此时还没测量出 width） */
         const val PANEL_DP = 300
     }
