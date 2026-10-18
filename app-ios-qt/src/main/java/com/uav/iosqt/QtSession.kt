@@ -57,6 +57,9 @@ internal class QtSession(
     /** 上一次交给上层的 SPS/PPS —— 内容变了（iPad 转屏）才需要重建解码器 */
     private var lastCsd: ByteArray? = null
 
+    /** HPD1 是否已发过：设备会连发两次 CWPA，显示描述只该发一轮 */
+    private var hpd1Sent = false
+
     /** 外部停止信号（点「停止投屏」时置位）。 */
     @Volatile
     var stopRequested = false
@@ -169,10 +172,16 @@ internal class QtSession(
                     QtPacket.matches(p, 12, "cwpa") && p.size >= 32 -> {
                         st.cwpa++
                         audioClock = QtPacket.u64At(p, 24)
-                        write(QtPacket.hpd1())
+                        // 参考实现每个 CWPA 连发两个 HPD1；设备自己也会连发两次 CWPA，
+                        // 所以这里按「只发一轮」处理，免得包数翻倍。
+                        if (!hpd1Sent) {
+                            hpd1Sent = true
+                            write(QtPacket.hpd1())
+                            write(QtPacket.hpd1())
+                        }
                         write(QtPacket.clockReply(corr, audioClock + 0x1000))
                         write(QtPacket.hpa1(audioClock))
-                        log("CWPA audio=$audioClock → HPD1+clock+HPA1")
+                        log("CWPA audio=$audioClock → ${if (hpd1Sent) "HPD1×2+" else ""}clock+HPA1")
                     }
 
                     QtPacket.matches(p, 12, "cvrp") && p.size >= 32 -> {
@@ -185,8 +194,10 @@ internal class QtSession(
 
                     QtPacket.matches(p, 12, "afmt") -> {
                         st.afmt++
+                        // 设备在这里声明它**将要用的**音频格式；打出来便于对照本端能否解码
+                        val want = AudioParser.afmtFormat(p)
                         write(QtPacket.afmtReply(corr))
-                        log("AFMT → reply")
+                        log("AFMT → reply（设备要求 $want）")
                     }
 
                     // ★ 设备问「当前音频时钟偏差多少」。**不回它就不推音频**。

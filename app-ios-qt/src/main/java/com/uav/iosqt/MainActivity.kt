@@ -538,6 +538,15 @@ class MainActivity : Activity() {
         }
         log("QT 接口 if#${itf.id} 已 claim；IN=0x${epIn.address.toString(16)} " +
             "OUT=${epOut?.let { "0x" + it.address.toString(16) } ?: "无"}")
+        // 音频若走**另一个** bulk IN，只取第一个 IN 就会永远收不到 EAT —— 先把端点全列出来
+        val eps = (0 until itf.endpointCount).map { i ->
+            val e = itf.getEndpoint(i)
+            "%s0x%02x/%dB".format(
+                if (e.direction == android.hardware.usb.UsbConstants.USB_DIR_IN) "IN " else "OUT ",
+                e.address, e.maxPacketSize
+            )
+        }
+        log("  接口端点 ${itf.endpointCount} 个：${eps.joinToString(" ")}")
 
         // 8) 收流：**一直投到用户点停止**（原先是跑 60s 就结束，那是采集测试、不是投屏）
         val outFile = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")

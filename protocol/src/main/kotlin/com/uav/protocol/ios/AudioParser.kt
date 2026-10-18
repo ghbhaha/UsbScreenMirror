@@ -84,7 +84,12 @@ object AudioParser {
         //            u32 framesPerPacket | u32 bytesPerFrame | u32 channels |
         //            u32 bitsPerChannel | u32 reserved | f64 x2
         val base = asbdAt + 4
-        if (base + 40 > payload.size) return null
+        return readAsbd(payload, base)
+    }
+
+    /** 按 ASBD 的固定布局读格式（`base` 指向 SampleRate 的 f64）。 */
+    private fun readAsbd(payload: ByteArray, base: Int): Format? {
+        if (base < 0 || base + 40 > payload.size) return null
         val rate = java.lang.Double.longBitsToDouble(le64(payload, base))
         val codec = String(payload.copyOfRange(base + 8, base + 12).reversedArray(), Charsets.US_ASCII)
         val flags = le32(payload, base + 12)
@@ -92,6 +97,18 @@ object AudioParser {
         val bits = le32(payload, base + 32)
         if (rate <= 0.0 || channels !in 1..8 || bits !in 8..32) return null
         return Format(rate.toInt(), channels, bits, codec, flags)
+    }
+
+    /**
+     * `SYNC/AFMT` 报文里的音频格式。
+     *
+     * ⚠️ 与 EAT 帧**不是一个位置**：AFMT 里的 ASBD 是**裸放**的（payload off 24 起，
+     * 前面依次是 `sync` / clockRef / `afmt` / correlationID），
+     * 没有 `fdsc` 段可找。所以 [format] 在这里读不出来，必须用这个入口。
+     */
+    fun afmtFormat(payload: ByteArray): Format? {
+        if (payload.size < 24 + 40) return null
+        return readAsbd(payload, 24)
     }
 
     /**

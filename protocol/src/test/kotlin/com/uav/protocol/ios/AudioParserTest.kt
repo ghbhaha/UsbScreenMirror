@@ -71,6 +71,26 @@ class AudioParserTest {
         assertNull(AudioParser.format(ByteArray(64)))
     }
 
+    /**
+     * AFMT 里的 ASBD 与 EAT 帧**不在一个位置**：前者裸放在报文 off 24，
+     * 后者藏在 sbuf 的 `fdsc` 段里。这条用例就是防止把两者搞混。
+     */
+    @Test
+    fun `AFMT 报文里的格式能单独读出来`() {
+        val raw = javaClass.classLoader!!.getResourceAsStream("ios/afmt-request.bin")!!
+            .use { it.readBytes() }
+        // fixture 带 4B 长度前缀，而运行时拿到的是去掉前缀的 payload
+        val payload = raw.copyOfRange(4, raw.size)
+        val f = AudioParser.afmtFormat(payload)
+        assertNotNull("AFMT 的 ASBD 应能解析", f)
+        assertEquals("lpcm", f!!.codec)
+        assertEquals(48_000, f.sampleRate)
+        assertEquals(2, f.channels)
+        assertEquals(16, f.bitsPerChannel)
+        // 顺便证明：用 EAT 那套（找 fdsc）读 AFMT 是读不出来的
+        assertNull("AFMT 没有 fdsc 段，format() 应返回 null", AudioParser.format(payload))
+    }
+
     @Test
     fun `截断的 sdat 不会被越界读取`() {
         val p = sample()
