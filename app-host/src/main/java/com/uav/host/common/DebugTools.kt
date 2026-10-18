@@ -35,4 +35,25 @@ internal object DebugTools {
      * release = `false`（上述入口全部失效）。
      */
     val ENABLED: Boolean = BuildConfig.DEBUG
+
+    // ── iOS 页的 adb 驱动入口（界面上不再留入口） ───────────────────────────────
+
+    /**
+     * `am start -n com.uav.host/.ios.IosActivity --ez record true`
+     *
+     * 把 `ASYN/FEED` 原始报文落盘成 `feed.bin`（格式 `[4B 小端长度][原始报文]`）。
+     *
+     * ⚠️ **默认关闭**：全量落盘约 **2 MB/s**（实测 33 秒 66 MB），
+     * 长期投屏一小时就是 7 GB，而且写盘失败会直接把读循环打断。
+     * 它只服务于 [IOS_EXTRA_REPLAY]，需要抓一次现网码流时才开。
+     */
+    const val IOS_EXTRA_RECORD = "record"
+
+    /**
+     * `am start -n com.uav.host/.ios.IosActivity --ez replay true`
+     *
+     * 用 `feed.bin` 离线回放，二分定位"USB/协议"与"解码/渲染"哪一半出问题，
+     * 不需要插 iPad。要先 [IOS_EXTRA_RECORD] 录一份。
+     */
+    const val IOS_EXTRA_REPLAY = "replay"
 }

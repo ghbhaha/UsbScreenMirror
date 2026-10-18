@@ -73,6 +73,10 @@ internal class QtSession(
     var abortReason: String? = null
         private set
 
+    /** 录制流已写坏（磁盘满等）：置位后不再尝试，投屏继续 */
+    @Volatile
+    private var sinkBroken = false
+
     // ── 写路径：接收线程只入队，绝不等待 ────────────────────────────────────────
     // 参考实现（iPhoneMirror CaptureSession.cpp）的注释说得很直白：这是 USB 接收线程，
     // 绝不能在这里等——哪怕 20ms 的等待都会让 NEED/clock 应答变慢，某些 iOS 版本
@@ -153,9 +157,17 @@ internal class QtSession(
 
                 /** 抓包转储：写 `[4B 长度][原始报文]`，与改造前逐字节一致 */
                 override fun onFeedRaw(payload: ByteArray) {
-                    sink?.let {
-                        it.write(QtPacket.u32(payload.size))
-                        it.write(payload)
+                    val s = sink ?: return
+                    if (sinkBroken) return
+                    // ★ 录制是排障用的旁路，**绝不能因为它失败而打断投屏**：
+                    //   磁盘满 / 存储卸载时 `write` 抛 IOException，原样冒出去会一路
+                    //   冲出读循环，表现成"投屏莫名断了"。这里就地止损：关录制，继续投。
+                    runCatching {
+                        s.write(QtPacket.u32(payload.size))
+                        s.write(payload)
+                    }.onFailure {
+                        sinkBroken = true
+                        log("✗ 录制写入失败，已关闭录制（投屏继续）：${it.javaClass.simpleName}: ${it.message}")
                     }
                 }
             },

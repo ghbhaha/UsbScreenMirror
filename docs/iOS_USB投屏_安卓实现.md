@@ -203,24 +203,36 @@ libimobiledevice / pymobiledevice3 用**空 DN**（`30 00`），设备侧 libcry
 ## 五、怎么跑
 
 ```bash
-# 编、装、起
-./gradlew :app-ios-qt:assembleDebug
-adb install -r app-ios-qt/build/outputs/apk/debug/app-ios-qt-debug.apk
-adb shell am start -n com.uav.iosqt/.MainActivity
-# 界面三个按钮，按状态点：
-#   首次： 「配对」→ iPad 上点「信任」→ 「重新武装」→ 「开始采集」
-#   之后：  直接「开始采集」（设备在采集态时走配置 3→5 来回）
-# 日志： adb logcat -s UAV-IosQt:I
+# 编、装、起（模块已合入 app-host，页面挂在宿主里）
+./gradlew :app-host:assembleDebug
+adb install -r app-host/build/outputs/apk/debug/app-host-debug.apk
+adb shell am start -n com.uav.host/.ChooserActivity
+# 然后插上 iPad 即可 —— 页面会自己跳过去、自己配对、自己投屏，不用按任何按钮
+# 日志： adb logcat -s UAV-IosQt:I Chooser:I
 ```
 
-**离线自测**：**长按**「开始采集」= 回放 `filesDir/feed.bin`，
-不依赖设备、不用重启 iPad，就能验证「解析 → 解码 → 上屏」整条链路。
+**界面只剩一个兜底按钮「重新唤醒采集通道」**：只有在"lockdown 已信任、QT 也 claim 到了，
+但一个字节都不来"时才需要点它（会走 `activate` + 等设备重枚举）。
+
+**录制 / 离线回放都不在界面上，只由 adb 驱动**（见 `DebugTools.IOS_EXTRA_*`）：
+
+```bash
+# 录一份现网码流（默认关闭！约 2 MB/s，一小时 7 GB）
+adb shell am start -n com.uav.host/.ios.IosActivity --ez record true
+
+# 用刚录的 feed.bin 离线回放：不插 iPad 也能验证「解析 → 解码 → 上屏」
+adb shell am start -n com.uav.host/.ios.IosActivity --ez replay true
+```
+
+⚠️ 录制写的是 `getExternalFilesDir()/feed.bin`，**每次开始投屏会覆盖**；
+写盘失败（磁盘满等）只会关掉录制，不会打断投屏。
 
 ---
 
 ## 六、还没做的
 
-1. **音频**：`HPA1` / `EAT!` 那条线还没接。
+1. ~~音频~~ **已打通**：`HPA1` / `EAT!` 可正常出声；两处 fourcc 坑
+   （`lpcm` 必须走 `fcc()`、OG 是 `go! ` 不是 `og! `）见 §三·五。
 2. **触摸回传**：iOS 侧没有 USB 输入通道，只能走 BLE HID 或网络。
 3. **首启引导**：现在「配对 → 重新武装 → 开始采集」是三个按钮，首次使用要按顺序点三次；
    应该收敛成一个「连接」按钮（内部按 `是否已配对` / `配置数` 自动决定走哪几步）。

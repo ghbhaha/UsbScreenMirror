@@ -15,6 +15,7 @@ import android.view.WindowManager
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import com.uav.host.R
+import com.uav.host.common.DebugTools
 import com.uav.host.ios.ui.IosPanel
 import com.uav.protocol.ios.QtStats
 import com.uav.protocol.ios.SampleParser
@@ -103,6 +104,18 @@ class IosActivity : Activity() {
     @Volatile
     private var lastSeenDeviceId = -1
 
+    /**
+     * 是否把 FEED 原始报文落盘。
+     *
+     * **默认 false**，只能由 adb 打开：`am start … --ez record true`。
+     * 理由见 [com.uav.host.common.DebugTools.IOS_EXTRA_RECORD] —— 全量落盘约 2 MB/s，
+     * 而且写盘失败会打断读循环。
+     */
+    private var recordFeed = false
+
+    /** adb 指定"进来就回放 feed.bin"（不插 iPad 也能验证解码链路） */
+    private var replayRequested = false
+
     private val logFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
     private val permissionReceiver = object : BroadcastReceiver() {
@@ -153,9 +166,7 @@ class IosActivity : Activity() {
                     pendingCsd = null
                 }
             },
-            onRearm = { if (!running.get()) rearm() },
-            // 长按「重新唤醒」= 回放上次录制的流（离线验证"解析→解码→上屏"）
-            onRearmLongClick = { if (!running.get()) { replay(); true } else false }
+            onRearm = { if (!running.get()) rearm() }
         )
         // 投屏期间别让屏幕自己熄掉（熄屏会连带把 Surface 收走）
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -185,6 +196,20 @@ class IosActivity : Activity() {
             log("配对记录：已有（${Pairing.loadRecord(filesDir)?.hostId ?: "读取失败"}）")
         } else {
             log("配对记录：无 ⇒ 首次会自动发起配对，请留意 iPad 上的「信任」弹窗")
+        }
+
+        // ★ 录制 / 回放都只在 adb 上开，界面不留入口：
+        //   am start -n com.uav.host/.ios.IosActivity --ez record true
+        //   am start -n com.uav.host/.ios.IosActivity --ez replay true
+        recordFeed = DebugTools.ENABLED &&
+            (intent?.getBooleanExtra(DebugTools.IOS_EXTRA_RECORD, false) ?: false)
+        replayRequested = DebugTools.ENABLED &&
+            (intent?.getBooleanExtra(DebugTools.IOS_EXTRA_REPLAY, false) ?: false)
+        if (recordFeed) log("录制开关：开（adb --ez record true），会写 feed.bin")
+        if (replayRequested) {
+            log("回放开关：开（adb --ez replay true）")
+            // 放到 onCreate 之后：replay 会置 running，随后的轮询看到它就不会抢着建链
+            handler.post { replay() }
         }
     }
 
@@ -305,8 +330,12 @@ class IosActivity : Activity() {
         Thread({
             val f = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
             if (!f.exists() || f.length() < 1024) {
-                log("没有可回放的 feed.bin（先采一次）")
-                running.set(false); return@Thread
+                log("没有可回放的 feed.bin —— 先用 adb 录一次：" +
+                    "am start -n com.uav.host/.ios.IosActivity --ez record true")
+                running.set(false)
+                panel.setMirroring(false)
+                panel.render(IosPanel.Stage.IDLE, null)
+                return@Thread
             }
             log("回放 ${f.absolutePath}（${f.length()} B）")
             runCatching {
@@ -727,19 +756,28 @@ class IosActivity : Activity() {
         }
         log("  接口端点 ${itf.endpointCount} 个：${eps.joinToString(" ")}")
 
-        // 8) 收流：**一直投到用户点停止**（原先是跑 60s 就结束，那是采集测试、不是投屏）
-        val outFile = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
-        log("落盘：${outFile.absolutePath}")
+        // 8) 收流：**一直投到拔线**（maxSeconds = 0）
+        //
+        // ★ **默认不落盘**。以前这里无条件把 FEED 原始报文写进 feed.bin，
+        //   代价是 ~2 MB/s（一小时 7 GB）外加"写盘失败就把读循环打断"：
+        //   `sink.write` 抛 IOException 会一路冒到读循环外面，表现成"投屏莫名断了"。
+        //   现在只在 `--ez record true` 时开，而且流是可空的（QtSession 本来就接受 null）。
+        val outFile = if (recordFeed && DebugTools.ENABLED) {
+            File(getExternalFilesDir(null) ?: filesDir, "feed.bin").also {
+                log("★ 录制已开启（adb）：${it.absolutePath}")
+            }
+        } else null
+        val sinkStream = outFile?.outputStream()
         // 音频：第一包 PCM 到才真正建轨道（没声音就不占音频资源）
         val audioPlayer = PcmAudioPlayer(::log)
         audio = audioPlayer
-        return outFile.outputStream().use { out ->
+        return try {
             var session: QtSession? = null
             try {
                 panel.render(IosPanel.Stage.MIRRORING, null)
                 refreshDeviceInfo(state = "投屏中")
                 session = QtSession(
-                    connQt, epIn, epOut, out, ::log,
+                    connQt, epIn, epOut, sinkStream, ::log,
                     onCsd = { csd -> onCsdArrived(csd) },
                     onFrame = { f ->
                         decoder?.submit(f)
@@ -760,7 +798,7 @@ class IosActivity : Activity() {
                 // 用短窗口探一下：一字节都没有 = 设备侧没武装，交回上层重新唤醒
                 var st = session.run(maxSeconds = 0, idleAbortSeconds = 12)
                 // abortReason 非空 = 设备被拔 / 端点失效，此时再"重新武装"毫无意义
-                if (st.bytes > 0 || stopRequested || session.abortReason != null) return@use st
+                if (st.bytes > 0 || stopRequested || session.abortReason != null) return st
 
                 log("12s 内没有任何数据 ⇒ 用配置 4→5 重新武装一次")
                 transport.release(connQt, itf)
@@ -771,17 +809,17 @@ class IosActivity : Activity() {
                 }
                 if (!transport.setConfiguration(connQt, cfg)) {
                     log("  重新切回配置 ${cfg.id} 失败")
-                    return@use st
+                    return st
                 }
                 val itf2 = transport.captureInterfaceIn(cfg) ?: itf
                 transport.claim(connQt, itf2)
                 val (in2, out2) = transport.bulkEndpoints(itf2)
                 if (in2 == null) {
                     log("  重新武装后没有 bulk IN")
-                    return@use st
+                    return st
                 }
                 session = QtSession(
-                    connQt, in2, out2, out, ::log,
+                    connQt, in2, out2, sinkStream, ::log,
                     onCsd = { csd -> onCsdArrived(csd) },
                     onFrame = { f ->
                         decoder?.submit(f)
@@ -813,6 +851,10 @@ class IosActivity : Activity() {
                 runCatching { connQt.close() }
                 log("收尾完成：配置已还回普通态，可直接再次开始（无需重启 iPad）")
             }
+        } finally {
+            // 录制流收尾。默认没开时 sinkStream 是 null，这里就是空操作。
+            // ⚠️ 必须显式 close：不关的话最后几帧可能还压在 FileOutputStream 里。
+            runCatching { sinkStream?.close() }
         }
     }
 

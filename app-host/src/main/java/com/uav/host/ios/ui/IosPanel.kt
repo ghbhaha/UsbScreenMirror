@@ -79,14 +79,16 @@ class IosPanel(private val activity: Activity) {
      * 装配（`setContentView` 之后调用一次）。
      *
      * 界面已经没有「开始 / 配对」按钮了：插上就自动配对、自动投屏，拔掉就停。
-     * 人工只剩一个兜底入口 [onRearm]（设备侧没武装时用），长按它触发离线回放。
+     * 人工只剩一个兜底入口 [onRearm]（设备侧没武装时用）。
+     *
+     * 录制 / 离线回放**不再有界面入口**，改由 adb 驱动（见 `DebugTools.IOS_EXTRA_*`）：
+     * 它们本来只在排障时用，放在界面上反而容易被误触、也会持续写盘。
      *
      * @param onSurface 参数为 true=Surface 就绪 / false=消失。建链前必须等它为 true。
      */
     fun bind(
         onSurface: (Boolean) -> Unit,
-        onRearm: () -> Unit,
-        onRearmLongClick: () -> Boolean
+        onRearm: () -> Unit
     ) {
         surfaceView.holder.addCallback(object : android.view.SurfaceHolder.Callback {
             override fun surfaceCreated(holder: android.view.SurfaceHolder) {
@@ -103,7 +105,6 @@ class IosPanel(private val activity: Activity) {
         })
 
         btnRearm.setOnClickListener { onRearm() }
-        btnRearm.setOnLongClickListener { onRearmLongClick() }
         btnCollapse.setOnClickListener { setMenuVisible(false) }
         chipView.setOnClickListener { toggleMenu() }
 

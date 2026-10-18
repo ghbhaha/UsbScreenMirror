@@ -91,7 +91,7 @@
 <string name="ios_detail_link_lost">iPad 已断开 —— 把数据线插回去就能重新开始</string>
 <string name="ios_detail_pair_hint">配对成功后本机即成为受信任主机，以后不用再点</string>
 <string name="ios_detail_rearm_hint">配对完成后第一次投屏、或长时间无数据时才需要</string>
-<string name="ios_hint">插上 iPad 自动配对并投屏，拔线即停 · 点画面空白处或左上角药丸可显示 / 隐藏此面板 · 长按「重新唤醒」回放上次录制的流</string>
+<string name="ios_hint">插上 iPad 自动配对并投屏，拔线即停 · 点画面空白处或左上角药丸可显示 / 隐藏此面板</string>
     <string name="chooser_title">USB 投屏</string>
     <string name="chooser_subtitle">选择要投屏的设备类型（插线后会自动识别）</string>
     <string name="chooser_aoa_title">安卓手机</string>
