@@ -7,11 +7,12 @@
 
     <application
         android:allowBackup="false"
-        android:label="iOS QT 采集"
-        android:theme="@android:style/Theme.DeviceDefault.Light">
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
             android:exported="true"
             android:launchMode="singleTask">
             <intent-filter>

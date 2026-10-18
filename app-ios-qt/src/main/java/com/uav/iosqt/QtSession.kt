@@ -47,23 +47,41 @@ internal class QtSession(
     private var audioClock = 0L
     private var videoClock = 0L
     private var tail = ByteArray(0)
-    private var csdSent = false
+    /** 上一次交给上层的 SPS/PPS —— 内容变了（iPad 转屏）才需要重建解码器 */
+    private var lastCsd: ByteArray? = null
 
-    /** 持续收流，直到超时或收到 maxFrames 帧。返回统计。 */
-    fun run(maxSeconds: Int, maxFrames: Int = Int.MAX_VALUE): Stats {
+    /** 外部停止信号（点「停止投屏」时置位）。 */
+    @Volatile
+    var stopRequested = false
+
+    /**
+     * 持续收流。
+     *
+     * @param maxSeconds `<= 0` = 一直投到 [stopRequested] 被置位（投屏模式）；
+     *                   `> 0` = 到点自动结束（探测/回放模式）
+     * @param maxFrames 收满即停（回放用）
+     * @param idleAbortSeconds 开头这么久还**一个字节都没收到**就提前返回，把"要不要重新武装"
+     *                         的决定权交回上层；`<= 0` = 不提前放弃
+     */
+    fun run(
+        maxSeconds: Int,
+        maxFrames: Int = Int.MAX_VALUE,
+        idleAbortSeconds: Int = 0
+    ): Stats {
         val st = Stats()
         // ★ 读缓冲必须小：1 MiB 的 bulk IN 在 xHCI 上会排成一长串传输描述符，
         //   而设备最先发的是 16B 的 PING（短包）——短包会让整串立即取消，
         //   取消 URB 正是会把设备端点弄坏的动作（本项目已踩过）。
         //   Windows 上 libusb0 没有这种语义，所以 1 MiB 在那边照样能跑。
         val readBuf = ByteArray(16 * 1024)
-        val deadline = System.currentTimeMillis() + maxSeconds * 1000L
         val start = System.currentTimeMillis()
+        val deadline = if (maxSeconds > 0) start + maxSeconds * 1000L else Long.MAX_VALUE
+        val idleDeadline = if (idleAbortSeconds > 0) start + idleAbortSeconds * 1000L else Long.MAX_VALUE
 
         var timeouts = 0
         var lastReport = start
 
-        while (System.currentTimeMillis() < deadline) {
+        while (!stopRequested && System.currentTimeMillis() < deadline) {
             val t0 = System.currentTimeMillis()
             val n = conn.bulkTransfer(epIn, readBuf, readBuf.size, 500)
             val dt = System.currentTimeMillis() - t0
@@ -81,6 +99,11 @@ internal class QtSession(
                 if (now - lastReport >= 3000) {
                     lastReport = now
                     log("  …空闲 ${(now - start) / 1000}s：超时 $timeouts 次 / 已收 ${st.bytes} B")
+                }
+                // 开头一直没有数据 ⇒ 设备侧没武装，别在这里空等
+                if (st.bytes == 0L && now >= idleDeadline) {
+                    log("  ${idleAbortSeconds}s 内没有任何数据，交回上层决定是否重新唤醒")
+                    return st
                 }
                 continue
             }
@@ -106,6 +129,22 @@ internal class QtSession(
             tail = buf
         }
         return st
+    }
+
+    /**
+     * 把 SPS/PPS 交给上层 —— **只在内容变化时**交。
+     *
+     * iPad 转屏（竖⇄横）会让编码分辨率改变，设备随下一个 FEED 送来新的 avcC。
+     * 早期这里用 `csdSent` 标志"只发一次"，于是转屏后解码器仍拿着旧分辨率的 csd：
+     * 收流照旧、**渲染直接停住**（FEED 一直在来，帧数不动）。
+     */
+    private fun deliverCsd(csd: ByteArray, from: String) {
+        val prev = lastCsd
+        if (prev != null && prev.contentEquals(csd)) return
+        lastCsd = csd
+        if (prev == null) log("★ 从 $from 解出 SPS/PPS ${csd.size}B")
+        else log("★ 从 $from 解出新 SPS/PPS ${csd.size}B（分辨率变了，重建解码器）")
+        onCsd?.invoke(csd)
     }
 
     private fun handle(p: ByteArray, st: Stats, startMs: Long) {
@@ -165,11 +204,7 @@ internal class QtSession(
                     st.other++
                     val body = if (p.size > 16) p.copyOfRange(16, p.size) else ByteArray(0)
                     log("ASYN sprp ${p.size}B hex=${body.joinToString(" ") { "%02x".format(it) }}")
-                    val csd = SampleParser.csd(body)
-                    if (csd != null) {
-                        log("★ 从 sprp 解出 SPS/PPS ${csd.size}B")
-                        onCsd?.invoke(csd)
-                    }
+                    SampleParser.csd(body)?.let { deliverCsd(it, "sprp") }
                 } else if (QtPacket.matches(p, 12, "feed")) {
                     st.feed++
                     st.feedBytes += p.size
@@ -184,14 +219,7 @@ internal class QtSession(
                     //   而是嵌在 **FEED 样本尾部的字典**里：
                     //   `… 'datv' | 4B 长度 | 01 64 00 2a ff e1 00 10 <SPS16> 01 00 04 <PPS4>`
                     //   ⇒ 每个 FEED 都试一次，拿到就不再试。
-                    if (!csdSent && onCsd != null) {
-                        val csd = SampleParser.csd(p)
-                        if (csd != null) {
-                            csdSent = true
-                            log("★ 从 FEED 尾部解出 SPS/PPS ${csd.size}B")
-                            onCsd.invoke(csd)
-                        }
-                    }
+                    SampleParser.csd(p)?.let { deliverCsd(it, "FEED 尾部") }
                     if (onFrame != null) {
                         val frame = SampleParser.frame(p)
                         if (frame != null) onFrame.invoke(frame)

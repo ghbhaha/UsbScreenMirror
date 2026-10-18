@@ -31,4 +31,6 @@ kotlin {
 dependencies {
     // DER 证书签发 / plist 编解码 / 配对请求构造全是纯逻辑 —— 下沉到 :protocol，能用 JVM 单测验收
     implementation(project(":protocol"))
+    // WindowInsetsControllerCompat：沉浸式隐藏系统栏（targetSdk 36 上 systemUiVisibility 已废弃）
+    implementation(libs.androidx.core.ktx)
 }

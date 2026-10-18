@@ -9,14 +9,8 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Bundle
-import android.view.Gravity
-import android.widget.Button
-import android.widget.LinearLayout
-import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
-import android.widget.ScrollView
-import android.widget.TextView
+import android.view.WindowManager
+import com.uav.iosqt.ui.IosPanel
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -35,16 +29,22 @@ class MainActivity : Activity() {
 
     private lateinit var usb: UsbManager
     private lateinit var transport: QtTransport
-    private lateinit var logView: TextView
-    private lateinit var btn: Button
-    private lateinit var btnPair: Button
-    private lateinit var btnRearm: Button
-    private lateinit var preview: SurfaceView
+    private lateinit var panel: IosPanel
 
-    /** 预览用的 Surface；解码器要等它和 SPS/PPS 都就绪才能起 */
-    private var surface: Surface? = null
+    /** 解码器要等 Surface 和 SPS/PPS 都就绪才能起 */
     private var pendingCsd: ByteArray? = null
     private var decoder: H264Decoder? = null
+
+    /** 首帧只处理一次：到首帧就把面板收起来，把画面让出来 */
+    private val firstFrameDone = AtomicBoolean(false)
+
+    /** 用户点了「停止投屏」 */
+    @Volatile
+    private var stopRequested = false
+
+    /** 当前正在跑的会话 —— 停止信号要能立刻打断循环里的 bulkTransfer */
+    @Volatile
+    private var activeSession: QtSession? = null
 
     private val running = AtomicBoolean(false)
     private var permissionLatch: CountDownLatch? = null
@@ -64,61 +64,27 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(24, 24, 24, 24)
-        }
-        logView = TextView(this).apply {
-            textSize = 11f
-            setTextIsSelectable(true)
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        val scroll = ScrollView(this).apply { addView(logView) }
-        btn = Button(this).apply {
-            text = "开始采集"
-            setOnClickListener { if (!running.get()) start() }
-            // 长按 = 离线回放已录制的 feed.bin（验证解码/渲染链路，不依赖设备）
-            setOnLongClickListener { if (!running.get()) { replay(); true } else false }
-        }
-        btnPair = Button(this).apply {
-            text = "配对（让 iPad 信任本机）"
-            setOnClickListener { if (!running.get()) pairDevice() }
-        }
-        btnRearm = Button(this).apply {
-            text = "重新武装（0 字节时用）"
-            setOnClickListener { if (!running.get()) rearm() }
-        }
-        preview = SurfaceView(this).apply {
-            holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(h: SurfaceHolder) {
-                    surface = h.surface
+        setContentView(R.layout.activity_ios)
+        // ★ 必须在 setContentView 之后构造：IosPanel 在构造期就 findViewById
+        panel = IosPanel(this)
+        panel.bind(
+            onSurface = { ready ->
+                if (ready) {
                     log("预览 Surface 就绪")
                     ensureDecoder()
-                }
-                override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
-                override fun surfaceDestroyed(h: SurfaceHolder) {
-                    surface = null
+                } else {
                     decoder?.stop()
                     decoder = null
+                    pendingCsd = null
                 }
-            })
-        }
-        root.addView(btn)
-        root.addView(btnPair)
-        root.addView(btnRearm)
-        root.addView(
-            preview,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 3f
-            )
+            },
+            onStart = { toggleStart() },
+            onStartLongClick = { if (!running.get()) { replay(); true } else false },
+            onPair = { if (!running.get()) pairDevice() },
+            onRearm = { if (!running.get()) rearm() }
         )
-        root.addView(
-            scroll,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-            )
-        )
-        setContentView(root)
+        // 投屏期间别让屏幕自己熄掉（熄屏会连带把 Surface 收走）
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         transport = QtTransport(this, usb, ::log)
         registerReceiver(
@@ -126,15 +92,39 @@ class MainActivity : Activity() {
             IntentFilter(QtTransport.ACTION_USB_PERMISSION),
             RECEIVER_NOT_EXPORTED
         )
+
         log("QuickTime USB 采集（Android）")
-        log("用法：iPad 重启 → 解锁亮屏 → 插线 → 点「开始采集」")
-        log("（长按按钮 = 回放已录制的 feed.bin，用于离线验证解码）")
-        log(
-            if (Pairing.hasRecord(filesDir))
-                "配对记录：已有（${Pairing.loadRecord(filesDir)?.hostId ?: "读取失败"}）"
-            else
-                "配对记录：无 ⇒ 首次请先点「配对」，在 iPad 上点一次「信任」"
-        )
+        refreshDeviceInfo(state = "空闲")
+        if (!Pairing.hasRecord(filesDir)) {
+            panel.render(IosPanel.Stage.UNPAIRED, getString(R.string.ios_detail_pair_hint))
+            log("配对记录：无 ⇒ 首次请先点「配对」，在 iPad 上点一次「信任」")
+        } else {
+            panel.render(IosPanel.Stage.IDLE, null)
+            log("配对记录：已有（${Pairing.loadRecord(filesDir)?.hostId ?: "读取失败"}）")
+        }
+    }
+
+    /**
+     * 刷新「设备」卡片。
+     *
+     * 只写事实：设备名 / 配置数（4=普通态、5=采集态）/ 配对状态。
+     * 这行是排「0 字节」时最有用的一条 —— 比翻日志快。
+     */
+    private fun refreshDeviceInfo(state: String) {
+        val dev = transport.findAppleDevice()
+        val pair = Pairing.loadRecord(filesDir)?.hostId
+        val sb = StringBuilder()
+        if (dev == null) {
+            sb.append("未连接\n")
+        } else {
+            sb.append("iPad · pid 0x").append(dev.productId.toString(16)).append('\n')
+            sb.append("配置数 ").append(dev.configurationCount)
+                .append(if (dev.configurationCount >= 5) "（采集态）" else "（普通态）").append('\n')
+        }
+        sb.append("配对 ").append(if (pair != null) "已信任" else "未配对")
+        if (pair != null) sb.append('\n').append(pair)
+        sb.append('\n').append("状态 ").append(state)
+        panel.setDeviceInfo(sb.toString())
     }
 
     override fun onDestroy() {
@@ -145,6 +135,8 @@ class MainActivity : Activity() {
     /** 离线回放 filesDir/feed.bin：验证「解析 → 解码 → 上屏」整条链路。 */
     private fun replay() {
         running.set(true)
+        panel.setMirroring(true)
+        panel.render(IosPanel.Stage.REPLAY, "回放 filesDir/feed.bin")
         Thread({
             val f = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
             if (!f.exists() || f.length() < 1024) {
@@ -172,11 +164,7 @@ class MainActivity : Activity() {
                         }
                         if (off < total) break
                         n++
-                        if (pendingCsd == null) SampleParser.csd(payload)?.let {
-                            pendingCsd = it
-                            log("★ 回放中解出 SPS/PPS ${it.size}B")
-                            ensureDecoder()
-                        }
+                        SampleParser.csd(payload)?.let { onCsdArrived(it) }
                         SampleParser.frame(payload)?.let { fr ->
                             decoder?.submit(fr)
                             sent++
@@ -188,30 +176,58 @@ class MainActivity : Activity() {
                 }
             }.onFailure { log("回放异常：${it.message}") }
             running.set(false)
+            panel.setMirroring(false)
+            panel.render(IosPanel.Stage.IDLE, null)
         }, "replay").start()
+    }
+
+    /**
+     * 收到（新的）SPS/PPS。
+     *
+     * 第一次：等 Surface 就绪后起解码器；
+     * 之后内容变了（iPad 转屏 ⇒ 分辨率变）：**必须重建解码器**，否则旧 codec 会静默停产。
+     */
+    private fun onCsdArrived(csd: ByteArray) {
+        pendingCsd = csd
+        if (decoder == null) ensureDecoder() else decoder?.restart(csd)
     }
 
     /** Surface 与 SPS/PPS 都到位时启动解码器。 */
     private fun ensureDecoder() {
-        val sf = surface ?: return
+        val sf = panel.currentSurface() ?: return
         val csd = pendingCsd ?: return
         if (decoder != null) return
-        decoder = H264Decoder(sf, ::log).also { it.start(csd) }
+        decoder = H264Decoder(sf, ::log) { w, h -> panel.setVideoSize(w, h) }
+            .also { it.start(csd) }
     }
 
     private fun log(msg: String) {
-        val line = "${logFmt.format(Date())}  $msg"
         // 同时打到 logcat：UI 文本要 uiautomator dump 才读得到，logcat 一条命令就能跟
         android.util.Log.i("UAV-IosQt", msg)
-        runOnUiThread {
-            logView.append(line + "\n")
-        }
+        panel.log("${logFmt.format(Date())}  $msg")
     }
 
-    private fun start() {
+    /**
+     * 开始 / 停止投屏（同一个按钮）。
+     *
+     * 投屏是**持续**的：`QtSession.run(maxSeconds = 0)` 一直读到用户点停止。
+     * 停止走的是置位 [QtSession.stopRequested]，读循环在 500ms 的 bulkTransfer 超时后就会退出，
+     * 所以点下去是秒停，不需要强杀线程。
+     */
+    private fun toggleStart() {
+        if (running.get()) {
+            stopRequested = true
+            activeSession?.stopRequested = true
+            log("正在停止投屏…")
+            panel.render(IosPanel.Stage.MIRRORING, "正在停止…")
+            return
+        }
+        stopRequested = false
         running.set(true)
-        btn.isEnabled = false
-        btnPair.isEnabled = false
+        firstFrameDone.set(false)
+        panel.setMirroring(true)
+        panel.render(IosPanel.Stage.CONNECTING, null)
+        refreshDeviceInfo(state = "启动中")
         Thread({ runCapture() }, "ios-qt").start()
     }
 
@@ -223,8 +239,8 @@ class MainActivity : Activity() {
      */
     private fun pairDevice() {
         running.set(true)
-        btn.isEnabled = false
-        btnPair.isEnabled = false
+        panel.setBusy(true)
+        panel.render(IosPanel.Stage.PAIRING, getString(R.string.ios_detail_pair_hint))
         Thread({
             runCatching {
                 val dev = transport.findAppleDevice()
@@ -261,7 +277,7 @@ class MainActivity : Activity() {
                 }
             }.onFailure { log("配对异常：${it.javaClass.simpleName}: ${it.message}") }
             running.set(false)
-            runOnUiThread { btn.isEnabled = true; btnPair.isEnabled = true }
+            panel.setBusy(false); refreshDeviceInfo(state = "空闲")
         }, "ios-pair").start()
     }
 
@@ -276,9 +292,8 @@ class MainActivity : Activity() {
      */
     private fun rearm() {
         running.set(true)
-        btn.isEnabled = false
-        btnPair.isEnabled = false
-        btnRearm.isEnabled = false
+        panel.setBusy(true)
+        panel.render(IosPanel.Stage.REARM, getString(R.string.ios_detail_rearm_hint))
         Thread({
             runCatching {
                 val dev0 = transport.findAppleDevice()
@@ -331,7 +346,7 @@ class MainActivity : Activity() {
                 else log("✗ 240s 内设备根本没重枚举 ⇒ 只能拔插线或重启 iPad")
             }.onFailure { log("重新武装异常：${it.message}") }
             running.set(false)
-            runOnUiThread { btn.isEnabled = true; btnPair.isEnabled = true; btnRearm.isEnabled = true }
+            panel.setBusy(false); refreshDeviceInfo(state = "空闲")
         }, "ios-rearm").start()
     }
 
@@ -377,11 +392,16 @@ class MainActivity : Activity() {
             null
         }
         running.set(false)
-        runOnUiThread { btn.isEnabled = true; btnPair.isEnabled = true }
+        activeSession = null
+        panel.setMirroring(false)
+        refreshDeviceInfo(state = "空闲")
+        panel.render(
+            IosPanel.Stage.IDLE,
+            if (stats == null) getString(R.string.ios_status_error) else null
+        )
         if (stats != null) {
             log("=== 结束：PING ${stats.ping} / CWPA ${stats.cwpa} / CVRP ${stats.cvrp} / " +
                 "FEED ${stats.feed}（${stats.feedBytes} B） / 共 ${stats.bytes} B ===")
-            if (stats.feed > 0) log("★ 已拿到视频流")
         }
     }
 
@@ -517,22 +537,34 @@ class MainActivity : Activity() {
         log("QT 接口 if#${itf.id} 已 claim；IN=0x${epIn.address.toString(16)} " +
             "OUT=${epOut?.let { "0x" + it.address.toString(16) } ?: "无"}")
 
-        // 8) 收流落盘
+        // 8) 收流：**一直投到用户点停止**（原先是跑 60s 就结束，那是采集测试、不是投屏）
         val outFile = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
         log("落盘：${outFile.absolutePath}")
         return outFile.outputStream().use { out ->
+            var session: QtSession? = null
             try {
-                val st = QtSession(
+                panel.render(IosPanel.Stage.MIRRORING, null)
+                refreshDeviceInfo(state = "投屏中")
+                session = QtSession(
                     connQt, epIn, epOut, out, ::log,
-                    onCsd = { csd ->
-                        pendingCsd = csd
-                        ensureDecoder()
-                    },
-                    onFrame = { f -> decoder?.submit(f) }
-                ).run(maxSeconds = 60)
-                if (st.ping > 0 || st.bytes > 0) return@use st
+                    onCsd = { csd -> onCsdArrived(csd) },
+                    onFrame = { f ->
+                        decoder?.submit(f)
+                        if (!firstFrameDone.getAndSet(true)) {
+                            // 首帧到了：收起面板把画面让出来（药丸仍显示「投屏中」）
+                            log("首帧已渲染 ⇒ 收起面板")
+                            panel.render(IosPanel.Stage.MIRRORING, null)
+                            panel.setMenuVisible(false)
+                        }
+                    }
+                )
 
-                log("12s 内没有 PING ⇒ 用配置 4→5 重新武装一次")
+                activeSession = session
+                // 用短窗口探一下：一字节都没有 = 设备侧没武装，交回上层重新唤醒
+                var st = session.run(maxSeconds = 0, idleAbortSeconds = 12)
+                if (st.bytes > 0 || stopRequested) return@use st
+
+                log("12s 内没有任何数据 ⇒ 用配置 4→5 重新武装一次")
                 transport.release(connQt, itf)
                 val cfg4 = transport.configurationById(dev, 4)
                 if (cfg4 != null) {
@@ -550,11 +582,20 @@ class MainActivity : Activity() {
                     log("  重新武装后没有 bulk IN")
                     return@use st
                 }
-                QtSession(
+                session = QtSession(
                     connQt, in2, out2, out, ::log,
-                    onCsd = { csd -> pendingCsd = csd; ensureDecoder() },
-                    onFrame = { f -> decoder?.submit(f) }
-                ).run(maxSeconds = 30)
+                    onCsd = { csd -> onCsdArrived(csd) },
+                    onFrame = { f ->
+                        decoder?.submit(f)
+                        if (!firstFrameDone.getAndSet(true)) {
+                            panel.render(IosPanel.Stage.MIRRORING, null)
+                            panel.setMenuVisible(false)
+                        }
+                    }
+                )
+                activeSession = session
+                st = session.run(maxSeconds = 0, idleAbortSeconds = 12)
+                st
             } finally {
                 // ★ 收尾必须「还原配置」，否则设备留在配置 5，下次 activate 变空操作
                 //   —— 这正是「必须重启 iPad」的真正原因。

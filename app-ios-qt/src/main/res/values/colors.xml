@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  主机端配色（深色，投屏优先：界面越暗，画面越突出）。
+
+  命名按"用途"而不是"颜色"，改主题时不用改布局。
+-->
+<resources>
+
+    <!-- 底色 / 面板 / 卡片 -->
+    <color name="ios_bg">#FF0A0E13</color>
+    <color name="ios_panel">#F2101722</color>
+    <color name="ios_panel_stroke">#1FFFFFFF</color>
+    <color name="ios_card">#14FFFFFF</color>
+    <color name="ios_card_stroke">#1AFFFFFF</color>
+    <color name="ios_tile">#12FFFFFF</color>
+    <color name="ios_tile_stroke">#1FFFFFFF</color>
+    <color name="ios_tile_pressed">#2EFFFFFF</color>
+
+    <!-- 文字三级 -->
+    <color name="ios_text">#FFF1F5F8</color>
+    <color name="ios_text_dim">#A6B4C0CB</color>
+    <color name="ios_text_faint">#73A8B4BD</color>
+
+    <!-- 强调色与状态色 -->
+    <color name="ios_accent">#FF3D7BFF</color>
+    <color name="ios_accent_soft">#FF2A5BD7</color>
+    <color name="ios_accent_glow">#553D7BFF</color>
+    <color name="ios_ok">#FF34D399</color>
+    <color name="ios_warn">#FFFBBF24</color>
+    <color name="ios_err">#FFF87171</color>
+    <color name="ios_idle">#FF8899A6</color>
+
+</resources>

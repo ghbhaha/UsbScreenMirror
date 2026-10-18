@@ -15,7 +15,9 @@ import java.nio.ByteBuffer
  */
 internal class H264Decoder(
     private val surface: Surface,
-    private val log: (String) -> Unit
+    private val log: (String) -> Unit,
+    /** 解码器首次交出真实画面尺寸（含裁剪）时回调 —— 视频视图按它做信箱适配 */
+    private val onSize: ((Int, Int) -> Unit)? = null
 ) {
 
     private var codec: MediaCodec? = null
@@ -39,6 +41,21 @@ internal class H264Decoder(
             log("✗ 解码器启动失败：${it.message}")
             false
         }
+    }
+
+    /**
+     * 分辨率变化（iPad 转屏）时重建解码器。
+     *
+     * MediaCodec 对**流中途的 SPS 变化**支持并不一致：实测旧 codec 会停在
+     * "收得到码流、但不吐帧"的状态（FEED 一直在涨，帧数不动）。重建最干净。
+     */
+    fun restart(csd: ByteArray) {
+        log("重建解码器（新 csd ${csd.size}B）")
+        runCatching { codec?.stop() }
+        runCatching { codec?.release() }
+        codec = null
+        frames = 0
+        start(csd)
     }
 
     /** 送一帧（Annex-B）。 */
@@ -66,6 +83,23 @@ internal class H264Decoder(
         val info = MediaCodec.BufferInfo()
         while (true) {
             val outIdx = c.dequeueOutputBuffer(info, 0)
+            if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                // 真实画面尺寸以解码器交出的 format 为准（比自己解 SPS 里的裁剪矩形可靠）
+                runCatching {
+                    val f = c.outputFormat
+                    var w = f.getInteger(MediaFormat.KEY_WIDTH)
+                    var h = f.getInteger(MediaFormat.KEY_HEIGHT)
+                    val cropL = if (f.containsKey("crop-left")) f.getInteger("crop-left") else 0
+                    val cropR = if (f.containsKey("crop-right")) f.getInteger("crop-right") else 0
+                    val cropT = if (f.containsKey("crop-top")) f.getInteger("crop-top") else 0
+                    val cropB = if (f.containsKey("crop-bottom")) f.getInteger("crop-bottom") else 0
+                    if (cropR > cropL) w = cropR - cropL + 1
+                    if (cropB > cropT) h = cropB - cropT + 1
+                    log("视频尺寸 ${w}x$h")
+                    onSize?.invoke(w, h)
+                }.onFailure { log("读视频尺寸失败：${it.message}") }
+                continue
+            }
             if (outIdx >= 0) {
                 c.releaseOutputBuffer(outIdx, true)   // true = 直接渲染到 Surface
                 frames++
