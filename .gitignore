@@ -22,3 +22,10 @@ app-ios-qt/src/main/assets/pc_host.der
 app-ios-qt/src/main/assets/pc_root.der
 app-ios-qt/src/main/assets/pc_host_key.pem
 app-ios-qt/src/main/assets/pc_hostid.txt
+
+# 签名密钥与口令：**绝不入库**
+# 实际的 keystore 放在 ~/.android/（用户级，本来就不在仓库里）；口令在用户级
+# $GRADLE_USER_HOME/gradle.properties。这里再加一层防御，防止有人拷进来。
+*.jks
+*.keystore
+keystore.properties
