@@ -45,7 +45,9 @@ class HidInjector(
             timeoutMs,
         )
         if (n < 0) {
-            logger.e(TAG, "REGISTER_HID[$id] 失败 n=$n（手机是否真的在配件模式？）")
+            // 机顶盒/车机这类没有触摸源的宿主上，这条是**正常结果**（实测 RK356x n=-1），
+            // 因此只记 WARN 且不要把它写成"手机是不是没在配件模式"这种误导性结论。
+            logger.w(TAG, "REGISTER_HID[$id] 失败 n=$n（本机若无触摸屏可忽略）")
             return false
         }
 

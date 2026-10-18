@@ -123,28 +123,65 @@ class VideoDecoder(
         return false
     }
 
-    private fun tryConfigure(width: Int, height: Int, csdUnits: List<ByteArray>): Boolean {
+    /**
+     * 逐个组合尝试 configure。
+     *
+     * ★ 为什么需要"去掉调优参数再试一次"（真机教训，RK356x 电视盒子）：
+     *   `MediaFormat.setInteger(KEY_LOW_LATENCY, 1)` **永远不会失败** —— 它只是往包里塞一个键。
+     *   真正的失败发生在 `configure()` 里：`ACodec` 会去 `setConfig(OMX_…lowLatency)`，
+     *   而 RK 的 **legacy OMX 组件**（`OMX.rk.video_decoder.avc`）对这个 index 返回
+     *   `UnsupportedIndex(0x8000101a)`，于是 `ACodec` **直接判 configureCodec 失败**：
+     *   ```
+     *   E/ACodec: decoder can not set low-latency to 1 (err -1010)
+     *   E/ACodec: [OMX.rk.video_decoder.avc] configureCodec returning error -1010
+     *   ```
+     *   ⇒ 原来那句注释"不支持就忽略"是错的：它**会**把启动挡死，且只在老组件上出现
+     *   （手机端 MTK/高通用的是 Codec2，能接受这个键，所以一直没暴露）。
+     *   ⇒ 所以调优参数必须是**可退让的**：先带调优试一次，失败就用最小 format 再试。
+     */
+    private fun tryConfigure(width: Int, height: Int, csdUnits: List<ByteArray>): Boolean =
+        tryConfigure(width, height, csdUnits, tune = true) ||
+            tryConfigure(width, height, csdUnits, tune = false)
+
+    /**
+     * @param tune 是否附加 `low-latency` / `priority` 这类**非必需**调优键。
+     *   老厂商 OMX 组件可能因为它们直接拒绝 configure（见上）。
+     */
+    private fun tryConfigure(
+        width: Int,
+        height: Int,
+        csdUnits: List<ByteArray>,
+        tune: Boolean,
+    ): Boolean {
         var c: MediaCodec? = null
         try {
             val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height)
             csdUnits.forEachIndexed { i, unit ->
                 format.setByteBuffer("csd-$i", ByteBuffer.wrap(unit))
             }
-            // ---- 低延迟（10.31）----
-            // ⚠️ 只"请求"，不支持就忽略：解码器不认这些 key 时只是没效果，不能让它挡住启动。
-            // ① 低延迟模式：解码器凑够一帧就立刻输出，不等后续参考帧（默认会攒几帧）。
-            runCatching { format.setInteger(KEY_LOW_LATENCY, 1) }
-                .onFailure { logger.w(TAG, "设置 low-latency 失败（忽略）: ${it.message}") }
-            // ② 实时优先级：与编码端同理，别被系统降级。
-            runCatching { format.setInteger(KEY_PRIORITY, 0) }
-                .onFailure { logger.w(TAG, "设置 priority 失败（忽略）: ${it.message}") }
+            if (tune) {
+                // ---- 低延迟（10.31）----
+                // ① 低延迟模式：解码器凑够一帧就立刻输出，不等后续参考帧（默认会攒几帧）。
+                // ⚠️ 设不进去不报错，是 configure() 时才失败 —— 所以外面还有一轮不带调优的重试。
+                runCatching { format.setInteger(KEY_LOW_LATENCY, 1) }
+                    .onFailure { logger.w(TAG, "设置 low-latency 失败（忽略）: ${it.message}") }
+                // ② 实时优先级：与编码端同理，别被系统降级。
+                runCatching { format.setInteger(KEY_PRIORITY, 0) }
+                    .onFailure { logger.w(TAG, "设置 priority 失败（忽略）: ${it.message}") }
+            }
             c = MediaCodec.createDecoderByType(MIME_TYPE)
             c.configure(format, surface, null, 0)
             c.start()
             codec = c
+            if (!tune) {
+                logger.w(TAG, "去掉 low-latency/priority 后才 configure 成功 —— 本机解码器不接受这些调优键（已降级）")
+            }
             return true
         } catch (t: Throwable) {
-            logger.w(TAG, "configure(csdUnits=${csdUnits.size}) 抛异常: ${t.message}")
+            logger.w(
+                TAG,
+                "configure(csdUnits=${csdUnits.size}, tune=$tune) 抛异常: ${t.message}"
+            )
             runCatching { c?.stop() }
             runCatching { c?.release() }
             return false

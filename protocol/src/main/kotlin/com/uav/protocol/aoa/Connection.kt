@@ -1,9 +1,11 @@
 package com.uav.protocol.aoa
 
+import com.uav.protocol.DesyncException
 import com.uav.protocol.Hex
 import com.uav.protocol.Logger
 import com.uav.protocol.ProtocolException
 import com.uav.protocol.adb.AdbMessage
+import com.uav.protocol.adb.DesyncRecovery
 import com.uav.protocol.e
 import com.uav.protocol.i
 import com.uav.protocol.w
@@ -67,6 +69,15 @@ class Connection(
      * 不跨连接共享。
      */
     private val frameMetaBuf = ByteArray(FrameCodec.META_SIZE)
+
+    /**
+     * 失步恢复时"已经读出来的那个报文头"（见 [recoverFromDesync]）。
+     *
+     * 只被读线程使用；`resyncHeaderPending` 表示里面有一份待消费的头。
+     */
+    private val resyncHeader = ByteArray(AdbMessage.HEADER_SIZE)
+
+    private var resyncHeaderPending = false
 
     private val writeQueue = LinkedBlockingQueue<Outbound>()
 
@@ -191,7 +202,19 @@ class Connection(
     private fun readerLoop() {
         try {
             while (running && !closing.get()) {
-                val message = AdbMessage.readFrom(transport, frameMetaBuf)
+                val message = try {
+                    // 上一次失步恢复已经把 24B 头读出来了，这里直接复用，不再重复读
+                    val pending = resyncHeaderPending
+                    resyncHeaderPending = false
+                    AdbMessage.readFrom(transport, frameMetaBuf, if (pending) resyncHeader else null)
+                } catch (desync: DesyncException) {
+                    // ★ 错位 ≠ 对端违规：前移到下一个合法报文头继续读（见 [DesyncException]）。
+                    //   以前这里直接判链路死 —— RK356x 盒子上因此永远连不上：
+                    //   配件端还在推流，宿主一上来就读到半条报文，每次都死在 bad magic 上。
+                    if (!running || closing.get()) throw desync
+                    recoverFromDesync(desync)
+                    continue
+                }
                 stats.messagesRead.incrementAndGet()
                 dispatch(message)
             }
@@ -206,6 +229,24 @@ class Connection(
                 fail(t)
             }
         }
+    }
+
+    /**
+     * 失步恢复：逐字节前移到下一个可信报文头，把结果留给下一轮 [AdbMessage.readFrom]。
+     *
+     * ⚠️ 这里**必须**逐字节而不是"丢一大块"：报文长度是自描述的，
+     *   只有落到真正的边界上才可能继续；丢一个固定数量只会换个位置继续错。
+     */
+    private fun recoverFromDesync(cause: DesyncException) {
+        val skipped = DesyncRecovery.scanForHeader(transport, resyncHeader)
+        resyncHeaderPending = true
+        val times = stats.resyncs.incrementAndGet()
+        val total = stats.resyncSkippedBytes.addAndGet(skipped.toLong())
+        logger.w(
+            tag,
+            "链路失步[$times]（${cause.message?.lineSequence()?.firstOrNull()}）" +
+                "→ 跳过 $skipped 字节后重新同步到报文头（累计跳过 $total 字节）"
+        )
     }
 
     private fun dispatch(message: AdbMessage) {
@@ -448,6 +489,17 @@ class Connection(
         val strayPayloads = AtomicLong()
 
         /**
+         * 失步重同步次数（正常应为 0）。
+         *
+         * 非 0 不必惊慌 —— 它代表"我们开始读的位置不在报文边界上"，属于**已自愈**的事件；
+         * 但它同时说明配件端在上一次会话结束时还在推流（残留数据流进了新会话）。
+         */
+        val resyncs = AtomicLong()
+
+        /** 重同步过程中累计丢弃的字节数（错位偏移量的总量）。 */
+        val resyncSkippedBytes = AtomicLong()
+
+        /**
          * 流头更新次数（= 尺寸变更 / 旋转次数）。
          *
          * 建链后正常恒为 0；手机旋转时发送端会重发流头，这里每次 +1。
@@ -483,8 +535,11 @@ class Connection(
             append("msgs(r/w)=").append(messagesRead.get()).append('/').append(messagesWritten.get())
             // 这两个只在非 0 时显示，避免正常运行时刷屏；但排查旋转 / 残留字节时是首要线索
             if (sizeChanges.get() > 0L) append(" sizeChanges=").append(sizeChanges.get())
-            if (strayPayloads.get() > 0L) append(" stray=").append(strayPayloads.get())
             if (strayPayloads.get() > 0) append(" stray=").append(strayPayloads.get())
+            if (resyncs.get() > 0) {
+                append(" resync=").append(resyncs.get())
+                append(" skipped=").append(resyncSkippedBytes.get())
+            }
             for ((id, h) in headersSeen) {
                 append(" | ").append(StreamId.name(id)).append('=')
                     .append(h.codecId).append(' ').append(h.width).append('x').append(h.height)

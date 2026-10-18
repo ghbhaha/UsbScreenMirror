@@ -227,7 +227,14 @@ class HidTouchController(private val logger: Logger = AndroidLogger) {
         val id = idSeq.incrementAndGet()
         val descriptor = HidTouchPanel.descriptor(spaceWidth, spaceHeight)
         if (!inj.registerAndLoad(id, descriptor)) {
-            logger.e(TAG, "HID 触摸屏注册失败（手机是否在配件模式？）")
+            // ⚠️ 用 WARN 而不是 ERROR：**机顶盒 / 车机根本没有触摸屏**，注册失败是正常结果
+            //   （实测 RK356x 盒子 REGISTER_HID 直接返回 n=-1）。真正的失败情形是
+            //   "触屏宿主上注册不上" —— 那才需要查手机是否在配件模式。
+            logger.w(
+                TAG,
+                "HID 触摸回传未注册（画面不受影响）。触屏宿主请检查手机是否在配件模式；" +
+                    "机顶盒/车机没有触摸源，可忽略。",
+            )
             return
         }
         registeredId = id

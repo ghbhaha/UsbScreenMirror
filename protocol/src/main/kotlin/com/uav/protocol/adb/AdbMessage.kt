@@ -1,6 +1,7 @@
 package com.uav.protocol.adb
 
 import com.uav.protocol.Bytes
+import com.uav.protocol.DesyncException
 import com.uav.protocol.Hex
 import com.uav.protocol.ProtocolException
 import com.uav.protocol.aoa.Command
@@ -145,37 +146,47 @@ class AdbMessage(
          *
          *   ⚠️ 这个缓冲**由调用方持有**（每连接一个），因为只有读线程用它 —— 不要跨连接共享。
          *
+         * @param header **已经读好的 24B 报文头**（失步恢复用，见 [DesyncRecovery]）。
+         *   传非 null 就跳过"读头"这一步 —— 扫描器已经把这 24 字节从流里取出来了，
+         *   再读一次就会把后面的 payload 吃掉。
+         *
          * @throws EOFException     对端关闭（读头或读 payload 时）
-         * @throws ProtocolException magic 不符 / 长度超限 / checksum 不符 / 收到已裁剪命令
+         * @throws DesyncException  字节流错位（magic / 长度 / checksum 不符）—— **可重同步**
+         * @throws ProtocolException 收到已裁剪命令 —— 不可恢复
          */
-        fun readFrom(transport: Transport, frameMeta: ByteArray? = null): AdbMessage {
-            val header = ByteArray(HEADER_SIZE)
-            try {
-                transport.readFully(header, 0, HEADER_SIZE)
-            } catch (eof: EOFException) {
-                throw EOFException("EOF while reading message header: ${eof.message}")
+        fun readFrom(
+            transport: Transport,
+            frameMeta: ByteArray? = null,
+            header: ByteArray? = null,
+        ): AdbMessage {
+            val hdr = header ?: ByteArray(HEADER_SIZE).also {
+                try {
+                    transport.readFully(it, 0, HEADER_SIZE)
+                } catch (eof: EOFException) {
+                    throw EOFException("EOF while reading message header: ${eof.message}")
+                }
             }
 
-            val command = Bytes.getIntLE(header, 0)
-            val arg0 = Bytes.getIntLE(header, 4)
-            val arg1 = Bytes.getIntLE(header, 8)
-            val dataLength = Bytes.getIntLE(header, 12)
-            val dataCheck = Bytes.getIntLE(header, 16)
-            val magic = Bytes.getIntLE(header, 20)
+            val command = Bytes.getIntLE(hdr, 0)
+            val arg0 = Bytes.getIntLE(hdr, 4)
+            val arg1 = Bytes.getIntLE(hdr, 8)
+            val dataLength = Bytes.getIntLE(hdr, 12)
+            val dataCheck = Bytes.getIntLE(hdr, 16)
+            val magic = Bytes.getIntLE(hdr, 20)
 
-            // 1) magic 校验 —— 错位的第一道防线
+            // 1) magic 校验 —— 错位的第一道防线（★ 判为 DesyncException：可重同步）
             if (magic != (command xor -1)) {
-                throw ProtocolException(
+                throw DesyncException(
                     "bad magic: got 0x${Integer.toHexString(magic)} expected 0x" +
                         Integer.toHexString(command xor -1) +
                         " (command=0x${Integer.toHexString(command)})\n" +
-                        Hex.dump(header, 0, HEADER_SIZE)
+                        Hex.dump(hdr, 0, HEADER_SIZE)
                 )
             }
 
             // 2) 长度上限 —— 防伪造头导致 OOM
             if (dataLength < 0 || dataLength > Protocol.MAX_PAYLOAD_SIZE) {
-                throw ProtocolException(
+                throw DesyncException(
                     "data_length out of range: $dataLength (max ${Protocol.MAX_PAYLOAD_SIZE}), " +
                         "command=0x${Integer.toHexString(command)}"
                 )
@@ -192,18 +203,18 @@ class AdbMessage(
                 val ptsAndFlags = Bytes.getLongLE(frameMeta, 0)
                 val size = Bytes.getIntLE(frameMeta, 8)
                 if (size < 0 || size > Protocol.MAX_FRAME_SIZE) {
-                    throw ProtocolException("frame size out of range: $size (max ${Protocol.MAX_FRAME_SIZE})")
+                    throw DesyncException("frame size out of range: $size (max ${Protocol.MAX_FRAME_SIZE})")
                 }
                 val declared = dataLength - FrameCodec.META_SIZE
                 if (size != declared) {
-                    throw ProtocolException("frame size mismatch: declared $size, actual $declared")
+                    throw DesyncException("frame size mismatch: declared $size, actual $declared")
                 }
                 val data = ByteArray(size)
                 transport.readFully(data, 0, size)
                 // checksum 是逐字节累加 ⇒ 可以分段相加（8 MiB 上限不会溢出 Int）
                 val actual = checksumOf(frameMeta, 0, FrameCodec.META_SIZE) + checksumOf(data, 0, size)
                 if (actual != dataCheck) {
-                    throw ProtocolException(
+                    throw DesyncException(
                         "bad checksum for WRTE: got 0x${Integer.toHexString(actual)} " +
                             "expected 0x${Integer.toHexString(dataCheck)}"
                     )
@@ -219,7 +230,7 @@ class AdbMessage(
             // 4) payload 校验和
             val actual = checksumOf(payload, 0, payload.size)
             if (actual != dataCheck) {
-                throw ProtocolException(
+                throw DesyncException(
                     "bad checksum for ${Command.fromWire(command)?.name ?: "0x${Integer.toHexString(command)}"}: " +
                         "got 0x${Integer.toHexString(actual)} expected 0x${Integer.toHexString(dataCheck)}"
                 )
