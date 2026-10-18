@@ -13,6 +13,7 @@ import android.view.WindowManager
 import androidx.core.content.ContextCompat
 import com.uav.host.R
 import com.uav.host.ios.ui.IosPanel
+import com.uav.protocol.ios.QtStats
 import com.uav.protocol.ios.SampleParser
 import com.uav.protocol.ios.QtPacket
 import java.io.File
@@ -442,7 +443,7 @@ class IosActivity : Activity() {
         }
     }
 
-    private fun capture(): QtSession.Stats? {
+    private fun capture(): QtStats? {
         // 1) 找设备
         var dev = transport.findAppleDevice()
         if (dev == null) {

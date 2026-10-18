@@ -49,6 +49,20 @@ object AudioParser {
     }
 
     /**
+     * 设备没在 `fdsc` 里给出格式时的兜底。
+     *
+     * 实测本机 iPad8,9 恒为 `lpcm 48000Hz/16bit/2ch`、`formatFlags = 12`
+     * （`kAudioFormatFlagIsSignedInteger or kAudioFormatFlagIsPacked`）。
+     */
+    val DEFAULT_FORMAT = Format(
+        sampleRate = 48_000,
+        channels = 2,
+        bitsPerChannel = 16,
+        codec = "lpcm",
+        formatFlags = 12,
+    )
+
+    /**
      * 取出一个 EAT 帧里的 PCM。
      *
      * @return 裸 PCM（按 [format] 描述的布局交错）；不是音频样本或结构不符时返回 null

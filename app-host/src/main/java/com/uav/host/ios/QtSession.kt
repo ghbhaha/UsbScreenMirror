@@ -5,6 +5,8 @@ import android.hardware.usb.UsbEndpoint
 import com.uav.protocol.ios.SampleParser
 import com.uav.protocol.ios.AudioParser
 import com.uav.protocol.ios.QtPacket
+import com.uav.protocol.ios.QtProtocolCore
+import com.uav.protocol.ios.QtStats
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
@@ -46,28 +48,7 @@ internal class QtSession(
     private val requestAudio: Boolean = false
 ) {
 
-    data class Stats(
-        var ping: Int = 0,
-        var cwpa: Int = 0,
-        var cvrp: Int = 0,
-        var afmt: Int = 0,
-        var og: Int = 0,
-        var skew: Int = 0,
-        var eat: Int = 0,
-        var audioBytes: Long = 0,
-        var clok: Int = 0,
-        var time: Int = 0,
-        var feed: Int = 0,
-        var other: Int = 0,
-        var bytes: Long = 0,
-        var feedBytes: Long = 0
-    )
-
-    private var audioClock = 0L
-    private var videoClock = 0L
     private var tail = ByteArray(0)
-    /** 上一次交给上层的 SPS/PPS —— 内容变了（iPad 转屏）才需要重建解码器 */
-    private var lastCsd: ByteArray? = null
 
     /** 外部停止信号（点「停止投屏」时置位）。 */
     @Volatile
@@ -104,7 +85,7 @@ internal class QtSession(
         maxSeconds: Int,
         maxFrames: Int = Int.MAX_VALUE,
         idleAbortSeconds: Int = 0
-    ): Stats {
+    ): QtStats {
         // 写线程与读循环同生共死：任何一条返回路径（含异常）都要收掉它
         startWriter()
         try {
@@ -118,8 +99,7 @@ internal class QtSession(
         maxSeconds: Int,
         maxFrames: Int = Int.MAX_VALUE,
         idleAbortSeconds: Int = 0
-    ): Stats {
-        val st = Stats()
+    ): QtStats {
         // ★ 读缓冲必须小：1 MiB 的 bulk IN 在 xHCI 上会排成一长串传输描述符，
         //   而设备最先发的是 16B 的 PING（短包）——短包会让整串立即取消，
         //   取消 URB 正是会把设备端点弄坏的动作（本项目已踩过）。
@@ -128,6 +108,40 @@ internal class QtSession(
         val start = System.currentTimeMillis()
         val deadline = if (maxSeconds > 0) start + maxSeconds * 1000L else Long.MAX_VALUE
         val idleDeadline = if (idleAbortSeconds > 0) start + idleAbortSeconds * 1000L else Long.MAX_VALUE
+
+        // ★ 协议状态机在 `:protocol/ios/QtProtocolCore` —— 本类只负责 USB 收发与线程。
+        //   这样"入站报文 → 出站字节"的映射可以在 JVM 单测里钉住，不必插着 iPad 试。
+        val core = QtProtocolCore(
+            enqueue = { write(it) },
+            writeNow = { data -> epOut?.let { conn.bulkTransfer(it, data, data.size, 1000) } ?: -1 },
+            log = log,
+            requestAudio = requestAudio,
+            // 没有帧回调时不解析 NAL（纯抓包/探测场景省 CPU）—— 与改造前行为一致
+            parseFrames = onFrame != null,
+            startedAtMillis = start,
+            listener = object : QtProtocolCore.Listener {
+                override fun onCsd(csd: ByteArray) {
+                    onCsd?.invoke(csd)
+                }
+
+                override fun onFrame(annexB: ByteArray) {
+                    onFrame?.invoke(annexB)
+                }
+
+                override fun onAudio(pcm: ByteArray, format: AudioParser.Format) {
+                    onAudio?.invoke(pcm, format)
+                }
+
+                /** 抓包转储：写 `[4B 长度][原始报文]`，与改造前逐字节一致 */
+                override fun onFeedRaw(payload: ByteArray) {
+                    sink?.let {
+                        it.write(QtPacket.u32(payload.size))
+                        it.write(payload)
+                    }
+                }
+            },
+        )
+        val st = core.stats
 
         var timeouts = 0
         var lastReport = start
@@ -170,7 +184,7 @@ internal class QtSession(
                 if (buf.size < len) break               // 半包，等下一次
                 val payload = buf.copyOfRange(4, len)
                 buf = buf.copyOfRange(len, buf.size)
-                if (payload.size >= 4) handle(payload, st, start)
+                if (payload.size >= 4) core.handle(payload)
                 if (st.feed >= maxFrames) {
                     log("已收满 $maxFrames 帧，停止")
                     tail = ByteArray(0)
@@ -180,158 +194,6 @@ internal class QtSession(
             tail = buf
         }
         return st
-    }
-
-    /**
-     * 把 SPS/PPS 交给上层 —— **只在内容变化时**交。
-     *
-     * iPad 转屏（竖⇄横）会让编码分辨率改变，设备随下一个 FEED 送来新的 avcC。
-     * 早期这里用 `csdSent` 标志"只发一次"，于是转屏后解码器仍拿着旧分辨率的 csd：
-     * 收流照旧、**渲染直接停住**（FEED 一直在来，帧数不动）。
-     */
-    private fun deliverCsd(csd: ByteArray, from: String) {
-        val prev = lastCsd
-        if (prev != null && prev.contentEquals(csd)) return
-        lastCsd = csd
-        if (prev == null) log("★ 从 $from 解出 SPS/PPS ${csd.size}B")
-        else log("★ 从 $from 解出新 SPS/PPS ${csd.size}B（分辨率变了，重建解码器）")
-        onCsd?.invoke(csd)
-    }
-
-    private fun handle(p: ByteArray, st: Stats, startMs: Long) {
-        when {
-            QtPacket.matches(p, 0, "ping") -> {
-                st.ping++
-                log("PING#${st.ping} 收到 ${p.size}B: " + p.joinToString(" ") { "%02x".format(it) })
-                val w = epOut?.let { conn.bulkTransfer(it, QtPacket.ping(), 16, 1000) } ?: -1
-                log("PING#${st.ping} → 回写 $w B")
-            }
-
-            QtPacket.matches(p, 0, "sync") && p.size >= 16 -> {
-                val corr = QtPacket.u64At(p, 16)
-                when {
-                    QtPacket.matches(p, 12, "cwpa") && p.size >= 32 -> {
-                        st.cwpa++
-                        audioClock = QtPacket.u64At(p, 24)
-                        // ★ 每个 CWPA 都发 HPD1×2 —— 与参考实现逐字节一致。
-                        //   曾经为"免得包数翻倍"改成整个会话只发一轮，但从那以后音频再没出现过；
-                        //   设备自己会连发两次 CWPA，对第二个只回 clock+HPA1 与参考实现不同，
-                        //   而这段正是音频协商路径，不能自作聪明。
-                        write(QtPacket.hpd1())
-                        write(QtPacket.hpd1())
-                        write(QtPacket.clockReply(corr, audioClock + 0x1000))
-                        if (requestAudio) {
-                            write(QtPacket.hpa1(audioClock))
-                            log("CWPA#${st.cwpa} audio=$audioClock → HPD1×2+clock+HPA1")
-                        } else {
-                            log("CWPA#${st.cwpa} audio=$audioClock → HPD1×2+clock（未声明音频）")
-                        }
-                    }
-
-                    QtPacket.matches(p, 12, "cvrp") && p.size >= 32 -> {
-                        st.cvrp++
-                        videoClock = QtPacket.u64At(p, 24)
-                        write(QtPacket.need(videoClock))
-                        write(QtPacket.clockReply(corr, videoClock + 0x1000af))
-                        log("CVRP video=$videoClock → NEED+clock")
-                    }
-
-                    QtPacket.matches(p, 12, "afmt") -> {
-                        st.afmt++
-                        // 设备在这里声明它**将要用的**音频格式；打出来便于对照本端能否解码
-                        val want = AudioParser.afmtFormat(p)
-                        write(QtPacket.afmtReply(corr))
-                        log("AFMT → reply（设备要求 $want）")
-                    }
-
-                    // ★ 设备问「当前音频时钟偏差多少」。
-                    //   参考实现（iPhoneMirror 的 QuickTimeSession.cpp）回的是 **48000.0**
-                    //   （= 采样率），而不是 0 —— 已按它对齐。
-                    QtPacket.matches(p, 12, "skew") -> {
-                        st.skew++
-                        write(QtPacket.skewReply(corr, 48_000.0))
-                        log("SKEW → reply(48000.0)")
-                    }
-
-                    // ★ 线上字节 20 21 6F 67 ⇒ fourcc 名是 "go! "（早先误写成 "og! "，反转后永远匹配不上）；
-                    //   但它是音频开始推的前置之一（不回它，设备只推视频）。
-                    QtPacket.matches(p, 12, "go! ") -> {
-                        st.og++
-                        write(QtPacket.ogReply(corr))
-                        log("OG → reply")
-                    }
-
-                    QtPacket.matches(p, 12, "clok") -> {
-                        st.clok++
-                        write(QtPacket.clockReply(corr, QtPacket.u64At(p, 4) + 0x10000))
-                    }
-
-                    QtPacket.matches(p, 12, "time") -> {
-                        st.time++
-                        write(QtPacket.timeReply(corr, (System.currentTimeMillis() - startMs) * 1_000_000))
-                    }
-
-                    else -> {
-                        st.other++
-                        log("SYNC ${QtPacket.fccString(p, 12)}")
-                    }
-                }
-            }
-
-            QtPacket.matches(p, 0, "asyn") && p.size >= 16 -> {
-                if (QtPacket.matches(p, 12, "sprp")) {
-                    st.other++
-                    val body = if (p.size > 16) p.copyOfRange(16, p.size) else ByteArray(0)
-                    log("ASYN sprp ${p.size}B hex=${body.joinToString(" ") { "%02x".format(it) }}")
-                    SampleParser.csd(body)?.let { deliverCsd(it, "sprp") }
-                } else if (QtPacket.matches(p, 12, "feed")) {
-                    st.feed++
-                    st.feedBytes += p.size
-                    sink?.let {
-                        it.write(QtPacket.u32(p.size))
-                        it.write(p)
-                    }
-                    if (st.feed <= 3 || st.feed % 60 == 0) {
-                        log("FEED #${st.feed}  ${p.size} B")
-                    }
-                    // ★ SPS/PPS 不在 ASYN/sprp 里（那条只是 ObeyEmptyMediaMarkers 之类的键值），
-                    //   而是嵌在 **FEED 样本尾部的字典**里：
-                    //   `… 'datv' | 4B 长度 | 01 64 00 2a ff e1 00 10 <SPS16> 01 00 04 <PPS4>`
-                    //   ⇒ 每个 FEED 都试一次，拿到就不再试。
-                    SampleParser.csd(p)?.let { deliverCsd(it, "FEED 尾部") }
-                    if (onFrame != null) {
-                        val frame = SampleParser.frame(p)
-                        if (frame != null) onFrame.invoke(frame)
-                    }
-                    if (videoClock != 0L) write(QtPacket.need(videoClock))
-                } else if (QtPacket.matches(p, 12, "eat!")) {
-                    // 音频样本：与 FEED 同构的 sbuf，只是 sdat 里装裸 PCM
-                    st.eat++
-                    val pcm = AudioParser.pcm(p)
-                    if (pcm != null) {
-                        st.audioBytes += pcm.size
-                        if (st.eat <= 3 || st.eat % 200 == 0) {
-                            log("EAT #${st.eat}  ${p.size}B → PCM ${pcm.size}B " +
-                                "（累计 ${st.audioBytes} B，${AudioParser.sampleCount(p)} 样本，" +
-                                "pts=${"%.3f".format(AudioParser.ptsSeconds(p))}s）")
-                        }
-                        onAudio?.invoke(pcm, AudioParser.format(p) ?: PcmAudioPlayer.DEFAULT_FORMAT)
-                    } else {
-                        log("EAT #${st.eat} 结构未识别（${p.size}B）")
-                    }
-                } else {
-                    st.other++
-                    log("ASYN ${QtPacket.fccString(p, 12)} ${p.size}B")
-                }
-            }
-
-            QtPacket.matches(p, 0, "rply") -> st.other++
-
-            else -> {
-                st.other++
-                log("未知 ${QtPacket.fccString(p, 0)} ${p.size}B")
-            }
-        }
     }
 
     /**
