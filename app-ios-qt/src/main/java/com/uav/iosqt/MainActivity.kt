@@ -45,7 +45,7 @@ class MainActivity : Activity() {
      * ⚠️ 打开会让 iPad 把音频路由到 USB；**若本端收不到 EAT 帧，iPad 上点播放会立刻暂停**。
      * 所以只在排查音频时临时置 true，验证完必须改回 false。
      */
-    private val requestAudio = true
+    private val requestAudio = false
 
     /** 用户点了「停止投屏」 */
     @Volatile
