@@ -198,25 +198,75 @@ app-ios-qt           已删除（"选择页 → iPad" 就是原来的调试入�
 ⇒ ChooserActivity 里**退回合并前的老启发式**（有 bulk 端点对就当候选，交给 AOA 去试），
 否则"插线即达"会退化成"每次手点一下"。内建 HID 触摸屏/键鼠是中断端点，不会被误挑。
 
-## 十、合并后实测（2026-10-18 18:2x）
+## 十、合并后实测（2026-10-18 18:11 ~ 18:32）
 
-**iPad 走完合并路径：通。** 同一个 APK，插 iPad8,9 → `ChooserActivity` 按 VID `0x05AC`
-判成 iOS 直达 `IosActivity` → 画面完整上屏、**音频出声**，与合并前 `app-ios-qt` 行为一致。
+### 第一次测试：假的失败（旧 APK 残留）
 
-这说明三件容易出岔子的事都没坏：
+插 iPad 后"点了不动"，`dumpsys window` 看到 `Application Error: com.uav.host`，
+dropbox 里三次崩溃全是同一个：
 
-1. **清单迁移**：`LAUNCHER` 与 `USB_DEVICE_ATTACHED` 过滤器从 `HostActivity` 摘到
-   `ChooserActivity` 后，attach 派发仍然只到一处，没有互相抢；
-2. **资源改名**：12 个 drawable 加 `ios_` 前缀、layout 里 `com.uav.host.video.AspectRatioSurfaceView`
-   的全限定名替换，运行时没有 `Resources$NotFoundException` / `ClassNotFoundException`；
-3. **写线程与解码器**：`QtSession` 的 `qt-writer` 单线程、`H264Decoder.restart(csd)` 在新 Activity
-   里照旧工作 —— 转屏后的解码器重建链路没被搬家打断。
+```
+java.lang.ClassNotFoundException: com.uav.iosqt.video.AspectRatioSurfaceView
+  at IosActivity.onCreate(IosActivity.kt:97) → setContentView(activity_ios)
+```
 
-**还没验的（不能默认通过）：**
+而 `grep -r uav.iosqt app-host/src protocol/src` 一个字都没有 —— **源码早改好了，
+设备上跑的是修复前的包**。教训不是"包名要改"，而是：**验证合并这种跨模块改动，
+先确认设备上装的确实是刚构建的那个包**（`dumpsys package | grep lastUpdateTime`），
+否则会在一个已经修掉的 bug 上白查一轮。改包的修复本身见 §九 上方记录的
+"layout 里 `class=` 属性最容易漏"。
+
+### 第二次测试：真失败 —— 入口页没有轮询兜底
+
+装上新包后仍不跳。用 `am start -a android.hardware.usb.action.USB_DEVICE_ATTACHED`
+**手工制造**一次 attach intent，分类逻辑立刻正确：
+
+```
+I/Chooser: handleAttach action=android.hardware.usb.action.USB_DEVICE_ATTACHED
+I/Chooser:   extra=null 选定=5ac:12ab
+I/Chooser:   → iOS 投屏页
+```
+
+同时 `dumpsys usb` 里 iPad 明明在列（`vendor_id=1452` = 0x05AC，`product_id=4779`），
+但插线那一刻 `logcat` 里**没有任何 attach 派发**。
+
+⇒ 命中项目里早有的一条硬结论：**BOE P40UCH 的 USB host 栈在设备插入时不派发
+`USB_DEVICE_ATTACHED`，只派发 DETACHED**。AOA 路径之所以"插线即达"，靠的从来不是
+清单里的 intent-filter，而是 `UsbAttachRouter.startForegroundPolling()` 那个轮询。
+合并时把入口搬到 `ChooserActivity`，**把这条隐形依赖丢在了旧 Activity 里**。
+
+这是"搬家式重构"最典型的失效模式：清单能被 grep 到、代码能被编译校验，
+而**"谁来定期看一眼设备表"这件事不在任何一处显式声明**。
+
+### 修复（`ChooserActivity`）
+
+1. **前台轮询兜底**：`onResume` 起 1s 定时轮询（`onPause` 停），对比 `deviceId` 基线，
+   只对**基线之外新出现**的设备做跳转判定。
+   - 基线 = 进本页时已插着的设备 ⇒ 用户手动点图标进来想选安卓手机时，不会被
+     正插着的 iPad 立刻踢走；
+   - 设备拔出时从基线移除 ⇒ 同一条线再插回来仍算"新出现"，拔插可重复触发。
+2. **`EXTRA_DEVICE` 为空时的兜底**：部分 ROM / 走 `meta-data` 过滤器匹配时，
+   attach intent 不带这个 extra。此时退回"设备表里唯一的 Apple 设备"，
+   0 台或多台一律不猜（停在选择页）。
+3. **区分"插线拉起"与"手动打开"**：显式判 `action == USB_DEVICE_ATTACHED`，
+   不再只看有没有 extra。
+4. **诊断日志**（`Chooser` 标签，`DebugTools` 门控）：`action` / `extra` / `选定` / 跳转目标。
+   入口分类是"静默失败"高发区，没有这行日志就只能靠猜。
+
+### 结果
+
+```
+18:31:34.378 I/Chooser: 轮询到新设备：2042=5ac:12ab
+18:31:34.385 I/Chooser:   → iOS 投屏页
+```
+
+拔插 iPad → 7ms 内进 `IosActivity`，无崩溃；投屏与音频与合并前一致。
+
+**仍然没验的：**
 
 - **AOA 路径的入口复验**：`HostActivity` 内部一行未改，但它在清单里不再是 LAUNCHER，
-  `ChooserActivity` 的 IGNORE 分支要靠 `BulkPair.hasBulkPair()` 兜底。这一条**只影响"插上手机
-  能不能自动进投屏页"**，不影响投屏本身，但必须实测一次才算证完 —— 记忆里的硬结论是
-  「删掉/搬走的代码不会自己报错」，清单搬家属于同一类。
+  走的是 `ChooserActivity` 的 IGNORE 分支 + `BulkPair.hasBulkPair()` 兜底。
+  现在轮询也覆盖这条分支了，理论上"插手机自动进 AOA 页"应该恢复，但必须实测一次
+  —— 「删掉/搬走的代码不会自己报错」。
 - 两台设备先后插拔时的分类（iPad 拔掉立刻插手机、反之）。
 
