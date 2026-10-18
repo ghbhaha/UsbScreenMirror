@@ -2,6 +2,9 @@ package com.uav.iosqt
 
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
+import com.uav.protocol.ios.Lockdown
+import com.uav.protocol.ios.PlistXml
+import com.uav.protocol.ios.PValue
 
 /**
  * usbmux + lockdownd 会话（跑在接口 `0xFF/0xFE/02` 上），可选升级 TLS。
@@ -28,6 +31,13 @@ import android.hardware.usb.UsbEndpoint
  *   **Data Offset 写在 byte 12 的高 4 位**（`0x50`，不是 `0x05`）；数据段只带 `TH_ACK(0x10)`，
  *   从不设 PSH；窗口 512（按 256 缩放）。
  * - lockdownd 隧道流 = `[u32 **大端**长度][plist]`，长度不含自身 4 字节；设备回复恒为 XML plist。
+ *
+ * ## 两种用法
+ *
+ * - **会话模式** `open()`：QueryType → StartSession →（TLS）→ GetValue，用于投屏时维持
+ *   「受信任主机在线」这个前提；
+ * - **配对模式** `openRaw()` + `request()`：由 [Pairing] 组合出 GetValue(DevicePublicKey)
+ *   → GetValue 全量 → Pair 这套序列。
  */
 internal class MuxLink(
     private val conn: UsbDeviceConnection,
@@ -59,8 +69,18 @@ internal class MuxLink(
 
     private var tls: TlsTunnel? = null
 
+    /** 已收到的 lockdownd 应答条数（配对流程靠它做「等下一条」的同步）。 */
     @Volatile
-    var lockdownReply: String? = null
+    var replyCount = 0
+        private set
+
+    /** 最近一条应答（已解析）；解析失败时对应该条原文见 [lastReplyText]。 */
+    @Volatile
+    var lastReply: PValue? = null
+        private set
+
+    @Volatile
+    var lastReplyText: String? = null
         private set
 
     /** 设备是否要求 SSL（StartSession 的回复里）。 */
@@ -150,7 +170,13 @@ internal class MuxLink(
 
     // ---------- 建立 ----------
 
-    fun open(): Boolean {
+    /**
+     * 只把隧道与 lockdownd 连起来并完成 QueryType —— 不做 StartSession、不升 TLS。
+     *
+     * 配对必须走这条路：设备**尚未**信任我们，配对的 `GetValue(DevicePublicKey)` / `Pair`
+     * 都在明文 lockdown 上进行。
+     */
+    fun openRaw(): Boolean {
         // --- A) VERSION（8B 头 + major/minor/padding） ---
         val ver = ByteArray(20)
         be32(ver, 0, PROTO_VERSION)
@@ -166,7 +192,7 @@ internal class MuxLink(
             if (n > 0) pre += readBuf.copyOfRange(0, n)
         }
         if (pre.size < 20) { failed = "2s 内无有效 VERSION 回复（${pre.size}B）"; return false }
-        val hdr16 = u32be(pre, 8) == MAGIC
+        val hdr16 = pre.size >= 12 && u32be(pre, 8) == MAGIC
         val off = if (hdr16) 16 else 8
         val major = u32be(pre, off)
         log("← mux VERSION major=$major（${hex(pre, 32)}）")
@@ -195,31 +221,98 @@ internal class MuxLink(
         while (!connected && failed == null && System.currentTimeMillis() - t0 < 5000) pumpOnce(300)
         if (!connected) { failed = failed ?: "5s 内没等到 SYN/ACK"; return false }
 
-        // --- E) 等 QueryType 回复 ---
-        val t1 = System.currentTimeMillis()
-        while (lockdownReply == null && failed == null && System.currentTimeMillis() - t1 < 5000) pumpOnce(300)
-        if (lockdownReply == null) { failed = failed ?: "QueryType 无回复"; return false }
+        // --- E) QueryType ---
+        val qt = request(Lockdown.queryType("UsbScreenMirror"))
+        if (qt == null) { failed = failed ?: "QueryType 无回复"; return false }
+        log("← QueryType: Type=${qt.str("Type")} ProductVersion=${qt.str("ProductVersion")}")
+        return true
+    }
 
-        // --- F) StartSession → TLS → GetValue ---
+    /**
+     * 会话模式：QueryType（已在 [openRaw] 做完）→ StartSession → TLS → GetValue。
+     *
+     * 返回 true 只代表"流程跑完且没炸"，是否真受信任看 [trusted]。
+     */
+    fun open(): Boolean {
+        if (!openRaw()) return false
         val id = identity ?: return true
-        log("→ StartSession（HostID=${id.hostId}）")
-        sendLockdown(Plist.startSession(id.hostId, id.systemBuid))
+        return establishSession(id)
+    }
 
-        val t2 = System.currentTimeMillis()
-        while (tls == null && failed == null && System.currentTimeMillis() - t2 < 8000) pumpOnce(300)
-        if (tls == null) { log("（未收到 EnableSessionSSL，停在明文）"); return true }
+    /**
+     * 用给定身份走 StartSession → TLS → GetValue。
+     *
+     * 单独抽出来是为了让**配对刚做完**的那条连接能立刻自证一次（不必让用户再点一次开始采集）。
+     */
+    fun establishSession(id: Identity): Boolean {
+        val started = request(Lockdown.startSession("UsbScreenMirror", id.hostId, id.systemBuid))
+        if (started == null) {
+            log("✗ StartSession 无回复：${failed ?: "超时"}")
+            return false
+        }
+        if (started.str("Error") != null) {
+            log("✗ StartSession 被拒：${started.str("Error")}")
+            if (started.str("Error") == "InvalidHostID") failed = "设备不认这个 HostID（配对记录无效）"
+            return false
+        }
+        if (started.bool("EnableSessionSSL") != true) {
+            log("（未要求 SSL，停在明文）")
+            return true
+        }
+
+        sslRequired = true
+        log("→ 升级 TLS（客户端证书 = ${if (id.selfPaired) "App 自签" else "导入的 PC 配对证书"}）")
+        val t = TlsTunnel(id, log)
+        tls = t
+        val hello = t.begin()
+        log("  → ClientHello ${hello.size}B hex=${hex(hello, minOf(hello.size, 24))}")
+        if (hello.isNotEmpty()) sendTcp(0x10, hello)
 
         val t3 = System.currentTimeMillis()
         while (!tlsReady && failed == null && System.currentTimeMillis() - t3 < 8000) pumpOnce(300)
         if (!tlsReady) {
-            log("✗ TLS 未完成：${failed ?: "超时"}（${tls?.describe()}）")
-            return true
+            log("✗ TLS 未完成：${failed ?: "超时"}（${t.describe()}）")
+            return false
         }
+
         log("→ GetValue（判决信任是否成立）")
-        sendLockdown(Plist.getValue())
-        val t4 = System.currentTimeMillis()
-        while (!trusted && failed == null && System.currentTimeMillis() - t4 < 5000) pumpOnce(300)
+        val v = request(Lockdown.getValue("UsbScreenMirror", key = "UniqueDeviceID"))
+        if (v != null && v.str("Value") != null) {
+            trusted = true
+            log("★★★ GetValue 成功 —— 设备确认本主机已受信任（UDID=${v.str("Value")}）")
+        } else if (v != null) {
+            log("✗ GetValue 返回异常：${v.str("Error") ?: "无 Value"}")
+        }
+
+        // ★ 设备侧「亮屏解锁」是 QT 推流的隐含前提：息屏/锁屏时端点照样能连，但一个字节都不吐。
+        //   排「已信任但 0 B」时先看这两行，比反复重启设备省事。
+        val all = request(Lockdown.getValue("UsbScreenMirror"))?.dict("Value")
+        if (all != null) {
+            log(
+                "   设备状态：屏幕${if (all.bool("ScreenLocked") == true) "已锁定" else "已解锁"}" +
+                    " / 是否设密码=${all.bool("PasswordProtected") ?: "?"}" +
+                    " / iOS=${all.str("ProductVersion") ?: "?"}" +
+                    " / 机型=${all.str("ProductType") ?: "?"}"
+            )
+        }
         return true
+    }
+
+    /**
+     * 发一条 lockdown 请求并等**下一条**应答。
+     *
+     * 用 [replyCount] 做序号配对，而不是"内容里含某个关键字" —— 后者在配对流程里会误判
+     * （GetValue 全量回包里也带 `Pair` 字段）。
+     */
+    fun request(plist: ByteArray, timeoutMs: Int = 8000): PValue? {
+        val base = replyCount
+        sendLockdown(plist)
+        val t0 = System.currentTimeMillis()
+        while (replyCount == base && failed == null && System.currentTimeMillis() - t0 < timeoutMs) {
+            pumpOnce(300)
+        }
+        if (replyCount == base) return null
+        return lastReply
     }
 
     /** 读一轮；超时返回 0。供握手与后台保活共用。 */
@@ -231,12 +324,12 @@ internal class MuxLink(
         while (true) {
             if (acc.size < 16) break
             val flen = u32be(acc, 4)
-            if (flen < 16 || flen > 65536 || acc.size < flen) {
-                if (acc.size < flen) break
+            if (flen < 16 || flen > 65536) {
                 log("  非法 mux 帧长 $flen，清空重同步")
                 acc = ByteArray(0)
                 break
             }
+            if (acc.size < flen) break
             val frame = acc.copyOfRange(0, flen)
             acc = acc.copyOfRange(flen, acc.size)
             devRx = u16be(frame, 12)
@@ -261,7 +354,6 @@ internal class MuxLink(
                             connTx = 1; connAck = 1
                             log("★★ SYN/ACK：lockdownd 隧道建立")
                             sendTcp(0x10)
-                            sendLockdown(Plist.queryType())
                         }
                         flags and 0x04 != 0 -> failed = "设备 RST（${String(payload, Charsets.UTF_8)}）"
                         payload.isNotEmpty() -> {
@@ -293,13 +385,13 @@ internal class MuxLink(
         return handled
     }
 
-    /** 从 tunnel 里切出完整的 lockdownd 消息并判读。 */
+    /** 从 tunnel 里切出完整的 lockdownd 消息并记录。 */
     private fun drainTunnel(): Int {
         var handled = 0
         while (true) {
             if (tunnel.size < 4) break
             val mlen = u32be(tunnel, 0)
-            if (mlen <= 0 || mlen > 0x100000 || tunnel.size < 4 + mlen) break
+            if (mlen <= 0 || mlen > 0x200000 || tunnel.size < 4 + mlen) break
             val msg = tunnel.copyOfRange(4, 4 + mlen)
             tunnel = tunnel.copyOfRange(4 + mlen, tunnel.size)
             handled++
@@ -310,43 +402,19 @@ internal class MuxLink(
 
     private fun onLockdown(msg: ByteArray) {
         val text = String(msg, Charsets.UTF_8)
-        val flat = text.replace("\n", " ").replace("\r", "").replace(Regex("\\s+"), " ")
+        val parsed = PlistXml.parse(text)
+        lastReplyText = text
+        lastReply = parsed
+        replyCount++
 
-        if (lockdownReply == null) {
-            lockdownReply = text
-            log("← lockdownd ${msg.size}B: ${flat.take(140)}")
-            return
-        }
-        if (flat.contains("EnableSessionSSL")) {
-            val ssl = flat.contains("<key>EnableSessionSSL</key> <true/>") ||
-                flat.contains("<key>EnableSessionSSL</key><true/>")
-            log("← StartSession 回复：EnableSessionSSL=$ssl ${flat.take(120)}")
-            if (ssl) {
-                sslRequired = true
-                val id = identity
-                if (id != null) {
-                    log("→ 升级 TLS（客户端证书 = 导入的配对证书）")
-                    val t = TlsTunnel(id, log)
-                    tls = t
-                    val hello = t.begin()
-                    log("  → ClientHello ${hello.size}B hex=${hex(hello, minOf(hello.size, 24))}")
-                    if (hello.isNotEmpty()) sendTcp(0x10, hello)
-                }
-            }
-            return
-        }
-        if (flat.contains("TrustedHostAttached")) {
-            trusted = true
-            log("★★★ GetValue 成功 —— 设备确认本主机已受信任")
-            log("    ${flat.take(400)}")
-            return
-        }
-        val err = Regex("<key>Error</key>\\s*<string>([^<]+)</string>").find(flat)?.groupValues?.get(1)
-        if (err != null) {
-            log("✗ lockdownd 报错：Error=$err")
-            if (err == "InvalidHostID") failed = "设备不认这个 HostID（配对记录无效）"
-            return
-        }
-        log("← lockdownd ${msg.size}B: ${flat.take(160)}")
+        val flat = text.replace("\n", " ").replace("\r", "").replace(Regex("\\s+"), " ")
+        val err = parsed?.str("Error")
+        if (err != null) log("← lockdownd 报错 Error=$err")
+        else log("← lockdownd ${msg.size}B: ${flat.take(160)}")
+    }
+
+    /** 后台保活用：只推进管道，不解析语义。 */
+    fun keepAliveTick() {
+        runCatching { pumpOnce(200) }
     }
 }

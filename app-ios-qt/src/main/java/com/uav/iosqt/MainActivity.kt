@@ -37,6 +37,8 @@ class MainActivity : Activity() {
     private lateinit var transport: QtTransport
     private lateinit var logView: TextView
     private lateinit var btn: Button
+    private lateinit var btnPair: Button
+    private lateinit var btnRearm: Button
     private lateinit var preview: SurfaceView
 
     /** 预览用的 Surface；解码器要等它和 SPS/PPS 都就绪才能起 */
@@ -78,6 +80,14 @@ class MainActivity : Activity() {
             // 长按 = 离线回放已录制的 feed.bin（验证解码/渲染链路，不依赖设备）
             setOnLongClickListener { if (!running.get()) { replay(); true } else false }
         }
+        btnPair = Button(this).apply {
+            text = "配对（让 iPad 信任本机）"
+            setOnClickListener { if (!running.get()) pairDevice() }
+        }
+        btnRearm = Button(this).apply {
+            text = "重新武装（0 字节时用）"
+            setOnClickListener { if (!running.get()) rearm() }
+        }
         preview = SurfaceView(this).apply {
             holder.addCallback(object : SurfaceHolder.Callback {
                 override fun surfaceCreated(h: SurfaceHolder) {
@@ -94,6 +104,8 @@ class MainActivity : Activity() {
             })
         }
         root.addView(btn)
+        root.addView(btnPair)
+        root.addView(btnRearm)
         root.addView(
             preview,
             LinearLayout.LayoutParams(
@@ -117,6 +129,12 @@ class MainActivity : Activity() {
         log("QuickTime USB 采集（Android）")
         log("用法：iPad 重启 → 解锁亮屏 → 插线 → 点「开始采集」")
         log("（长按按钮 = 回放已录制的 feed.bin，用于离线验证解码）")
+        log(
+            if (Pairing.hasRecord(filesDir))
+                "配对记录：已有（${Pairing.loadRecord(filesDir)?.hostId ?: "读取失败"}）"
+            else
+                "配对记录：无 ⇒ 首次请先点「配对」，在 iPad 上点一次「信任」"
+        )
     }
 
     override fun onDestroy() {
@@ -193,7 +211,164 @@ class MainActivity : Activity() {
     private fun start() {
         running.set(true)
         btn.isEnabled = false
+        btnPair.isEnabled = false
         Thread({ runCapture() }, "ios-qt").start()
+    }
+
+    /**
+     * 让 iPad 信任本机 —— 走一次完整的 lockdownd `Pair`。
+     *
+     * 这是「不依赖 PC 导凭证」的那一步：配对记录会存进 `filesDir/ios_pair.properties`，
+     * 之后 [Identity.load] 优先用它。配对必须在**普通配置**下做，所以这里不 activate。
+     */
+    private fun pairDevice() {
+        running.set(true)
+        btn.isEnabled = false
+        btnPair.isEnabled = false
+        Thread({
+            runCatching {
+                val dev = transport.findAppleDevice()
+                if (dev == null) {
+                    log("未找到 Apple 设备（VID 05ac）。请先插线。")
+                    return@Thread
+                }
+                log("配对目标：${dev.deviceName} pid=0x${dev.productId.toString(16)}")
+                if (!ensurePermission(dev)) {
+                    log("未取得 USB 权限，中止")
+                    return@Thread
+                }
+                transport.dumpConfigs(dev)
+
+                val pairing = Pairing(transport, filesDir, ::log)
+                // 上一轮若留在采集配置，先还原到普通态再配对
+                if (dev.configurationCount >= 5) {
+                    log("设备停在采集配置 ⇒ 先还原到普通配置")
+                    restoreToNormal(dev)
+                    Thread.sleep(400)
+                    transport.findAppleDevice()?.let { dev2 ->
+                        if (!ensurePermission(dev2)) { log("还原后未取得权限"); return@Thread }
+                        if (pairing.run(dev2) == null) { log("配对未完成"); return@Thread }
+                    } ?: run { log("还原后设备消失"); return@Thread }
+                } else if (pairing.run(dev) == null) {
+                    log("配对未完成")
+                    return@Thread
+                }
+
+                // 配对成功后立刻自证一次：StartSession → TLS → GetValue
+                Pairing.loadRecord(filesDir)?.let { rec ->
+                    log("自检：用刚配好的身份走一次 StartSession + TLS…")
+                    verifyTrust(rec.hostId)
+                }
+            }.onFailure { log("配对异常：${it.javaClass.simpleName}: ${it.message}") }
+            running.set(false)
+            runOnUiThread { btn.isEnabled = true; btnPair.isEnabled = true }
+        }, "ios-pair").start()
+    }
+
+    /**
+     * 重新武装 QT 端点：配置 5 → 3 → `activate` → **等设备自己重枚举**。
+     *
+     * 什么时候需要它：lockdown 已经信任、QT 接口也 claim 到了，但**一个字节都不来**。
+     * 这时说明设备侧的 QT 服务没被"启动"——只有 `activate` 让设备走一次 USB 重枚举，
+     * 它才会把带 0x2A 的配置**主动交出来**；单纯的配置来回（3→5）只对"刚武装过"的设备有效。
+     *
+     * ⚠️ activate 之后**绝不能再碰任何配置**，一碰就打断重枚举（踩过：以为没反应，实际是被自己搅黄的）。
+     */
+    private fun rearm() {
+        running.set(true)
+        btn.isEnabled = false
+        btnPair.isEnabled = false
+        btnRearm.isEnabled = false
+        Thread({
+            runCatching {
+                val dev0 = transport.findAppleDevice()
+                if (dev0 == null) { log("未找到 Apple 设备，先插线"); return@Thread }
+                if (!ensurePermission(dev0)) { log("未取得 USB 权限，中止"); return@Thread }
+                log("起始状态：${dev0.deviceName} 描述配置数=${dev0.configurationCount}")
+
+                if (dev0.configurationCount >= 5) {
+                    log("先把设备切回普通配置（3），让 activate 有意义…")
+                    restoreToNormal(dev0)
+                    Thread.sleep(800)
+                }
+                val dev = transport.findAppleDevice()
+                if (dev == null) { log("切配置后设备消失，请重插"); return@Thread }
+                if (!ensurePermission(dev)) { log("切配置后未取得权限"); return@Thread }
+
+                val conn = transport.open(dev)
+                if (conn == null) { log("openDevice 失败"); return@Thread }
+                try {
+                    if (!transport.activate(conn)) { log("activate 被拒"); return@Thread }
+                } finally {
+                    runCatching { conn.close() }
+                }
+                log("已发 activate，等设备重枚举（最长 240s，期间不要拔线/不要点其他按钮）…")
+
+                // 判据：配置集必须**先离开 5 再回到 5**。只看">=5"会把"没动"误判成"已就绪"。
+                val t0 = System.currentTimeMillis()
+                var sawLeave = false
+                var lastReport = 0L
+                var current: UsbDevice = dev
+                while (System.currentTimeMillis() - t0 < 240_000) {
+                    val d = transport.findAppleDevice()
+                    if (d != null) {
+                        current = d
+                        if (d.configurationCount < 5) sawLeave = true
+                        if (sawLeave && d.configurationCount >= 5) {
+                            log("★★ 重枚列完成：${d.deviceName} 配置数=${d.configurationCount} ⇒ 现在可以点「开始采集」")
+                            return@Thread
+                        }
+                    }
+                    val elapsed = (System.currentTimeMillis() - t0) / 1000
+                    if (elapsed - lastReport >= 10) {
+                        lastReport = elapsed
+                        log("  等待中 ${elapsed}s… ${current.deviceName} 描述配置数=${current.configurationCount}" +
+                            if (sawLeave) "（已离开采集态，等它回来）" else "（还没动静）")
+                    }
+                    Thread.sleep(700)
+                }
+                if (sawLeave) log("✗ 设备离开采集态后 240s 内没回来")
+                else log("✗ 240s 内设备根本没重枚举 ⇒ 只能拔插线或重启 iPad")
+            }.onFailure { log("重新武装异常：${it.message}") }
+            running.set(false)
+            runOnUiThread { btn.isEnabled = true; btnPair.isEnabled = true; btnRearm.isEnabled = true }
+        }, "ios-rearm").start()
+    }
+
+    /** 用已保存的配对记录走一遍「StartSession → TLS → GetValue」，输出信任结论。 */
+    private fun verifyTrust(hostId: String) {
+        val dev = transport.findAppleDevice()
+        if (dev == null) { log("自检跳过：设备不可见"); return }
+        runCatching {
+            val rec = Pairing.loadRecord(filesDir) ?: return
+            val identity = Identity.fromRecord(rec)
+            val cfg = (0 until dev.configurationCount).mapNotNull {
+                runCatching { dev.getConfiguration(it) }.getOrNull()
+            }.firstOrNull { transport.muxInterfaceIn(it) != null } ?: run {
+                log("自检跳过：没有含 usbmux 的配置"); return
+            }
+            val itf = transport.muxInterfaceIn(cfg) ?: return
+            val conn = transport.open(dev) ?: return
+            try {
+                transport.setConfiguration(conn, cfg)
+                if (!transport.claim(conn, itf)) { log("自检：claim 失败"); return }
+                val (epIn, epOut) = transport.bulkEndpoints(itf)
+                if (epIn == null || epOut == null) { log("自检：端点不全"); return }
+                val link = MuxLink(conn, epIn, epOut, identity, ::log)
+                if (link.openRaw()) {
+                    link.establishSession(identity)
+                    log(
+                        if (link.trusted) "★★ 自检通过：设备已信任 HostID=$hostId，可以点「开始采集」"
+                        else "✗ 自检未通过：TLS=${link.tlsReady} 原因=${link.failed ?: "未取得 Value"}"
+                    )
+                } else {
+                    log("✗ 自检隧道失败：${link.failed}")
+                }
+                runCatching { transport.release(conn, itf) }
+            } finally {
+                runCatching { conn.close() }
+            }
+        }.onFailure { log("自检异常：${it.message}") }
     }
 
     private fun runCapture() {
@@ -202,7 +377,7 @@ class MainActivity : Activity() {
             null
         }
         running.set(false)
-        runOnUiThread { btn.isEnabled = true }
+        runOnUiThread { btn.isEnabled = true; btnPair.isEnabled = true }
         if (stats != null) {
             log("=== 结束：PING ${stats.ping} / CWPA ${stats.cwpa} / CVRP ${stats.cvrp} / " +
                 "FEED ${stats.feed}（${stats.feedBytes} B） / 共 ${stats.bytes} B ===")
@@ -238,8 +413,10 @@ class MainActivity : Activity() {
             log("  已切回普通配置，准备重新进入采集配置")
         }
 
-        // 4) 没有采集接口就 activate 并等重枚举
-        if (transport.findCaptureInterface(dev) == null) {
+        // 4) 设备**不在采集态**就 activate 并等重枚举。
+        //    ⚠️ 判据必须是「配置集里有几个配置」，不能是 `findCaptureInterface()`：
+        //    后者扫的是扁平表（所有配置的接口并集），永远能找到 0x2A ⇒ activate 从来没被真正触发过。
+        if (dev.configurationCount < 5) {
             val conn0 = transport.open(dev) ?: return null
             try {
                 if (!transport.activate(conn0)) {
@@ -256,7 +433,7 @@ class MainActivity : Activity() {
                 return null
             }
         } else {
-            log("设备已在采集配置，跳过激活")
+            log("设备已在采集态（${dev.configurationCount} 个配置），跳过激活")
         }
 
         // 4) 重枚举后要重新拿权限
@@ -287,7 +464,7 @@ class MainActivity : Activity() {
 
         // 6) ★ 先建 lockdown 会话，再碰 QT —— 这是 AMDS 的顺序。
         //    2026-10-18 的 A/B 证明：没有这个会话，设备只回一次 PING 就沉默。
-        val identity = Identity.loadFromAssets(this, ::log)
+        val identity = Identity.load(this, ::log)
         var connMux: UsbDeviceConnection? = null
         val keepAlive = java.util.concurrent.atomic.AtomicBoolean(true)
         var muxThread: Thread? = null
@@ -433,9 +610,9 @@ class MainActivity : Activity() {
         while (System.currentTimeMillis() < deadline) {
             val d = transport.findAppleDevice()
             if (d != null) {
-                val itf = transport.findCaptureInterface(d)
-                if (itf != null) {
-                    log("★ 采集接口已出现：${d.deviceName}")
+                // 同样不能用扁平表：配置集从 4 涨到 5 才代表设备真的切进了采集模式
+                if (d.configurationCount >= 5) {
+                    log("★ 设备已进入采集态：${d.deviceName}（${d.configurationCount} 个配置）")
                     return d
                 }
                 val now = System.currentTimeMillis()

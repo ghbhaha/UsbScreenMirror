@@ -27,3 +27,8 @@ kotlin {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
+
+dependencies {
+    // DER 证书签发 / plist 编解码 / 配对请求构造全是纯逻辑 —— 下沉到 :protocol，能用 JVM 单测验收
+    implementation(project(":protocol"))
+}

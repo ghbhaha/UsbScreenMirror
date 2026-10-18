@@ -1,14 +1,11 @@
 package com.uav.iosqt
 
-import java.security.KeyPair
-import java.security.KeyPairGenerator
+import com.uav.protocol.ios.CertKit
+import com.uav.protocol.ios.PairRecord
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
-import java.security.interfaces.RSAPrivateCrtKey
-import java.security.spec.PKCS8EncodedKeySpec
-import java.security.spec.RSAPublicKeySpec
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLEngineResult
@@ -19,18 +16,49 @@ import javax.net.ssl.X509TrustManager
 /**
  * 主机身份（客户端证书链 + 私钥），lockdown 升级 TLS 时要用。
  *
- * 当前实现从 **assets 导入一台已被 iPad 信任的 PC 的配对凭证**，用于验证
- * 「有真正的受信任会话时，QT 端点会不会推流」这个机制问题；
- * 之后要换成 App 自己配对生成的那套（那一步设备是否认账，是另一个待解问题）。
+ * 两条来源，优先级如下：
+ *
+ * 1. **App 自己配出来的**（`filesDir/ios_pair.properties`，见 [Pairing]）—— 目标形态，
+ *    用户只需在 iPad 上点一次「信任」；
+ * 2. 退化来源：assets 里导入的 PC 配对凭证（`pc_hostid.txt` / `pc_host.der` / `pc_root.der` /
+ *    `pc_host_key.pem`）。留着是为了**对照实验**：当自配对出问题时，能一键排除"证书本身"这条嫌疑。
  */
 internal class Identity(
     val hostId: String,
     val systemBuid: String,
-    val chain: List<ByteArray>,   // [host, root]
-    val key: java.security.PrivateKey
+    /** 原样字节，PEM 或 DER 都行（`CertificateFactory` 两种都吃） */
+    val chain: List<ByteArray>,
+    val key: java.security.PrivateKey,
+    /** true = App 自己配的；false = 从 PC 导入 */
+    val selfPaired: Boolean
 ) {
 
     companion object {
+
+        const val PAIR_FILE = "ios_pair.properties"
+
+        fun fromRecord(rec: PairRecord): Identity = Identity(
+            hostId = rec.hostId,
+            systemBuid = rec.systemBuid,
+            chain = listOf(rec.hostCertPem, rec.rootCertPem),
+            key = CertKit.privateKey(String(rec.hostKeyPem, Charsets.US_ASCII)),
+            selfPaired = true
+        )
+
+        /** 读本地配对记录；没有再退回 assets。 */
+        fun load(ctx: android.content.Context, log: (String) -> Unit): Identity? {
+            val f = java.io.File(ctx.filesDir, PAIR_FILE)
+            if (f.exists()) {
+                runCatching {
+                    val rec = PairRecord.decode(f.readText()) ?: error("记录格式不认识")
+                    val id = fromRecord(rec)
+                    log("已载入 App 自建配对记录：HostID=${id.hostId}（${f.length()} B）")
+                    return id
+                }.onFailure { log("（自建配对记录读取失败：${it.message}，回退 assets）") }
+            }
+            return loadFromAssets(ctx, log)
+        }
+
         /**
          * 从 assets 读 `pc_hostid.txt`（两行：HostID / SystemBUID）、`pc_host.der`、
          * `pc_root.der`、`pc_host_key.pem`（PKCS#8）。缺任何一个就返回 null。
@@ -40,66 +68,13 @@ internal class Identity(
             val hostDer = ctx.assets.open("pc_host.der").use { it.readBytes() }
             val rootDer = ctx.assets.open("pc_root.der").use { it.readBytes() }
             val keyPem = ctx.assets.open("pc_host_key.pem").bufferedReader().use { it.readText() }
-            val key = parsePrivateKey(keyPem)
+            val key = CertKit.privateKey(keyPem)
             log("已导入 PC 配对凭证：HostID=${ids[0].trim()} 证书 ${hostDer.size}B / 根 ${rootDer.size}B")
-            Identity(ids[0].trim(), ids[1].trim(), listOf(hostDer, rootDer), key)
+            Identity(ids[0].trim(), ids[1].trim(), listOf(hostDer, rootDer), key, selfPaired = false)
         }.getOrElse {
             log("（未导入 PC 凭证：${it.message}）")
             null
         }
-
-        /** 解析 PKCS#8 或 PKCS#1 的 PEM 私钥（Apple 的配对记录里是 PKCS#8）。 */
-        private fun parsePrivateKey(pem: String): java.security.PrivateKey {
-            val b64 = pem.lineSequence()
-                .filter { !it.startsWith("-----") && it.isNotBlank() }
-                .joinToString("")
-            val der = java.util.Base64.getDecoder().decode(b64)
-            val pkcs8 = runCatching {
-                java.security.KeyFactory.getInstance("RSA")
-                    .generatePrivate(PKCS8EncodedKeySpec(der))
-            }.getOrNull()
-            if (pkcs8 != null) return pkcs8
-            // PKCS#1：SEQUENCE { INTEGER 版本, n, e, d, p, q, dp, dq, qinv }
-            val ints = ArrayList<java.math.BigInteger>()
-            var p = 0
-            fun tlv(off: Int): Pair<Int, Int> {
-                val tag = der[off].toInt() and 0xFF
-                var q = off + 1
-                var len = der[q].toInt() and 0xFF
-                q++
-                if (len and 0x80 != 0) {
-                    val n = len and 0x7F
-                    len = 0
-                    repeat(n) { len = (len shl 8) or (der[q].toInt() and 0xFF); q++ }
-                }
-                return (q to len).also { if (tag != 0x02) { /* 忽略 */ } }
-            }
-            val (s0, l0) = tlv(0)
-            var q = s0
-            val end = s0 + l0
-            while (q < end) {
-                val (body, len) = tlv(q)
-                ints.add(java.math.BigInteger(der.copyOfRange(body, body + len)))
-                q = body + len
-            }
-            require(ints.size >= 9) { "私钥字段不足（${ints.size}）" }
-            val spec = java.security.spec.RSAPrivateCrtKeySpec(
-                ints[1], ints[2], ints[3], ints[4], ints[5], ints[6], ints[7], ints[8]
-            )
-            return java.security.KeyFactory.getInstance("RSA").generatePrivate(spec)
-        }
-
-        /** 用私钥里的 n/e 反推公钥，拼成给 KeyStore 用的 KeyPair。 */
-        fun keyPairOf(privateKey: java.security.PrivateKey): KeyPair {
-            val crt = privateKey as RSAPrivateCrtKey
-            val pub = java.security.KeyFactory.getInstance("RSA")
-                .generatePublic(RSAPublicKeySpec(crt.modulus, crt.publicExponent))
-            return KeyPair(pub, privateKey)
-        }
-
-        /** 生成一对临时 RSA 密钥（仅用于占位，不参与当前导入流程）。 */
-        fun generateRsa(bits: Int = 2048): KeyPair =
-            KeyPairGenerator.getInstance("RSA").apply { initialize(bits) }.generateKeyPair()
     }
 }
 
