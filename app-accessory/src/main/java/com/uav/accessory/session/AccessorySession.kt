@@ -302,14 +302,22 @@ class AccessorySession(
         //   只提示不中断 —— 版本不同通常只是少个新功能，投屏照样能用；
         //   真拒绝了反而没法用旧包复现老问题。
         val compat = AppVersions.compat(BuildConfig.VERSION_CODE, message.arg1)
-        if (AppVersions.needsWarning(compat)) {
-            val why = if (compat == AppVersions.Compat.PEER_LEGACY) {
-                "宿主端未上报版本（旧包）"
-            } else {
-                "宿主 ${message.arg1} / 本机 ${BuildConfig.VERSION_CODE}"
+        when (compat) {
+            AppVersions.Compat.SAME -> Unit
+
+            // 宿主更新 = 正常组合（宿主可以更大），只是本端少用几个新功能
+            AppVersions.Compat.PEER_NEWER ->
+                logger.i(TAG, "宿主较新（${message.arg1} > 本机 ${BuildConfig.VERSION_CODE}），向下兼容")
+
+            // 宿主更旧/未知 ⇒ 宿主侧会拒绝，这里只留证据
+            AppVersions.Compat.PEER_LEGACY, AppVersions.Compat.PEER_OLDER -> {
+                logger.w(
+                    TAG,
+                    "宿主版本低于本机（${message.arg1} < ${BuildConfig.VERSION_CODE}）" +
+                        "—— 宿主会拒绝本次会话，应升级宿主",
+                )
+                listener.onStatus("宿主版本过低（v${message.arg1} < v${BuildConfig.VERSION_CODE}），请升级宿主")
             }
-            logger.w(TAG, "两端版本不一致：$why ⇒ 依赖新协议的功能可能静默不生效（如像素模式）")
-            listener.onStatus("两端版本不一致：$why —— 请一并升级")
         }
         // 回复本机尺寸；版本取两者较小值
         val version = minOf(message.arg0, Protocol.VERSION)

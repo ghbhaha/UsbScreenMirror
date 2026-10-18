@@ -239,9 +239,9 @@ class SessionFlowTest {
     }
 
     @Test
-    fun `两端版本不一致也不阻断会话`() {
-        // 只提示、不拒绝：版本不同通常只是少个新功能，投屏还能用；
-        // 硬拒绝会让"用旧包复现老问题"这种调试手段失效。
+    fun `协议层不因版本差异阻断消息流`() {
+        // 这一层只负责搬字节，**版本策略在上层**（HostSession 用 AppVersions.hostCanServe 判定）：
+        // 对端更新时宿主会拒绝，但那是在 CNXN 之后由 sessionFlow 收口的，不是 Connection 的事。
         runFlowWithPeerVersion(99)
     }
 

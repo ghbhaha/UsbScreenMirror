@@ -132,6 +132,19 @@ class HostSession(
 
     private val videoQueue = FrameQueue(StreamId.VIDEO, logger = logger)
 
+    /** 对端在 `CNXN.arg1` 报的 `versionCode`（0 = 旧包），仅用于日志与提示。 */
+    @Volatile
+    private var peerAppVersion = AppVersions.UNKNOWN
+
+    /**
+     * 宿主版本**低于**配件端 ⇒ 拒绝继续（见 `AppVersions.hostCanServe`）。
+     *
+     * 为什么必须在 latch 之后才处理：这个标志在**读线程**的 CNXN 回调里置位，
+     * 而 `fail()` 会关闭连接 —— 从连接自己的读回调里关自己容易自锁。
+     */
+    @Volatile
+    private var versionBlocked = false
+
     /**
      * 最后一次收到**媒体帧**（非 CONFIG）的单调时刻；`0` = 本次会话还没收到过。
      *
@@ -371,6 +384,12 @@ class HostSession(
                 // ★ 对端在配件模式下"人不在"：CNXN 发出去 5 秒一个字节都没回。
                 //   正常情况配件端 App 收到会立刻应答，所以这不是链路问题。
                 peerSilent("等待手机 CNXN 超时（${TIMEOUT_MS}ms）：配件模式下对端没有任何应答")
+                return
+            }
+
+            if (versionBlocked) {
+                // ★ 单向硬约束：宿主可以更新，但不能比配件端旧（见 AppVersions.hostCanServe）
+                fail("宿主版本过低：宿主 v$appVersion / 配件 v$peerAppVersion —— 请先升级宿主")
                 return
             }
 
@@ -909,21 +928,35 @@ class HostSession(
             // 配件端回的是 minOf(对方, 自己)，正常情况下不会不等；真不等说明有人改过常量
             logger.w(TAG, "协议版本不同：host v${Protocol.VERSION} / peer v$peerProto（按较低版本继续）")
         }
+        peerAppVersion = peerApp
         when (AppVersions.compat(appVersion, peerApp)) {
             AppVersions.Compat.SAME ->
                 logger.i(TAG, "两端 App 版本一致（$appVersion）")
 
+            // ---- 允许：宿主不旧于配件端，只是可能少用几个新功能 ----
             AppVersions.Compat.PEER_LEGACY -> {
                 logger.w(
                     TAG,
                     "配件端未上报版本（旧包）⇒ 依赖新协议的功能可能静默不生效（如像素模式）",
                 )
-                listener.onStatus("配件端是旧包（未上报版本），建议升级到 $appVersion 再排查")
+                listener.onStatus("配件端是旧包（未上报版本），部分新功能可能不生效")
             }
 
-            AppVersions.Compat.DIFFERENT -> {
-                logger.w(TAG, "两端版本不一致：host $appVersion / peer $peerApp ⇒ 请一并升级")
-                listener.onStatus("两端版本不一致：宿主 $appVersion / 配件 $peerApp —— 请一并升级")
+            AppVersions.Compat.PEER_OLDER -> {
+                logger.i(TAG, "配件端较旧（$peerApp < 宿主 $appVersion）⇒ 向下兼容，继续")
+                listener.onStatus("配件端 v$peerApp 较旧（宿主 v$appVersion），个别新功能可能不生效")
+            }
+
+            // ---- 拒绝：宿主比配件端旧 ----
+            AppVersions.Compat.PEER_NEWER -> {
+                logger.e(
+                    TAG,
+                    "宿主版本过低：host $appVersion < peer $peerApp ⇒ 拒绝继续" +
+                        "（新配件端可能发本端解析不了的报文）",
+                )
+                // ★ 不在读线程里直接 fail()：fail 会关连接，从读回调里关自己可能自锁。
+                //   只置标志，由 sessionFlow 在 latch 之后统一收口。
+                versionBlocked = true
             }
         }
     }

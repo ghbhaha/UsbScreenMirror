@@ -31,20 +31,26 @@ object AppVersions {
     /** 对端没上报版本 —— 老包（`arg1` 恒为 0）。 */
     const val UNKNOWN: Int = 0
 
-    /** 两端 `versionCode` 的关系。 */
+    /** 两端 `versionCode` 的关系（**带方向**，不是简单的"相等/不等"）。 */
     enum class Compat {
         /** 相同，正常。 */
         SAME,
 
-        /** 对端是没上报版本的旧包：功能可能缺失，但**无法确定**缺哪些。 */
+        /** 对端是没上报版本的旧包：功能可能缺失，但**无法确定**缺哪些。按"对端更旧"处理。 */
         PEER_LEGACY,
 
-        /** 明确不一致。 */
-        DIFFERENT,
+        /** 对端更旧。**允许**：新端向下兼容旧端，只是部分新功能不生效。 */
+        PEER_OLDER,
+
+        /** 对端更新。**宿主端不允许**（见 [hostCanServe]）：宿主太旧，可能读不懂对端的新报文。 */
+        PEER_NEWER,
     }
 
     /**
      * 比较两端 `versionCode`。
+     *
+     * ⚠️ **本函数只描述方向，不替调用方做决定** —— 哪一侧算"不允许"由
+     * [hostCanServe] 这类策略函数表达，因为两端的要求不对称（见下）。
      *
      * @param local 本端 `BuildConfig.VERSION_CODE`
      * @param peer  对端在 `CNXN.arg1` 里报的 `versionCode`（0 = 老包）
@@ -52,9 +58,36 @@ object AppVersions {
     fun compat(local: Int, peer: Int): Compat = when {
         peer <= UNKNOWN -> Compat.PEER_LEGACY
         peer == local -> Compat.SAME
-        else -> Compat.DIFFERENT
+        peer < local -> Compat.PEER_OLDER
+        else -> Compat.PEER_NEWER
     }
 
-    /** 是否值得在界面上提示（`SAME` 之外都要提）。 */
+    /**
+     * 宿主能否服务这个配件端 —— **项目级硬约束：宿主版本可以更大，但不能更小**。
+     *
+     * ```
+     * host >= accessory  ✅ 允许（新宿主兼容旧配件端，最多个别新功能不生效）
+     * host <  accessory  ❌ 拒绝（宿主太旧）
+     * ```
+     *
+     * 为什么方向不对称：新行为几乎都是**先加到配件端**（新编码参数、新命令字）
+     * 或**由宿主下发、配件端决定是否买账**（`applyOptions` 之类）。宿主更新时，
+     * 旧配件端顶多"不认"，链路照样跑；反过来，新配件端发的东西旧宿主可能**解析不了**，
+     * 那是协议级故障，不是"少个功能"。
+     *
+     * 对端没上报版本（`0`）按"旧包"处理 ⇒ 允许 —— 这条很重要：
+     * 一升级宿主，所有没升级的手机不该全废。
+     */
+    fun hostCanServe(hostCode: Int, accCode: Int): Boolean =
+        accCode <= UNKNOWN || accCode <= hostCode
+
+    /** 这个关系是否值得在界面上提示（`SAME` 之外都要提）。 */
     fun needsWarning(compat: Compat): Boolean = compat != Compat.SAME
+
+    /**
+     * 这个关系是否**阻断**会话（只在宿主视角有意义）。
+     *
+     * 只有 `PEER_NEWER` 阻断 —— 也就是"宿主比配件端旧"。其余都放行。
+     */
+    fun isBlocking(compat: Compat): Boolean = compat == Compat.PEER_NEWER
 }
