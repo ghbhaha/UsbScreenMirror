@@ -3,6 +3,7 @@ package com.uav.iosqt
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.hardware.usb.UsbConfiguration
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
@@ -63,18 +64,50 @@ internal class QtTransport(
         return r >= 0
     }
 
+    private fun isCapture(itf: UsbInterface): Boolean =
+        itf.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPEC && itf.interfaceSubclass == 0x2A
+
     /**
-     * 找 QuickTime 采集接口：class 0xFF、subclass 0x2A。
+     * 找承载 QuickTime 采集接口（0xFF/0x2A）的那个**配置**。
      *
-     * 用扁平的 `interfaceCount/getInterface()`（公开 API）而不是 `getConfiguration(int)`——
-     * Android 的 `UsbDevice` 没有无参 `getConfiguration()`，扁平列表本身就覆盖所有配置的接口。
-     * 普通态约 12 个接口（无 0x2A），激活后约 18 个（含 0x2A）。
+     * ⚠️ 只扫 `interfaceCount/getInterface()` 是不够的：那张扁平表是所有配置的接口并集，
+     * 找到 0x2A 并不代表它在**当前活动配置**里 —— 直接 claim 会失败（实测 `claim 接口失败`）。
+     * Windows 侧的做法是 `set_configuration(5)` 后再 claim，这里等价地先定位到那个配置。
      */
+    fun captureConfiguration(dev: UsbDevice): UsbConfiguration? {
+        for (i in 0 until dev.configurationCount) {
+            val cfg = runCatching { dev.getConfiguration(i) }.getOrNull() ?: continue
+            for (j in 0 until cfg.interfaceCount) {
+                if (isCapture(cfg.getInterface(j))) return cfg
+            }
+        }
+        return null
+    }
+
+    /** 找 QuickTime 采集接口：class 0xFF、subclass 0x2A。 */
     fun findCaptureInterface(dev: UsbDevice): UsbInterface? {
         for (i in 0 until dev.interfaceCount) {
             val itf = dev.getInterface(i)
+            if (isCapture(itf)) return itf
+        }
+        return null
+    }
+
+    /** 从某个配置里取出 0x2A 接口（一定存在，调用前已确认）。 */
+    fun captureInterfaceIn(cfg: UsbConfiguration): UsbInterface? {
+        for (j in 0 until cfg.interfaceCount) {
+            val itf = cfg.getInterface(j)
+            if (isCapture(itf)) return itf
+        }
+        return null
+    }
+
+    /** 找 usbmux 接口：class 0xFF、subclass 0xFE、protocol 2（Apple 的 mux 通道）。 */
+    fun muxInterfaceIn(cfg: UsbConfiguration): UsbInterface? {
+        for (j in 0 until cfg.interfaceCount) {
+            val itf = cfg.getInterface(j)
             if (itf.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPEC &&
-                itf.interfaceSubclass == 0x2A
+                itf.interfaceSubclass == 0xFE && itf.interfaceProtocol == 2
             ) {
                 return itf
             }
@@ -82,8 +115,59 @@ internal class QtTransport(
         return null
     }
 
-    fun claim(conn: UsbDeviceConnection, itf: UsbInterface): Boolean =
-        runCatching { conn.claimInterface(itf, true) }.getOrDefault(false)
+    /** 按配置 id 取配置（找不到返回 null）。只返回描述符里真实存在的，绝不凭空构造。 */
+    fun configurationById(dev: UsbDevice, id: Int): UsbConfiguration? {
+        for (i in 0 until dev.configurationCount) {
+            val cfg = runCatching { dev.getConfiguration(i) }.getOrNull() ?: continue
+            if (cfg.id == id) return cfg
+        }
+        return null
+    }
+
+    /** 打印配置/接口分布，用于确认「采集接口到底在哪个配置里」。 */
+    fun dumpConfigs(dev: UsbDevice) {
+        log("配置数 ${dev.configurationCount}，扁平接口数 ${dev.interfaceCount}")
+        for (i in 0 until dev.configurationCount) {
+            val cfg = runCatching { dev.getConfiguration(i) }.getOrNull() ?: continue
+            val marks = (0 until cfg.interfaceCount).map { j ->
+                val t = cfg.getInterface(j)
+                "#${t.id}:%02x/%02x/%02x".format(t.interfaceClass, t.interfaceSubclass, t.interfaceProtocol)
+            }
+            log("  cfg[$i] id=${cfg.id} ifs=${cfg.interfaceCount} ${marks.joinToString(" ")}")
+        }
+    }
+
+    /**
+     * 把活动配置切到目标配置（公开 API，API 21+）。
+     *
+     * 只切**设备描述符里确实存在**的配置 —— Windows 上切到不存在的配置会让驱动栈崩掉，
+     * 这里也绝不凭空构造配置对象。
+     */
+    fun setConfiguration(conn: UsbDeviceConnection, cfg: UsbConfiguration): Boolean {
+        val r = runCatching { conn.setConfiguration(cfg) }
+        val ok = r.getOrDefault(false)
+        log("setConfiguration(id=${cfg.id}) => $ok" + (r.exceptionOrNull()?.let { " 异常:$it" } ?: ""))
+        return ok
+    }
+
+    fun claim(conn: UsbDeviceConnection, itf: UsbInterface): Boolean {
+        val r = runCatching { conn.claimInterface(itf, true) }
+        val ok = r.getOrDefault(false)
+        if (!ok) log("claimInterface(if#${itf.id}) => false" + (r.exceptionOrNull()?.let { " 异常:$it" } ?: ""))
+        return ok
+    }
+
+    /**
+     * 释放接口。
+     *
+     * ⚠️ 有接口被 claim 住时 `setConfiguration` 会直接返回 false（实测）——
+     * 所以任何「切配置」之前都必须先 release，否则改不动配置。
+     */
+    fun release(conn: UsbDeviceConnection, itf: UsbInterface): Boolean {
+        val ok = runCatching { conn.releaseInterface(itf) }.getOrDefault(false)
+        if (!ok) log("releaseInterface(if#${itf.id}) => false")
+        return ok
+    }
 
     /** 从接口里挑出 bulk IN / OUT。 */
     fun bulkEndpoints(itf: UsbInterface): Pair<UsbEndpoint?, UsbEndpoint?> {

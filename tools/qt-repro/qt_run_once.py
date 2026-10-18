@@ -62,10 +62,10 @@ def main():
             print(f'activate => {n} {U.strerror() if n < 0 else "ok"}')
         finally:
             U.lib.usb_close(h)
-        print('等待重枚举（activate 可能延迟数十秒才生效，耐心等）…')
-        d = wait_capture_mode(120)
+        print('等待重枚举（实测 activate 可能延迟 2~3 分钟才生效，耐心等）…')
+        d = wait_capture_mode(200)
         if d is None:
-            print('\n✗ 120s 内没等到采集配置。设备需要重启（解锁亮屏）。')
+            print('\n✗ 200s 内没等到采集配置。设备需要重启（解锁亮屏）。')
             return 3
 
     # ---- 进入采集 ----

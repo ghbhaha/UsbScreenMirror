@@ -47,13 +47,38 @@ internal class QtSession(
     /** 持续收流，直到超时或收到 maxFrames 帧。返回统计。 */
     fun run(maxSeconds: Int, maxFrames: Int = Int.MAX_VALUE): Stats {
         val st = Stats()
-        val readBuf = ByteArray(1 shl 20)      // 1 MiB：FEED 包可达 60KB+
+        // ★ 读缓冲必须小：1 MiB 的 bulk IN 在 xHCI 上会排成一长串传输描述符，
+        //   而设备最先发的是 16B 的 PING（短包）——短包会让整串立即取消，
+        //   取消 URB 正是会把设备端点弄坏的动作（本项目已踩过）。
+        //   Windows 上 libusb0 没有这种语义，所以 1 MiB 在那边照样能跑。
+        val readBuf = ByteArray(16 * 1024)
         val deadline = System.currentTimeMillis() + maxSeconds * 1000L
         val start = System.currentTimeMillis()
 
+        var timeouts = 0
+        var lastReport = start
+
         while (System.currentTimeMillis() < deadline) {
+            val t0 = System.currentTimeMillis()
             val n = conn.bulkTransfer(epIn, readBuf, readBuf.size, 500)
-            if (n <= 0) continue
+            val dt = System.currentTimeMillis() - t0
+
+            if (n <= 0) {
+                // Android 的 bulkTransfer 对「超时」和「端点错误」都返回 -1，
+                // 只能用耗时区分：接近 timeout 的是超时，明显更短的是错误。
+                val isTimeout = dt >= 450
+                if (isTimeout) {
+                    timeouts++
+                } else {
+                    log("读错误 n=$n（${dt}ms）")
+                }
+                val now = System.currentTimeMillis()
+                if (now - lastReport >= 3000) {
+                    lastReport = now
+                    log("  …空闲 ${(now - start) / 1000}s：超时 $timeouts 次 / 已收 ${st.bytes} B")
+                }
+                continue
+            }
             st.bytes += n
             var buf = tail + readBuf.copyOf(n)
             while (buf.size >= 4) {
@@ -82,8 +107,9 @@ internal class QtSession(
         when {
             QtPacket.matches(p, 0, "ping") -> {
                 st.ping++
+                log("PING#${st.ping} 收到 ${p.size}B: " + p.joinToString(" ") { "%02x".format(it) })
                 val w = epOut?.let { conn.bulkTransfer(it, QtPacket.ping(), 16, 1000) } ?: -1
-                log("PING → 回写 $w B")
+                log("PING#${st.ping} → 回写 $w B")
             }
 
             QtPacket.matches(p, 0, "sync") && p.size >= 16 -> {

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.view.Gravity
@@ -92,6 +93,8 @@ class MainActivity : Activity() {
 
     private fun log(msg: String) {
         val line = "${logFmt.format(Date())}  $msg"
+        // 同时打到 logcat：UI 文本要 uiautomator dump 才读得到，logcat 一条命令就能跟
+        android.util.Log.i("UAV-IosQt", msg)
         runOnUiThread {
             logView.append(line + "\n")
         }
@@ -143,10 +146,10 @@ class MainActivity : Activity() {
             } finally {
                 runCatching { conn0.close() }
             }
-            log("已请求激活，等待设备重枚举（最长 120s，可能延迟数十秒）…")
-            dev = waitForCaptureMode(120)
+            log("已请求激活，等待设备重枚举（最长 300s；实测可能延迟 2~3 分钟）…")
+            dev = waitForCaptureMode(300)
             if (dev == null) {
-                log("✗ 120s 内没有出现采集接口。设备需要物理重启（解锁亮屏）。")
+                log("✗ 300s 内没有出现采集接口。设备需要物理重启（解锁亮屏）。")
                 return null
             }
         } else {
@@ -159,35 +162,113 @@ class MainActivity : Activity() {
             return null
         }
 
-        // 5) claim + 找端点
-        val itf = transport.findCaptureInterface(dev)
+        // 5) 先把配置切到承载 0x2A 的那个（等价 Windows 的 set_configuration(5)）。
+        //    只切这一次 —— 之后建 lockdown 会话、claim QT 都不再动配置。
+        transport.dumpConfigs(dev)
+        val cfg = transport.captureConfiguration(dev)
+        if (cfg == null) {
+            log("没有任何配置包含 0xFF/0x2A 采集接口，中止")
+            return null
+        }
+        val itf = transport.captureInterfaceIn(cfg)
         if (itf == null) {
-            log("找不到 0xFF/0x2A 采集接口，中止")
+            log("配置 id=${cfg.id} 里找不到 0xFF/0x2A 接口，中止")
             return null
         }
         val conn = transport.open(dev) ?: return null
-        if (!transport.claim(conn, itf)) {
-            log("claim 接口失败")
+        if (!transport.setConfiguration(conn, cfg)) {
+            log("切换配置失败")
             runCatching { conn.close() }
+            return null
+        }
+
+        // 6) ★ 先建 lockdown 会话，再碰 QT —— 这是 AMDS 的顺序。
+        //    2026-10-18 的 A/B 证明：没有这个会话，设备只回一次 PING 就沉默。
+        val identity = Identity.loadFromAssets(this, ::log)
+        var connMux: UsbDeviceConnection? = null
+        val keepAlive = java.util.concurrent.atomic.AtomicBoolean(true)
+        var muxThread: Thread? = null
+        val itfMux = transport.muxInterfaceIn(cfg)
+        if (itfMux == null) {
+            log("⚠ 配置 id=${cfg.id} 里没有 usbmux 接口（0xFF/0xFE/2），跳过 lockdown 会话")
+        } else {
+            val cm = transport.open(dev)
+            if (cm == null) {
+                log("⚠ mux 连接 openDevice 失败")
+            } else {
+                connMux = cm
+                if (!transport.claim(cm, itfMux)) {
+                    log("⚠ claim usbmux 接口失败")
+                } else {
+                    val (mi, mo) = transport.bulkEndpoints(itfMux)
+                    if (mi == null || mo == null) {
+                        log("⚠ usbmux 接口端点不全")
+                    } else {
+                        log("建立 lockdown 会话（if#${itfMux.id}）…")
+                        val link = MuxLink(cm, mi, mo, identity, ::log)
+                        if (link.open()) {
+                            log("★★ lockdown 会话在线（TLS=${link.tlsReady} 信任=${link.trusted}），开始保活")
+                            muxThread = Thread({
+                                while (keepAlive.get() && link.failed == null) {
+                                    runCatching { link.pumpOnce(200) }
+                                }
+                            }, "mux-keepalive").apply { isDaemon = true; start() }
+                        } else {
+                            log("✗ lockdown 会话未建立：${link.failed}")
+                        }
+                    }
+                }
+            }
+        }
+
+        // 7) 现在才 claim QT 并开读
+        val connQt = conn
+        if (!transport.claim(connQt, itf)) {
+            log("claim QT 接口失败")
+            keepAlive.set(false); runCatching { connMux?.close() }; runCatching { connQt.close() }
             return null
         }
         val (epIn, epOut) = transport.bulkEndpoints(itf)
         if (epIn == null) {
             log("接口里没有 bulk IN 端点")
-            runCatching { conn.close() }
+            keepAlive.set(false); runCatching { connMux?.close() }; runCatching { connQt.close() }
             return null
         }
-        log("接口 if#${itf.id} 已 claim；IN=0x${epIn.address.toString(16)} " +
+        log("QT 接口 if#${itf.id} 已 claim；IN=0x${epIn.address.toString(16)} " +
             "OUT=${epOut?.let { "0x" + it.address.toString(16) } ?: "无"}")
 
-        // 6) 收流落盘
+        // 8) 收流落盘
         val outFile = File(getExternalFilesDir(null) ?: filesDir, "feed.bin")
         log("落盘：${outFile.absolutePath}")
         return outFile.outputStream().use { out ->
             try {
-                QtSession(conn, epIn, epOut, out, ::log).run(maxSeconds = 30)
+                val st = QtSession(connQt, epIn, epOut, out, ::log).run(maxSeconds = 12)
+                if (st.ping > 0 || st.bytes > 0) return@use st
+
+                log("12s 内没有 PING ⇒ 用配置 4→5 重新武装一次")
+                transport.release(connQt, itf)
+                val cfg4 = transport.configurationById(dev, 4)
+                if (cfg4 != null) {
+                    transport.setConfiguration(connQt, cfg4)
+                    Thread.sleep(300)
+                }
+                if (!transport.setConfiguration(connQt, cfg)) {
+                    log("  重新切回配置 ${cfg.id} 失败")
+                    return@use st
+                }
+                val itf2 = transport.captureInterfaceIn(cfg) ?: itf
+                transport.claim(connQt, itf2)
+                val (in2, out2) = transport.bulkEndpoints(itf2)
+                if (in2 == null) {
+                    log("  重新武装后没有 bulk IN")
+                    return@use st
+                }
+                QtSession(connQt, in2, out2, out, ::log).run(maxSeconds = 25)
             } finally {
-                runCatching { conn.close() }
+                keepAlive.set(false)
+                runCatching { muxThread?.interrupt() }
+                runCatching { connMux?.close() }
+                runCatching { connQt.close() }
             }
         }
     }

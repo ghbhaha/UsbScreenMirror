@@ -16,3 +16,9 @@ build/
 # qt-repro 抓下来的原始视频流（体积大，不入库）
 tools/qt-repro/capture/
 tools/qt-repro/*.bin
+
+# app-ios-qt 导入的 PC 配对凭证（含私钥），绝不入库
+app-ios-qt/src/main/assets/pc_host.der
+app-ios-qt/src/main/assets/pc_root.der
+app-ios-qt/src/main/assets/pc_host_key.pem
+app-ios-qt/src/main/assets/pc_hostid.txt
