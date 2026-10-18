@@ -11,6 +11,7 @@ import com.uav.host.aoa.video.VideoDecoder
 import com.uav.protocol.Bytes
 import com.uav.protocol.Logger
 import com.uav.protocol.adb.AdbMessage
+import com.uav.protocol.aoa.AppVersions
 import com.uav.protocol.aoa.Command
 import com.uav.protocol.aoa.Connection
 import com.uav.protocol.aoa.ConnectionListener
@@ -65,6 +66,14 @@ class HostSession(
     private val listener: Listener,
     /** 回放模式：跳过 CNXN/OPEN 握手，直接消费文件里的 WRTE。 */
     private val replay: Boolean = false,
+
+    /**
+     * 本端 `versionCode`，握手时通过 `CNXN.arg1` 报给配件端（10.39）。
+     *
+     * 由调用方传入而不是直接读 `BuildConfig`：本类要能在 JVM 单测里跑，
+     * 掺进构建系统常量会让"喂固定字节 → 断言出站字节"这类测试没法做。
+     */
+    private val appVersion: Int = 0,
 
     /** 是否向手机请求音频（10.13）。关掉用于 A/B 对比排障。 */
     private val audioEnabled: Boolean = true,
@@ -354,7 +363,8 @@ class HostSession(
             val payload = Bytes.intLE(localWidth) + Bytes.intLE(localHeight) +
                 Bytes.longLE(sentNanos)
             cnxnSentNanos = sentNanos
-            connection?.send(Command.CNXN, Protocol.VERSION, 0, payload)
+            // ★ arg1 = 本端 versionCode：老包不读它（会忽略），新包据此核对两端版本。
+            connection?.send(Command.CNXN, Protocol.VERSION, appVersion, payload)
             listener.onStatus("CNXN 已发送（本机 ${localWidth}x$localHeight），等待手机尺寸…")
 
             if (!peerCnxnLatch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
@@ -494,7 +504,12 @@ class HostSession(
                     if (message.payload.size >= 8) {
                         phoneWidth = Bytes.getIntLE(message.payload, 0)
                         phoneHeight = Bytes.getIntLE(message.payload, 4)
-                        logger.i(TAG, "peer CNXN: version=${message.arg0} ${phoneWidth}x$phoneHeight")
+                        logger.i(
+                            TAG,
+                            "peer CNXN: proto=${message.arg0} app=${message.arg1} " +
+                                "${phoneWidth}x$phoneHeight",
+                        )
+                        checkPeerVersions(message.arg0, message.arg1)
                     } else {
                         logger.w(TAG, "CNXN payload 只有 ${message.payload.size} 字节，期望 8")
                     }
@@ -877,6 +892,40 @@ class HostSession(
             surfaceProvider()?.let { return it }
         }
         return null
+    }
+
+    /**
+     * 握手期的版本核对（10.39）：`CNXN.arg0` = 协议版本，`arg1` = 对方 `versionCode`。
+     *
+     * **只提示、不中断**：版本不同不等于不能用，绝大多数差异只是少个新功能；
+     * 硬拒绝会让"用旧包复现老问题"这种调试手段直接失效。判定边界在
+     * `:protocol/aoa/AppVersions`（有单测），这里只负责说人话。
+     *
+     * ⚠️ 提示走 [Listener.onStatus]（副行），而副行很快会被"OPEN 已发送…"覆盖 ——
+     * 所以**日志才是这条信息的持久载体**，排查时 grep `两端版本` / `旧包`。
+     */
+    private fun checkPeerVersions(peerProto: Int, peerApp: Int) {
+        if (peerProto != Protocol.VERSION) {
+            // 配件端回的是 minOf(对方, 自己)，正常情况下不会不等；真不等说明有人改过常量
+            logger.w(TAG, "协议版本不同：host v${Protocol.VERSION} / peer v$peerProto（按较低版本继续）")
+        }
+        when (AppVersions.compat(appVersion, peerApp)) {
+            AppVersions.Compat.SAME ->
+                logger.i(TAG, "两端 App 版本一致（$appVersion）")
+
+            AppVersions.Compat.PEER_LEGACY -> {
+                logger.w(
+                    TAG,
+                    "配件端未上报版本（旧包）⇒ 依赖新协议的功能可能静默不生效（如像素模式）",
+                )
+                listener.onStatus("配件端是旧包（未上报版本），建议升级到 $appVersion 再排查")
+            }
+
+            AppVersions.Compat.DIFFERENT -> {
+                logger.w(TAG, "两端版本不一致：host $appVersion / peer $peerApp ⇒ 请一并升级")
+                listener.onStatus("两端版本不一致：宿主 $appVersion / 配件 $peerApp —— 请一并升级")
+            }
+        }
     }
 
     private fun fail(message: String, cause: Throwable? = null) {

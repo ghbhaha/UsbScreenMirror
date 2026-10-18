@@ -40,6 +40,8 @@ class SessionFlowTest {
         private val header: StreamHeader,
         private val configPayload: ByteArray,
         private val frames: List<Pair<Long, ByteArray>>,
+        /** 回报的 `CNXN.arg1`（= 配件端 versionCode）。默认 0 = 老包，不发版本。 */
+        private val appVersion: Int = 0,
     ) {
         val gotOpen = AtomicReference<ParsedOpen?>()
         val openLatch = CountDownLatch(1)
@@ -53,7 +55,7 @@ class SessionFlowTest {
                     when (message.commandType) {
                         Command.CNXN -> {
                             val payload = Bytes.intLE(screenWidth) + Bytes.intLE(screenHeight)
-                            c.send(Command.CNXN, Protocol.VERSION, 0, payload)
+                            c.send(Command.CNXN, Protocol.VERSION, appVersion, payload)
                         }
 
                         Command.OPEN -> {
@@ -225,5 +227,77 @@ class SessionFlowTest {
         assertEquals(720, decoded.width)
         assertEquals(1_600, decoded.height)
         assertEquals(720f / 1600f, decoded.aspectRatio, 1e-6f)
+    }
+
+    // ---------------------------------------------------------------- 握手版本协商（10.39）
+
+    @Test
+    fun `旧配件端不发版本号时宿主照常完成会话`() {
+        // appVersion 默认 0 = 老包。宿主必须把它当成"老包"而不是"版本冲突"，
+        // 否则一升级宿主，所有没升级的手机就全废了 —— 这是硬约束。
+        runFlowWithPeerVersion(0)
+    }
+
+    @Test
+    fun `两端版本不一致也不阻断会话`() {
+        // 只提示、不拒绝：版本不同通常只是少个新功能，投屏还能用；
+        // 硬拒绝会让"用旧包复现老问题"这种调试手段失效。
+        runFlowWithPeerVersion(99)
+    }
+
+    /** 走完整会话，只断言"能不能连通并出帧"，版本号只影响提示。 */
+    private fun runFlowWithPeerVersion(peerAppVersion: Int) {
+        val (hostSide, accSide) = MemoryPipe.pair()
+        val hostTransport = Transport(hostSide)
+        val accTransport = Transport(accSide)
+
+        val videoHeader = StreamHeader(CodecId.AVC1, 720, 1600)
+        val spsPps = bytes(0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E)
+        val frames = listOf(1000L to bytes(1, 2, 3, 4))
+        val accessory = FakeAccessory(
+            accTransport, 1080, 2400, videoHeader, spsPps, frames,
+            appVersion = peerAppVersion,
+        ).also { it.start() }
+
+        val hostConn = Connection(hostTransport)
+        val videoQueue = FrameQueue(StreamId.VIDEO)
+        hostConn.registerSink(StreamId.VIDEO, videoQueue)
+
+        val peerApp = AtomicReference<Int>()
+        val phoneCnxn = CountDownLatch(1)
+        val okayLatch = CountDownLatch(1)
+        hostConn.setListener(object : ConnectionListener {
+            override fun onMessage(message: AdbMessage) {
+                when (message.commandType) {
+                    Command.CNXN -> {
+                        peerApp.set(message.arg1)
+                        phoneCnxn.countDown()
+                    }
+
+                    Command.OKAY -> okayLatch.countDown()
+                    else -> Unit
+                }
+            }
+
+            override fun onError(cause: Throwable) = Unit
+            override fun onClosed(reason: String) = Unit
+        })
+        hostConn.start()
+
+        hostConn.send(Command.CNXN, Protocol.VERSION, 2, Bytes.intLE(1080) + Bytes.intLE(2400))
+        assertTrue("未收到手机 CNXN", phoneCnxn.await(3, TimeUnit.SECONDS))
+        assertEquals("arg1 应原样透传", peerAppVersion, peerApp.get())
+
+        hostConn.send(
+            Command.OPEN, StreamId.CONTROL, 0,
+            Options.buildPayload(Options.defaultOptions(2400)),
+        )
+        assertTrue("未收到 OKAY —— 版本不同不该阻断握手", okayLatch.await(3, TimeUnit.SECONDS))
+
+        // 能出帧才算真兼容（不只看握手）
+        assertTrue("版本不同不该阻断出帧", videoQueue.take(3_000) != null)
+
+        hostConn.close()
+        accessory.close()
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.os.Handler
+import android.os.SystemClock
 import android.os.Looper
 import com.uav.host.common.AndroidLogger
 import com.uav.host.common.DisplaySize
@@ -170,6 +171,10 @@ class LinkCoordinator(
     @Volatile
     private var waitingForPeerApp = false
 
+    /** 上一次判定"对端没人应答"的时刻（`elapsedRealtime`），用于给 attach 触发的重试设闸。 */
+    @Volatile
+    private var peerAppMissingAt = 0L
+
     /**
      * 前台轮询兜底：实测宿主设备（BOE P40UCH）在手机重枚举后**只发 DETACHED、不发 ATTACHED**，
      * 只靠 `USB_DEVICE_ATTACHED` 广播会让"插线即投"彻底失效。
@@ -232,7 +237,16 @@ class LinkCoordinator(
 
     /** USB 设备刚插上。 */
     fun onDeviceAttached(device: UsbDevice) {
-        // 重新插上 = 新情况（可能刚装好 App），解除"等 App"状态
+        // ⚠️ 我们自己的 AOA 握手会让手机**重新枚举** USB，于是又派发一次 attach ——
+        //   如果把它当成"用户重插"，重试就会自我续命：每次超时 → 重新握手 → 又 attach
+        //   → 又重试，形成 5s 一轮的空转（真机日志里数到 5 次）。
+        //   所以这里加一道时间闸：判定缺 App 后的 15s 内忽略 attach 触发的重试。
+        //   用户真拔插一次通常远超 15s，不受影响；急着重试也有「扫描 / 重试」按钮。
+        val sinceMissing = SystemClock.elapsedRealtime() - peerAppMissingAt
+        if (waitingForPeerApp && sinceMissing < PEER_APP_RETRY_GATE_MS) {
+            logger.i(TAG, "忽略本次 attach：刚判定对端没人应答（${sinceMissing}ms < ${PEER_APP_RETRY_GATE_MS}ms）")
+            return
+        }
         waitingForPeerApp = false
         forceRetried = false
         restartSerial { router?.onDeviceAttached(device) }
@@ -240,8 +254,8 @@ class LinkCoordinator(
 
     /** 设备拔出。 */
     fun onDeviceDetached(device: UsbDevice?) {
-        // 拔插是"新情况"：用户可能刚在手机上装好 App，让他插回来就能重试。
-        waitingForPeerApp = false
+        // ⚠️ 这里**不解除** waitingForPeerApp：我们自己的握手同样会让手机重新枚举、
+        //   派发 DETACHED —— 那不是"用户拔线"。解除只发生在 attach（带 15s 闸）与用户动作。
         stopSession()
         listener.onProgress("USB 已拔出，请重新插线或点 Scan/Retry")
         listener.onClosed("USB 已拔出")
@@ -469,6 +483,8 @@ class LinkCoordinator(
             transport = transport,
             localWidth = screen.x,
             localHeight = screen.y,
+            // 握手时用它跟对端核对两端版本（10.39）
+            appVersion = com.uav.host.BuildConfig.VERSION_CODE,
             surfaceProvider = surfaceProvider,
             displayArea = displayArea,
             oneToOne = oneToOne,
@@ -518,6 +534,7 @@ class LinkCoordinator(
                     //   这里不计 consecutiveFailures 也没用 —— 链路层每轮都成功、
                     //   计数会被 onReady 清零，退避永远停在最小档。
                     waitingForPeerApp = true
+                    peerAppMissingAt = SystemClock.elapsedRealtime()
                     listener.onPeerAppMissing()
 
                     // 自愈仍值得试一次：配件身份可能被"别的宿主 App"改写过，
@@ -580,6 +597,9 @@ class LinkCoordinator(
 
         /** 前台轮询的基准间隔。 */
         const val POLL_INTERVAL_MS = 2_000L
+
+        /** 判定缺 App 后，这段窗口内忽略 attach 触发的重试（见 onDeviceAttached）。 */
+        const val PEER_APP_RETRY_GATE_MS = 15_000L
 
         /** 轮询退避的上限（连续失败会 2s→4s→8s… 最长等这么久再试）。 */
         const val MAX_POLL_INTERVAL_MS = 30_000L

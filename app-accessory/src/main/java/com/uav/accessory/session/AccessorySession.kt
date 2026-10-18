@@ -1,10 +1,12 @@
 package com.uav.accessory.session
 
+import com.uav.accessory.BuildConfig
 import com.uav.accessory.CaptureService
 import com.uav.accessory.common.AndroidLogger
 import com.uav.protocol.Bytes
 import com.uav.protocol.Logger
 import com.uav.protocol.adb.AdbMessage
+import com.uav.protocol.aoa.AppVersions
 import com.uav.protocol.aoa.Command
 import com.uav.protocol.aoa.Connection
 import com.uav.protocol.aoa.ConnectionListener
@@ -294,8 +296,21 @@ class AccessorySession(
         }
         logger.i(
             TAG,
-            "host CNXN: version=${message.arg0} 宿主屏幕 ${hostWidth}x$hostHeight"
+            "host CNXN: proto=${message.arg0} app=${message.arg1} 宿主屏幕 ${hostWidth}x$hostHeight"
         )
+        // ★ 核对两端 App 版本（10.39）：arg1 = 宿主 versionCode。
+        //   只提示不中断 —— 版本不同通常只是少个新功能，投屏照样能用；
+        //   真拒绝了反而没法用旧包复现老问题。
+        val compat = AppVersions.compat(BuildConfig.VERSION_CODE, message.arg1)
+        if (AppVersions.needsWarning(compat)) {
+            val why = if (compat == AppVersions.Compat.PEER_LEGACY) {
+                "宿主端未上报版本（旧包）"
+            } else {
+                "宿主 ${message.arg1} / 本机 ${BuildConfig.VERSION_CODE}"
+            }
+            logger.w(TAG, "两端版本不一致：$why ⇒ 依赖新协议的功能可能静默不生效（如像素模式）")
+            listener.onStatus("两端版本不一致：$why —— 请一并升级")
+        }
         // 回复本机尺寸；版本取两者较小值
         val version = minOf(message.arg0, Protocol.VERSION)
         // ★ payload 追加本机单调时钟读数（8B -> 16B）：宿主用它标定两端时钟，
@@ -304,7 +319,8 @@ class AccessorySession(
         //   用 System.nanoTime() 作为帧时间戳，所以这里也用 System.nanoTime()。
         val payload = Bytes.intLE(localWidth) + Bytes.intLE(localHeight) +
             Bytes.longLE(System.nanoTime())
-        connection?.send(Command.CNXN, version, 0, payload)
+        // ★ arg1 回本端 versionCode，宿主据此核对两端版本（老宿主会忽略）
+        connection?.send(Command.CNXN, version, BuildConfig.VERSION_CODE, payload)
         listener.onStatus("已回 CNXN（本机 ${localWidth}x$localHeight）")
     }
 

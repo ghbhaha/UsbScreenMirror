@@ -581,6 +581,7 @@ class HostActivity : Activity() {
             surfaceProvider = { panel.currentSurface() },
             logger = logger,
             replay = true,
+            appVersion = com.uav.host.BuildConfig.VERSION_CODE,
             listener = replayListener,
         )
         link.adoptReplaySession(s)
