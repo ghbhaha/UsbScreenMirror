@@ -55,6 +55,11 @@ android {
             // 没配密钥就不设签名：signingConfig = null 时 AGP 照旧产出 unsigned APK
             signingConfig = signingConfigs.findByName("release")
         }
+        debug {
+            // ★ 与 release 共用同一张证书，理由见 :app-host 的同名字段。
+            // 没配密钥时保持 AGP 默认的 debug.keystore。
+            signingConfigs.findByName("release")?.let { signingConfig = it }
+        }
     }
 }
 

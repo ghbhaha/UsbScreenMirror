@@ -54,6 +54,14 @@ android {
             // 没配密钥就不设签名：signingConfig = null 时 AGP 照旧产出 unsigned APK
             signingConfig = signingConfigs.findByName("release")
         }
+        debug {
+            // ★ 与 release 共用同一张证书。
+            // 两侧签名不同时，debug ↔ release 必须**先卸载**才能装，而卸载会连带清掉
+            // filesDir 里的配对记录（iPad 上得重新点一次「信任」）。
+            // 共用之后，两种包可以直接互相覆盖安装。
+            // 没配密钥时（别人 clone、或没配 secret 的 CI）保持 AGP 默认的 debug.keystore。
+            signingConfigs.findByName("release")?.let { signingConfig = it }
+        }
     }
 }
 
