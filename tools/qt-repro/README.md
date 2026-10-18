@@ -95,3 +95,49 @@ def fcc(name):            # 'ping' -> b'gnip' 的字节序
 
 这个「两次 PING」的差异是目前最有价值的线索：设备在 Windows 上会再发一次 PING，
 之后才进 `WaitingForAudioClock`。Android 侧为什么只收到一次，尚未定位。
+
+## 抓包：USBPcap（对比 iPhoneMirror 有音频、我们没音频）
+
+### 安装（只需一次，**装完必须重启**）
+
+```bash
+winget install --id desowin.USBPcap -e --accept-package-agreements --accept-source-agreements
+```
+
+安装器结尾若打印
+
+```
+PCI\VEN_8086&DEV_51ED...: Failed to invoke DIF_PROPERTYCHANGE! Please reboot.
+```
+
+说明过滤器（`USBPcap` 已写进 USB 类 `UpperFilters`）**没能热挂到已存在的主控上**，
+必须重启电脑才生效。判断方法：`USBPcapCMD.exe -A -o x.pcap` 跑几秒仍**不产生文件** = 还没挂上。
+
+### 抓
+
+```bash
+# iPad 插 PC、iPhoneMirror 用【有线】模式连上并开始投屏后：
+"/c/Program Files/USBPcap/USBPcapCMD.exe" -A -o capture/qt_audio.pcap
+# Ctrl+C 结束。-A = 所有设备（-d "\\.\USBPcapN" 只抓某个根集线器，更小但要知道 N）
+```
+
+### 看
+
+`usbpcap_dump.py` 把 pcap 转成和两端日志能直接对照的时序（不需要 Wireshark）：
+
+```bash
+python usbpcap_dump.py capture/qt_audio.pcap            # 全量时序
+python usbpcap_dump.py capture/qt_audio.pcap --out      # 只看主机→设备（"我们该发什么"）
+python usbpcap_dump.py capture/qt_audio.pcap --fcc      # fourcc 统计（有无 eat! 一眼看出）
+```
+
+输出形如：
+
+```
+  0.000 OUT ctrl ep=0x00 dev=7  setup bm=0x40 req=0x52 wValue=0x0000 wIndex=0x0002 len=0   ← activate
+  1.234 OUT bulk ep=0x05 dev=7  len=24    fcc='hpd1'
+  2.345 IN  bulk ep=0x86 dev=7  len=72    fcc='eat!'
+```
+
+⚠️ 抓包期间**不要**跑本目录的 `qt_stream.py`（它会 `activate`/切配置，本机蓝屏过两次）。
+抓包只做观察，别扰动设备状态。

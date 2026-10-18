@@ -44,8 +44,26 @@ class MainActivity : Activity() {
      *
      * ⚠️ 打开会让 iPad 把音频路由到 USB；**若本端收不到 EAT 帧，iPad 上点播放会立刻暂停**。
      * 所以只在排查音频时临时置 true，验证完必须改回 false。
+     *
+     * 本次置 true 是为验证「HPD1 恢复成每个 CWPA 都发」后音频是否出现，验完按结果决定去留。
+     * 结果（2026-10-18 17:03，iPad 正在放音频）：两个 CWPA 都回了 HPD1×2+clock+HPA1、AFMT 也回了，
+     * **仍然零 EAT** ⇒ 本机组合下设备就是不推 QT 音频帧。已改回 false。
      */
     private val requestAudio = false
+
+    /**
+     * 是否先建 lockdown 受信任会话再 claim QT。
+     *
+     * ★ iPhoneMirror（有线模式，能同时出音视频）**完全不做 lockdown**：
+     *   它的日志是 `libusb0_quicktime_open claim=success configuration=5 interface=2`
+     *   紧接 `async_sprp`，中间没有任何 mux/TLS 步骤。
+     *   而我们从 2026-10-18 起一直坚持"先 lockdown 再 claim"（当时的 A/B 说没有它会静默）。
+     *   ⇒ 已验证：关掉之后设备**只回一次 PING 就沉默**（零 CWPA/零 FEED）。
+     *   原因是它借用了 PC 上常驻的 **Apple Mobile Device Service**（它自己的
+     *   DRIVER_DEPENDENCIES.md 把 AMDS 列为必需依赖）—— 那份受信任会话由系统提供，
+     *   安卓上没有，所以我们必须自己建。**这个开关必须保持 true。**
+     */
+    private val useLockdown = true
 
     /** 用户点了「停止投屏」 */
     @Volatile
@@ -492,13 +510,15 @@ class MainActivity : Activity() {
             return null
         }
 
-        // 6) ★ 先建 lockdown 会话，再碰 QT —— 这是 AMDS 的顺序。
-        //    2026-10-18 的 A/B 证明：没有这个会话，设备只回一次 PING 就沉默。
+        // 6) 先建 lockdown 会话（可选）
         val identity = Identity.load(this, ::log)
         var connMux: UsbDeviceConnection? = null
         val keepAlive = java.util.concurrent.atomic.AtomicBoolean(true)
         var muxThread: Thread? = null
-        val itfMux = transport.muxInterfaceIn(cfg)
+        val itfMux = if (!useLockdown) {
+            log("★ 按 iPhoneMirror 的做法跳过 lockdown，直接 claim QT")
+            null
+        } else transport.muxInterfaceIn(cfg)
         if (itfMux == null) {
             log("⚠ 配置 id=${cfg.id} 里没有 usbmux 接口（0xFF/0xFE/2），跳过 lockdown 会话")
         } else {

@@ -65,9 +65,6 @@ internal class QtSession(
     /** 上一次交给上层的 SPS/PPS —— 内容变了（iPad 转屏）才需要重建解码器 */
     private var lastCsd: ByteArray? = null
 
-    /** HPD1 是否已发过：设备会连发两次 CWPA，显示描述只该发一轮 */
-    private var hpd1Sent = false
-
     /** 外部停止信号（点「停止投屏」时置位）。 */
     @Volatile
     var stopRequested = false
@@ -180,19 +177,18 @@ internal class QtSession(
                     QtPacket.matches(p, 12, "cwpa") && p.size >= 32 -> {
                         st.cwpa++
                         audioClock = QtPacket.u64At(p, 24)
-                        // 参考实现每个 CWPA 连发两个 HPD1；设备自己也会连发两次 CWPA，
-                        // 所以这里按「只发一轮」处理，免得包数翻倍。
-                        if (!hpd1Sent) {
-                            hpd1Sent = true
-                            write(QtPacket.hpd1())
-                            write(QtPacket.hpd1())
-                        }
+                        // ★ 每个 CWPA 都发 HPD1×2 —— 与参考实现逐字节一致。
+                        //   曾经为"免得包数翻倍"改成整个会话只发一轮，但从那以后音频再没出现过；
+                        //   设备自己会连发两次 CWPA，对第二个只回 clock+HPA1 与参考实现不同，
+                        //   而这段正是音频协商路径，不能自作聪明。
+                        write(QtPacket.hpd1())
+                        write(QtPacket.hpd1())
                         write(QtPacket.clockReply(corr, audioClock + 0x1000))
                         if (requestAudio) {
                             write(QtPacket.hpa1(audioClock))
-                            log("CWPA audio=$audioClock → clock+HPA1（已声明音频）")
+                            log("CWPA#${st.cwpa} audio=$audioClock → HPD1×2+clock+HPA1")
                         } else {
-                            log("CWPA audio=$audioClock → clock（未声明音频，避免 iPad 播放被掐）")
+                            log("CWPA#${st.cwpa} audio=$audioClock → HPD1×2+clock（未声明音频）")
                         }
                     }
 
