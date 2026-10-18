@@ -38,15 +38,25 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # 提供 ANDROID_HOME / sdkmanager，并自动接受 license
+      # ⚠️ 必须显式覆盖 packages —— action 默认装 `tools platform-tools`，
+      #    而 legacy `tools` 包已被 Google 从 SDK 仓库移除（2026-09-15 起），
+      #    新版 cmdline-tools 下 sdkmanager 会直接 exit 1：
+      #      Warning: Failed to find package 'tools'
+      #    上游 issue：android-actions/setup-android#537。
+      #    我们只需要它设置 ANDROID_HOME 并接受 license，platform 与 build-tools 下面自己装。
+      #    若上游再出类似问题：整步删掉即可 —— runner 镜像本来就带
+      #    /usr/local/lib/android/sdk（含 cmdline-tools），ANDROID_HOME 也已设好。
       - name: 安装 Android SDK 工具
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       # compileSdk=36 + buildToolsVersion=36.0.0 是写死的；runner 自带的不一定够新，
       # 显式装一次（已存在会直接跳过，不会重复下载）
       - name: 安装 SDK Platform 36 与 Build-Tools 36.0.0
         run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
 
       # wrapper 指向腾讯云镜像（本地开发快）；runner 在海外，走官方源更稳。
       # 只改 CI 这次检出，仓库里的文件不动。
