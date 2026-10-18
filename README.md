@@ -1,5 +1,6 @@
 # UsbScreenMirror
 
+[![CI](https://github.com/ghbhaha/UsbScreenMirror/actions/workflows/ci.yml/badge.svg)](https://github.com/ghbhaha/UsbScreenMirror/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/Android-6.0%2B%20(API%2023)-3ddc84)
 

@@ -1,0 +1,122 @@
+name: CI
+
+# 触发：
+#   - 推到 develop / master
+#   - PR 目标为这两条分支
+#   - 手动（Actions 页面 Run workflow）
+#   - 打 v* 标签 → 额外把 APK 附到 GitHub Release
+on:
+  push:
+    branches: [develop, master]
+    tags: ['v*']
+  pull_request:
+    branches: [develop, master]
+  workflow_dispatch:
+
+# 同一分支上的新推送取消旧任务：文档改一次推一次时不必等两份
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # 打 tag 时要创建 Release
+
+jobs:
+  build:
+    name: 单测 + 打 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 项目 target 是 Java 17，但开发机锁的是 JDK 21，CI 跟随 21 以免两边行为不一致
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 提供 ANDROID_HOME / sdkmanager，并自动接受 license
+      - name: 安装 Android SDK 工具
+        uses: android-actions/setup-android@v3
+
+      # compileSdk=36 + buildToolsVersion=36.0.0 是写死的；runner 自带的不一定够新，
+      # 显式装一次（已存在会直接跳过，不会重复下载）
+      - name: 安装 SDK Platform 36 与 Build-Tools 36.0.0
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      # wrapper 指向腾讯云镜像（本地开发快）；runner 在海外，走官方源更稳。
+      # 只改 CI 这次检出，仓库里的文件不动。
+      - name: 临时切回官方 Gradle 发行源
+        run: |
+          sed -i 's#mirrors\.cloud\.tencent\.com/gradle/#services.gradle.org/distributions/#' \
+            gradle/wrapper/gradle-wrapper.properties
+          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+
+      # 缓存 Gradle 依赖 + wrapper 发行包（wrapper 走腾讯云镜像，首次下载最耗时）
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/develop' }}
+
+      - name: 赋予 gradlew 执行权限
+        run: chmod +x ./gradlew
+
+      # 唯一能在没有真机时真正验收的部分；失败就不要再打包了
+      - name: 协议层单测
+        run: ./gradlew :protocol:test --stacktrace
+
+      - name: 构建 debug APK
+        run: ./gradlew :app-host:assembleDebug :app-accessory:assembleDebug --stacktrace
+
+      # 测试报告无论成败都传，失败时靠它定位
+      - name: 上传单测报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-test-report
+          path: protocol/build/reports/tests/test
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: 上传宿主 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-host-debug
+          path: app-host/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传配件 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-accessory-debug
+          path: app-accessory/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # 只在推 v* 标签时创建 Release。
+      # ⚠️ 附的是 **debug 签名** 的包：仓库里的 release 构建未签名，直接 adb install 会失败。
+      - name: 发布 Release（仅 tag）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app-host/build/outputs/apk/debug/app-host-debug.apk
+            app-accessory/build/outputs/apk/debug/app-accessory-debug.apk
+          generate_release_notes: true
+          body: |
+            ### 附件说明
+
+            | 文件 | 装到哪 |
+            | --- | --- |
+            | `app-host-debug.apk` | **宿主**（那台要显示画面的安卓设备） |
+            | `app-accessory-debug.apk` | **被投屏的安卓设备**（手机 / 平板 / 盒子 / 车机） |
+
+            ⚠️ 这是 **debug 签名** 的产物 —— 仓库里的 release 构建默认不签名，
+            直接安装会失败；debug 包可以直接 `adb install`。
+
+            配对 iPad、adb 调试入口等用法见 README 与 `docs/快速开始.md`。
