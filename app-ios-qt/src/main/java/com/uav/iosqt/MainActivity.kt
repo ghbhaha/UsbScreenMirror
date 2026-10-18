@@ -1,6 +1,7 @@
 package com.uav.iosqt
 
 import android.app.Activity
+import com.uav.protocol.ios.QtPacket
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent

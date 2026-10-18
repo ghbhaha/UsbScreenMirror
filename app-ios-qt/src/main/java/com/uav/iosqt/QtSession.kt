@@ -1,6 +1,7 @@
 package com.uav.iosqt
 
 import android.hardware.usb.UsbDeviceConnection
+import com.uav.protocol.ios.QtPacket
 import com.uav.protocol.ios.AudioParser
 import android.hardware.usb.UsbEndpoint
 import java.io.OutputStream

@@ -1,4 +1,4 @@
-package com.uav.iosqt
+package com.uav.protocol.ios
 
 /**
  * QuickTime USB 报文的构造。
@@ -11,7 +11,7 @@ package com.uav.iosqt
  *   `fourcc('p','i','n','g')` 是大端整数、按小端写盘，所以线上是 `67 6e 69 70`。
  *   构造和解析两侧都必须用 [fcc]，否则会"收到 SYNC 却认不出来"。
  */
-internal object QtPacket {
+object QtPacket {
 
     /** fourcc 的线上字节序：`"ping"` → `67 6e 69 70`。 */
     fun fcc(name: String): ByteArray =
@@ -87,7 +87,9 @@ internal object QtPacket {
         descriptor += u32(12) + u32(4) + u32(1) + u32(4) + u32(2) + u32(16) + u32(0)
         descriptor += f64(48000.0) + f64(48000.0)
         return asyncDict("hpa1", audioClock, dict(listOf(
-            "BufferAheadInterval" to numF64(0.073),
+            // ★ 用精确位模式，不要写 0.073 字面量：它与设备给的 double 差最后 1 bit
+            //   （0x3FB2B020C49BA5E4），逐字节比对样本时会露出来。
+            "BufferAheadInterval" to numF64(java.lang.Double.longBitsToDouble(0x3FB2B020C49BA5E4L)),
             "deviceUID" to strValue("Valeria"),
             "ScreenLatency" to numF64(0.04),
             "formats" to dataValue(descriptor),
