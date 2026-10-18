@@ -12,3 +12,7 @@ build/
 
 # 离线回放抓流文件（第 7 节），体积大、不入库
 *.uav
+
+# qt-repro 抓下来的原始视频流（体积大，不入库）
+tools/qt-repro/capture/
+tools/qt-repro/*.bin
