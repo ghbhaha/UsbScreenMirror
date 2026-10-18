@@ -170,6 +170,30 @@ topResumedActivity = com.boe.yplayer / com.boe.lebo.yplayer.MainPanelActivity
 | 要与本项目其他能力打通（录屏落盘、反向控制、码率自适应） | 需要自研，系统乐播不提供接口 |
 | 要"物理有线" | 仍受 §2 的 CDC-NCM 限制，本机不可行 |
 
+### 5.6 ★ 开源接收端完整跑通（13:08）
+
+用户重新投到开源 App 后，宿主侧取证：
+
+```
+进程      : io.github.jqssun.airplay  (pid 21160)
+前台      : io.github.jqssun.airplay/.MainActivity
+7000 连接 : 000080FE...:1B58  st=01 (ESTABLISHED)   ← 对端是 iPad 的 IPv6 链路本地地址
+解码器    : c2.mtk.avc.decoder#769（MediaCodec 硬件 H.264）
+分辨率    : crop(0, 0, 1545, 1079)，frame-rate 60
+渲染      : SurfaceView 1546x1080，BLASTBufferQueue 正常出帧
+```
+
+**截图确认是 iPad 的完整主屏**（Dock、图标、状态栏时间 13:08 / 10月18日 周日全在），
+间隔 3 秒的两张截图字节不同 ⇒ **画面在持续刷新，不是静止帧**。
+
+⇒ **路径 C（WiFi AirPlay 接收端）在本机完整成立**：
+- 无 QT 端点、无 PING/CWPA、无 TLS、无开发者模式、无"每次开机一次机会"；
+- iPad 在控制中心手动选设备即可，画面 + 声音都由设备主动推过来；
+- 硬件解码走 MediaCodec（mtk avc decoder），1080p60 无压力。
+
+**遗留**：这台宿主是教育管控设备，App 被系统回收过一次（§5.5）。
+若要长期运行，需要处理后台存活（前台服务 / 白名单）。
+
 ## 六、待确认
 
 1. 第 1 步的 APK 验证结果（决定这条路成不成立）；
