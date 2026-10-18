@@ -43,9 +43,20 @@ internal class AudioPlayer(private val log: (String) -> Unit) {
     private var bytesDropped = 0L
     private var firstPacket = true
 
-    /** 建（或按新格式重建）轨道。 */
+    /**
+     * 建（或按新格式重建）轨道。
+     *
+     * ⚠️ 比较时**故意忽略 `formatFlags`**：设备前几包的 fdsc 里这个字段会在 12 与 0 之间
+     * 跳一下，而 codec/采样率/位深/声道完全没变 —— 直接比整个 data class 会让播放器
+     * 在建轨瞬间白白重建一次（真机日志里就出现过「lpcm 48k/16bit/2ch → 同一串，重建轨道」）。
+     * 真正影响听感与轨道参数的只有这四项。
+     */
     private fun ensure(fmt: AudioParser.Format): AudioTrack? {
-        if (track != null && current == fmt) return track
+        val same = current?.let {
+            it.sampleRate == fmt.sampleRate && it.channels == fmt.channels &&
+                it.bitsPerChannel == fmt.bitsPerChannel && it.codec == fmt.codec
+        } ?: false
+        if (track != null && same) return track
         if (track != null) {
             log("音频格式变化（${current} → ${fmt}），重建轨道")
             releaseTrack()

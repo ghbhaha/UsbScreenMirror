@@ -50,7 +50,7 @@ class MainActivity : Activity() {
      * AFMT 应答全齐、写路径也已改成独立线程（读路径不再被写阻塞），**仍然零 EAT**
      * ⇒ 本机这台 iPad8,9 / iOS 27.2 就是不推 QT 音频帧。已改回 false。
      */
-    private val requestAudio = false
+    private val requestAudio = true
 
     /**
      * 是否先建 lockdown 受信任会话再 claim QT。

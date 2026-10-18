@@ -251,9 +251,9 @@ internal class QtSession(
                         log("SKEW → reply(48000.0)")
                     }
 
-                    // ★ 线上 fourcc 是 20 21 6F 67，读出来像 "go! "；含义未知，
+                    // ★ 线上字节 20 21 6F 67 ⇒ fourcc 名是 "go! "（早先误写成 "og! "，反转后永远匹配不上）；
                     //   但它是音频开始推的前置之一（不回它，设备只推视频）。
-                    QtPacket.matches(p, 12, "og! ") -> {
+                    QtPacket.matches(p, 12, "go! ") -> {
                         st.og++
                         write(QtPacket.ogReply(corr))
                         log("OG → reply")

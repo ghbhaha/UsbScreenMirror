@@ -102,10 +102,13 @@ def make_hpd1(width=1640, height=2360):
 
 
 def make_hpa1(audio_clock):
-    descriptor = (f64(48000.0) + b'lpcm' + u32(12) + u32(4) + u32(1) +
+    # ★ codec 的 fourcc 必须走 fcc()（小端 ⇒ ASCII 反序），
+    #   直接写 b'lpcm' 等于告诉设备格式是 'mcpl' —— 设备不认识就不路由音频，
+    #   表现就是永远收不到 AFMT、也永远收不到 EAT。2026-10-18 与真机样本比对才发现。
+    descriptor = (f64(48000.0) + fcc('lpcm') + u32(12) + u32(4) + u32(1) +
                   u32(4) + u32(2) + u32(16) + u32(0) + f64(48000.0) + f64(48000.0))
     return async_dict(fcc('hpa1'), audio_clock, dictionary([
-        ('BufferAheadInterval', num_f64(0.073)),
+        ('BufferAheadInterval', num_f64(0.07300000000000001)),
         ('deviceUID', string('Valeria')),
         ('ScreenLatency', num_f64(0.04)),
         ('formats', wrap(fcc('datv'), descriptor)),
@@ -147,8 +150,86 @@ def time_reply(corr, ns):
     return u32(44) + fcc('rply') + u64(corr) + u32(0) + u64(ns) + u32(1_000_000_000) + u32(1) + u64(0)
 
 
+def skew_reply(corr, skew):
+    """RPLY：音频时钟偏差（参考实现固定回采样率 48000.0）。"""
+    return u32(28) + fcc('rply') + u64(corr) + u32(0) + f64(skew)
+
+
 def zero_reply(corr):
     return u32(24) + fcc('rply') + u64(corr) + u64(0)
+
+
+# ---------------------------------------------------------------- 收尾
+
+EMPTY_CLOCK_REF = 1
+
+
+def async_control(subtype, clock):
+    """20B 的 ASYN 控制包：len / 'asyn' / clock / subtype。"""
+    return u32(20) + fcc('asyn') + u64(clock) + fcc(subtype)
+
+
+def teardown(h, request_audio, audio_clock, quiet=False):
+    """按参考实现的方式收尾：HPA0/HPD0 -> 等 2 个 RELS -> 再补一个 HPD0。
+
+    参考实现的顺序（iPhoneMirror CaptureSession.cpp::shutdown_usb）：
+      1. stop_messages = [hpa0(设备音频时钟), hpd0(EmptyClockRef=1)]
+      2. 读最多 6s：期间对 SYNC `stop` 回 zero_reply，数到 2 个 ASYN `rels` 为止
+      3. 拿到 2 个 rels 后，再发一次 hpd0
+
+    ★ 不发这一段，设备侧的时钟会话就一直是打开的 —— 下一轮会话会直接在
+      第 3 帧卡死（2026-10-18 实测）。所以这不是可选步骤。
+    """
+    sent = 0
+    try:
+        if request_audio:
+            U.bulk_write(h, EP_OUT, async_control('hpa0', audio_clock or EMPTY_CLOCK_REF), 500)
+            sent += 1
+        U.bulk_write(h, EP_OUT, async_control('hpd0', EMPTY_CLOCK_REF), 500)
+        sent += 1
+    except Exception as e:
+        print(f'  (teardown 发送失败：{e})')
+
+    rels = 0
+    stops = 0
+    buf = b''
+    deadline = time.time() + 6.0
+    try:
+        while rels < 2 and time.time() < deadline:
+            n, data = U.bulk_read(h, EP_IN, 1 << 20, 250)
+            if n <= 0:
+                continue
+            buf += data
+            while len(buf) >= 4:
+                plen = read_u32(buf, 0)
+                if plen < 8 or plen > 8 << 20 or len(buf) < plen:
+                    break
+                payload = buf[4:plen]
+                buf = buf[plen:]
+                if len(payload) < 16:
+                    continue
+                magic = payload[:4]
+                sub = payload[12:16]
+                if magic == fcc('sync') and sub == fcc('stop'):
+                    stops += 1
+                    try:
+                        U.bulk_write(h, EP_OUT, zero_reply(read_u64(payload, 16)), 500)
+                    except Exception:
+                        pass
+                elif magic == fcc('asyn') and sub == fcc('rels'):
+                    rels += 1
+    except Exception as e:
+        print(f'  (teardown 排水异常：{e})')
+
+    if rels >= 2:
+        try:
+            U.bulk_write(h, EP_OUT, async_control('hpd0', EMPTY_CLOCK_REF), 500)
+        except Exception:
+            pass
+    if not quiet:
+        print(f'  ⇤ 收尾：发了 {sent} 个停止包，收到 rels={rels}/2、sync stop={stops}'
+              f'{"，已补发 hpd0" if rels >= 2 else "（未凑够 rels，可能又是下一轮卡死的原因）"}')
+    return rels
 
 
 # ---------------------------------------------------------------- 设备操作
@@ -231,11 +312,21 @@ def main():
     eat_file = open(os.path.join(OUT_DIR, 'audio.pcm'), 'wb')
     eat_bytes = [0]
     try:
-        while time.time() - t0 < 25:
+        # 采集时长：默认 25s，可用 QT_SECONDS 拉长（做"边放音频边收流"的对照时需要）
+        run_seconds = float(os.environ.get('QT_SECONDS', '25'))
+        kick_done = False
+        while time.time() - t0 < run_seconds:
             n, data = U.bulk_read(h, EP_IN, 1 << 20, 500)
             if n <= 0:
-                if time.time() - t0 > 6 and stats['feed'] == 0 and stats['ping'] == 0:
-                    pass
+                # 设备静默：可能是上一轮做了正确收尾（HPD0 = "显示器拔掉了"），
+                # 它已经把流停掉，等主机重新声明。参考实现在分辨率变化时就是
+                # 先 hpd0 再重新发 hpd1（complete_display_reconfigure），
+                # 这里借用同一条路把设备重新唤醒，免得回去切配置。
+                idle = time.time() - t0
+                if idle > 10 and not kick_done and stats['ping'] == 0 and stats['feed'] == 0:
+                    kick_done = True
+                    w = U.bulk_write(h, EP_OUT, make_hpd1(), 1000)
+                    print(f'  ↻ {idle:.0f}s 无数据 → 补发 HPD1 重新声明显示（{w}B）')
                 continue
             stats['bytes'] += n
             buf = buf_tail + data
@@ -283,6 +374,21 @@ def main():
                     elif sub == fcc('clok'):
                         stats['clok'] += 1
                         U.bulk_write(h, EP_OUT, clock_reply(corr, read_u64(payload, 4) + 0x10000), 1000)
+                    elif sub == fcc('go! '):
+                        # 线上字节 20 21 6f 67 ⇒ fourcc 名是 'go! '（不是 'og! '）。
+                        # 参考实现对每个 OG 都回一个 zero_reply，
+                        # 不回就只推视频、不推音频。
+                        stats['other'] += 1
+                        U.bulk_write(h, EP_OUT, zero_reply(corr), 1000)
+                        print('  ◆ OG → zero_reply')
+                    elif sub == fcc('skew'):
+                        stats['other'] += 1
+                        U.bulk_write(h, EP_OUT, skew_reply(corr, 48000.0), 1000)
+                        print('  ◆ SKEW → skew_reply(48000.0)')
+                    elif sub == fcc('stop'):
+                        stats['other'] += 1
+                        U.bulk_write(h, EP_OUT, zero_reply(corr), 1000)
+                        print('  ◆ SYNC stop → zero_reply')
                     elif sub == fcc('time'):
                         stats['time'] += 1
                         U.bulk_write(h, EP_OUT, time_reply(corr, int((time.time() - t0) * 1e9)), 1000)
@@ -321,6 +427,10 @@ def main():
     finally:
         feed_file.close()
         eat_file.close()
+        try:
+            teardown(h, SEND_HPA1, audio_clock)
+        except Exception as e:
+            print(f'  (teardown 失败：{e})')
         try:
             U.lib.usb_release_interface(h, 2)
         except Exception:
