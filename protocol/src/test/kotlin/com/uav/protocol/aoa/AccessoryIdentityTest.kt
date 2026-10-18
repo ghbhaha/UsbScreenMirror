@@ -94,4 +94,18 @@ class AccessoryIdentityTest {
             all[3],
         )
     }
+
+    @Test
+    fun `URI 必须指向真实发布页而不是占位符`() {
+        // AOA SEND_STRING[4] 是"没装 App 时去哪下载"的唯一出口。
+        // 以前填的是 https://uav.example.com/usbscreen —— 一个不存在的域名，
+        // 等于把用户的自救路径指进了死路。这条用例防它被改回去。
+        val uri = AccessoryIdentity.URI
+        assertTrue("URI 不能是 example.com 占位符：$uri", !uri.contains("example.com"))
+        assertTrue("URI 必须是 https：$uri", uri.startsWith("https://"))
+        assertTrue(
+            "URI 应指向 GitHub Releases 最新版：$uri",
+            uri.contains("github.com") && uri.endsWith("/releases/latest")
+        )
+    }
 }

@@ -73,6 +73,14 @@ class LinkCoordinator(
 
         /** 需要强制走一次完整 AOA 握手（自愈快路径）。 */
         fun onSelfHealRequest(device: UsbDevice) {}
+
+        /**
+         * 对端在配件模式下**完全没人应答**（典型：手机端没装配套 App）。
+         *
+         * 与 [onError] 分开：这不是链路故障，等自动重连永远不会成功，
+         * 上层要给的是可操作的去处（下载入口），不是一个"出错"标签。
+         */
+        fun onPeerAppMissing() {}
     }
 
     /** 当前活动会话；`null` = 没有链路。 */
@@ -481,6 +489,29 @@ class LinkCoordinator(
 
                 override fun onError(message: String, cause: Throwable?) =
                     handleSessionError(message, cause)
+
+                override fun onPeerAppMissing() {
+                    // ★ 必须清掉会话：轮询的接管条件是 `session == null`，
+                    //   不清就会一直挂着一个已经死掉的会话，用户装好 App 也接不回来。
+                    mainHandler.post { stopSession() }
+                    // ★ 退避同样必须记上：缺 App 是个**不会自己好**的状态，
+                    //   不留计数就会以最快档（约 1s）反复重试，而每次重试都要让手机
+                    //   重新枚举 USB —— 对端只会一直在配件/普通之间来回跳。
+                    consecutiveFailures.incrementAndGet()
+                    // 断线算"新情况"（用户可能马上把 App 装上），重置自动重试配额。
+                    router?.resetAttempts()
+                    listener.onPeerAppMissing()
+
+                    // 自愈仍值得试一次：配件身份可能被"别的宿主 App"改写过，
+                    // 那种情况系统不会拉起我们的配件 App，表现和"没装"一模一样。
+                    val dev = lastDevice
+                    if (fastPathUnverified && !forceRetried && dev != null) {
+                        forceRetried = true
+                        fastPathUnverified = false
+                        logger.w(TAG, "快路径连上但没人应答 → 强制完整 AOA 握手重试一次")
+                        listener.onSelfHealRequest(dev)
+                    }
+                }
             },
         )
         session = s

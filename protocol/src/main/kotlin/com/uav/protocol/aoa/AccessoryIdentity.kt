@@ -25,8 +25,16 @@ object AccessoryIdentity {
     /** SEND_STRING index 2 —— 描述文本（不参与匹配）。 */
     const val DESCRIPTION: String = "UAV USB Accessory Screen Mirroring"
 
-    /** SEND_STRING index 4 —— URI（不参与匹配）。 */
-    const val URI: String = "https://uav.example.com/usbscreen"
+    /**
+     * SEND_STRING index 4 —— URI（**不参与匹配**，`accessory_filter.xml` 只比前三个）。
+     *
+     * 这是 AOA 里唯一的"到哪去下载配套 App"字段：手机切进配件模式后，如果**没有任何
+     * 应用认领**这条配件（没装、或被 force-stop 过），系统会拿这个 URI 给用户一个去处。
+     *
+     * ★ 以前这里填的是占位符 `https://uav.example.com/usbscreen` —— 等于把"没装 App
+     *   该怎么办"这条唯一的自救路径指到了一个不存在的域名。现在指向正式发布页。
+     */
+    const val URI: String = "https://github.com/ghbhaha/UsbScreenMirror/releases/latest"
 
     /** SEND_STRING index 5 —— 序列号（不参与匹配）。 */
     const val SERIAL: String = "UA V00000000001"
@@ -35,7 +43,7 @@ object AccessoryIdentity {
      * 按 AOA 规范顺序返回 6 段字符串（见计划 2.4）：
      * `0=manufacturer 1=model 2=description 3=version 4=URI 5=serial`
      *
-     * ⚠️ 每段必须编码为 **UTF-16LE 且含结尾 `\0`**（计划红线），
+     * ⚠️ 每段必须编码为 **UTF-8 且含结尾 `\0`**（见 [encodeSendString] 里的实测结论）。
      *    AOA 的 52 号控制请求对编码错误只返回失败，不报原因，极易踩坑。
      */
     val SEND_STRING_ORDER: List<String> = listOf(

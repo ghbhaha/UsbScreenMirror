@@ -267,4 +267,42 @@ class HostUiStateTest {
         assertTrue("普通断线不该置 peerStopped", !s.peerStopped)
         assertEquals("已断开：链路读失败", s.detail)
     }
+
+    // ---------------------------------------------------------------- 缺 App（对端无应答）
+
+    @Test
+    fun `对端无应答单独成一个阶段`() {
+        val s = HostUiState()
+        s.onProgress("CNXN 已发送…")
+        s.onPeerAppMissing("没装配套 App")
+        assertEquals(HostUiState.Phase.NO_ACCESSORY_APP, s.phase)
+        assertEquals("没装配套 App", s.detail)
+    }
+
+    @Test
+    fun `缺 App 提示不会被后续进度刷掉`() {
+        val s = HostUiState()
+        s.onPeerAppMissing("没装配套 App")
+        // 宿主会自动重连，进度事件每秒都来 —— 让它冲掉这条提示，用户就只知道"在转圈"
+        s.onProgress("CNXN 已发送（本机 1080x2400），等待手机尺寸…")
+        assertEquals(HostUiState.Phase.NO_ACCESSORY_APP, s.phase)
+        assertEquals("没装配套 App", s.detail)
+    }
+
+    @Test
+    fun `已经投屏时不会被误判成缺 App`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        // 能出画面说明对端 App 明明在跑，这个事件只可能是重连时的瞬时现象
+        s.onPeerAppMissing("没装配套 App")
+        assertEquals(HostUiState.Phase.MIRRORING, s.phase)
+    }
+
+    @Test
+    fun `用户点扫描会把缺 App 的状态带回连接中`() {
+        val s = HostUiState()
+        s.onPeerAppMissing()
+        s.onScanRequested()
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+    }
 }

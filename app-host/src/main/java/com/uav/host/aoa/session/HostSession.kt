@@ -110,6 +110,15 @@ class HostSession(
         fun onError(message: String, cause: Throwable?)
 
         fun onClosed(reason: String) {}
+
+        /**
+         * 对端在配件模式下**完全没有应答**（CNXN 发出后超时，或 OPEN 没有 OKAY）。
+         *
+         * 单独开一个回调而不是走 [onError]：这不是链路故障（USB 枚举、切换配件模式都成功了），
+         * 而是"对端没有软件接管这条管道"—— 用户要做的是**去装/打开配套 App**，
+         * 而不是等宿主自动重连。上层据此换成可操作的引导文案（含下载入口）。
+         */
+        fun onPeerAppMissing() {}
     }
 
     private val videoQueue = FrameQueue(StreamId.VIDEO, logger = logger)
@@ -349,12 +358,14 @@ class HostSession(
             listener.onStatus("CNXN 已发送（本机 ${localWidth}x$localHeight），等待手机尺寸…")
 
             if (!peerCnxnLatch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                fail("等待手机 CNXN 超时（${TIMEOUT_MS}ms）")
+                // ★ 对端在配件模式下"人不在"：CNXN 发出去 5 秒一个字节都没回。
+                //   正常情况配件端 App 收到会立刻应答，所以这不是链路问题。
+                peerSilent("等待手机 CNXN 超时（${TIMEOUT_MS}ms）：配件模式下对端没有任何应答")
                 return
             }
 
             if (!sendOpen()) {
-                fail("等待 OPEN 应答超时（${TIMEOUT_MS}ms）")
+                peerSilent("等待 OPEN 应答超时（${TIMEOUT_MS}ms）：对端收了 OPEN 却没有 OKAY")
                 return
             }
         } catch (t: Throwable) {
@@ -872,6 +883,27 @@ class HostSession(
         if (closed.get()) return
         logger.e(TAG, message, cause)
         listener.onError(message, cause)
+        stopInternal()
+    }
+
+    /**
+     * 对端"人不在"：配件模式切成功了，但 CNXN/OPEN 发出去后**一个字节都没回**。
+     *
+     * 与 [fail] 的区别是本质的：这不是链路故障，USB 枚举和 AOA 切换都成功了，
+     * 只是**没有软件在对端接管这条管道**。常见三种原因都指向同一个动作
+     * （装 / 重新打开配套 App）：
+     *
+     * 1. 没装 `com.uav.accessory`；
+     * 2. 装了但被 `adb force-stop` 过 —— 之后系统不再派发配件 intent；
+     * 3. 首次插线时把"是否打开该 App 处理 USB 配件"点了否。
+     *
+     * 所以走专用回调而不是 [fail]：让上层显示可操作的引导（含下载入口），
+     * 而不是"错误 + 等自动重连"——后者在缺 App 时永远不会成功。
+     */
+    private fun peerSilent(message: String) {
+        if (closed.get()) return
+        logger.e(TAG, message)
+        listener.onPeerAppMissing()
         stopInternal()
     }
 

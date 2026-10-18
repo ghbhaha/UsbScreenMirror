@@ -200,6 +200,21 @@
             android:drawableStart="@drawable/ic_play"
             android:text="@string/host_btn_replay" />
 
+        <!--
+          只在「对端没人应答」时出现（默认 gone）。
+          这是手机端没装配套 App 时唯一可操作的去处 —— 不做成常驻按钮，
+          否则正常投屏时它只是噪音。
+        -->
+        <Button
+            android:id="@+id/btn_get_app"
+            style="@style/HostTileRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:drawableStart="@drawable/ic_download"
+            android:text="@string/host_btn_get_app"
+            android:visibility="gone" />
+
         <!-- 画质：分段控件（当前模式一眼可见；点"已选中"的那段是 no-op，不触发重协商） -->
         <LinearLayout
             android:layout_width="match_parent"

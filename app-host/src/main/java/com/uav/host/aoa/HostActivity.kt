@@ -209,6 +209,7 @@ class HostActivity : Activity() {
             onScan = { userScan() },
             onForceRehandshake = { userForceRehandshake() },
             onPickReplay = { pickReplayFile() },
+            onGetApp = { openCompanionAppPage() },
             onDisplayAreaChanged = { quality.onDisplayAreaChanged() },
         )
 
@@ -382,8 +383,19 @@ class HostActivity : Activity() {
             panel.revealMenu()
             logger.e(TAG, message, cause)
             // 链路层已负责 stopSession / 退避计数 / 自愈判定，这里只管"让用户可见"。
+        }
 
-
+        /**
+         * 对端在配件模式下没人应答（典型：手机端没装配套 App）。
+         *
+         * 走独立回调而不是 [onError]：这不是链路故障，等自动重连永远不会成功，
+         * 界面要给的是**可操作的去处**（下载按钮），而不是"错误"两个字。
+         */
+        override fun onPeerAppMissing() {
+            uiState.onPeerAppMissing(getString(R.string.host_detail_peer_app_missing))
+            render()
+            // 面板收起时这条引导是看不见的，必须主动叫回来
+            panel.revealMenu()
         }
 
         override fun onSelfHealRequest(device: UsbDevice) {
@@ -392,6 +404,36 @@ class HostActivity : Activity() {
             link.stopSession()
             link.onDeviceAttached(device)
         }
+    }
+
+    // ------------------------------------------------------------------ 配套 App
+
+    /**
+     * 打开配套 App 的下载页（GitHub Releases 最新版）。
+     *
+     * 为什么要兜底剪贴板：宿主可能是**机顶盒 / 车机**，没有浏览器或没有默认 handler，
+     * `startActivity` 会抛 `ActivityNotFoundException`。那种情况下把链接塞进剪贴板，
+     * 至少用户还能拷到别处——比什么都不发生强。
+     *
+     * ⚠️ 这里打开的地址与 AOA `SEND_STRING[4]`（`AccessoryIdentity.URI`）是同一个，
+     *   一处改、两处要同步（一个是给手机系统看，一个是给用户看）。
+     */
+    private fun openCompanionAppPage() {
+        val url = getString(R.string.host_app_url)
+        val ok = runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+        }.isSuccess
+        if (ok) {
+            logger.i(TAG, "已打开配套 App 下载页：$url")
+            return
+        }
+        runCatching {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("UsbScreenMirror", url))
+            android.widget.Toast.makeText(this, R.string.host_link_copied, android.widget.Toast.LENGTH_LONG)
+                .show()
+        }.onFailure { logger.w(TAG, "复制下载链接失败：${it.message}") }
+        logger.w(TAG, "没有可用的浏览器，已把下载链接放进剪贴板：$url")
     }
 
     // ------------------------------------------------------------------ 画质回调

@@ -69,6 +69,9 @@ class HostPanel(private val activity: Activity) {
     private lateinit var segOneToOne: TextView
     private lateinit var segHighQuality: TextView
 
+    /** 「获取配套 App」—— 只在「对端没人应答」阶段露出（见 HostUiState.Phase.NO_ACCESSORY_APP）。 */
+    private lateinit var btnGetApp: android.widget.Button
+
     /**
      * Surface 当前是否可用。
      *
@@ -119,6 +122,7 @@ class HostPanel(private val activity: Activity) {
         onScan: () -> Unit,
         onForceRehandshake: () -> Unit,
         onPickReplay: () -> Unit,
+        onGetApp: () -> Unit,
         onDisplayAreaChanged: () -> Unit,
     ) {
         val r = activity
@@ -131,6 +135,7 @@ class HostPanel(private val activity: Activity) {
         chipText = r.findViewById(R.id.chip_state)
         segOneToOne = r.findViewById(R.id.btn_pixel_11)
         segHighQuality = r.findViewById(R.id.btn_pixel_hd)
+        btnGetApp = r.findViewById(R.id.btn_get_app)
         rootView = r.findViewById(R.id.root)
 
         setUpMenuToggle(onDisplayAreaChanged)
@@ -138,6 +143,7 @@ class HostPanel(private val activity: Activity) {
         findViewById<android.widget.Button>(R.id.btn_scan).setOnClickListener { onScan() }
         findViewById<android.widget.Button>(R.id.btn_force).setOnClickListener { onForceRehandshake() }
         findViewById<android.widget.Button>(R.id.btn_replay).setOnClickListener { onPickReplay() }
+        btnGetApp.setOnClickListener { onGetApp() }
 
         // 常驻状态药丸：面板收起后仍能看到链路状态；点它 = 打开面板（收起后不会"无路可回"）
         findViewById<View>(R.id.status_chip).setOnClickListener { toggleMenu() }
@@ -381,6 +387,7 @@ class HostPanel(private val activity: Activity) {
                 HostUiState.Phase.RENEGOTIATING -> R.string.host_status_renegotiating
                 HostUiState.Phase.REPLAY -> R.string.host_status_replay
                 HostUiState.Phase.NO_SIGNAL -> R.string.host_status_no_signal
+                HostUiState.Phase.NO_ACCESSORY_APP -> R.string.host_status_peer_app_missing
                 HostUiState.Phase.ERROR -> R.string.host_status_error
             }
         )
@@ -398,6 +405,8 @@ class HostPanel(private val activity: Activity) {
                 HostUiState.Phase.REPLAY -> ChipState.ACTIVE
                 // 无输出用黄色（警告）：链路是好的，只是对面不动了 —— 不是链路错误。
                 HostUiState.Phase.NO_SIGNAL -> ChipState.NO_SIGNAL
+                // 缺 App 用红色：这不是"等一等会好"，得用户去装东西
+                HostUiState.Phase.NO_ACCESSORY_APP -> ChipState.ERROR
                 HostUiState.Phase.ERROR -> ChipState.ERROR
             },
             activity.getString(
@@ -408,10 +417,15 @@ class HostPanel(private val activity: Activity) {
                     HostUiState.Phase.RENEGOTIATING -> R.string.host_chip_renegotiating
                     HostUiState.Phase.REPLAY -> R.string.host_chip_replay
                     HostUiState.Phase.NO_SIGNAL -> R.string.host_chip_no_signal
+                    HostUiState.Phase.NO_ACCESSORY_APP -> R.string.host_chip_peer_app_missing
                     HostUiState.Phase.ERROR -> R.string.host_chip_error
                 }
             ),
         )
+
+        // 只有"对端没人应答"时才给下载入口：正常投屏留着它只是噪音。
+        btnGetApp.visibility =
+            if (phase == HostUiState.Phase.NO_ACCESSORY_APP) View.VISIBLE else View.GONE
     }
 
     private fun setChip(state: ChipState, text: String) {

@@ -28,6 +28,7 @@
     <string name="host_chip_replay">回放</string>
     <string name="host_chip_no_signal">无输出</string>
     <string name="host_chip_error">出错</string>
+    <string name="host_chip_peer_app_missing">缺 App</string>
 
     <!-- 状态行 -->
     <string name="host_status_idle">空闲中 —— 请把配件手机插上来</string>
@@ -42,11 +43,18 @@
     <!-- ERROR 阶段的主行只说"出错了"，具体原因在副行（onError 已把原因拼进去） -->
     <string name="host_status_no_signal">手机无输出</string>
     <string name="host_status_error">链路出错</string>
+    <string name="host_status_peer_app_missing">对方设备无应答</string>
+    <!-- 副行说明：说清"为什么"和"去哪装"，不要只写"连接失败" -->
+    <string name="host_detail_peer_app_missing">已切进配件模式，但对端一直没有任何应答 —— 通常是没装配套 App（装过但被强制停止也会这样）。点下方按钮去下载。</string>
 
     <!-- 操作（磁贴：图标在上、文字在下，文案尽量短） -->
     <string name="host_btn_scan">扫描 / 重试</string>
     <string name="host_btn_force">强制重握手</string>
     <string name="host_btn_replay">回放抓流</string>
+    <string name="host_btn_get_app">获取配套 App</string>
+    <!-- 下载地址：与 AOA SEND_STRING[4]（AccessoryIdentity.URI）保持一致，指向 Releases 最新版 -->
+    <string name="host_app_url" translatable="false">https://github.com/ghbhaha/UsbScreenMirror/releases/latest</string>
+    <string name="host_link_copied">本机没有浏览器，下载链接已复制到剪贴板</string>
 
     <!-- 画质分段控件 -->
     <string name="host_section_quality">画质</string>

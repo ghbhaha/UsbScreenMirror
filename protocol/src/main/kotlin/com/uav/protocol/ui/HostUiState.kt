@@ -60,6 +60,20 @@ class HostUiState {
         REPLAY,
 
         /**
+         * 对端没人应答：AOA 已切到配件模式，但对端在超时窗口内**一个字节都没回**。
+         *
+         * 与 [ERROR] 的区别很关键：USB 链路是通的、枚举也正常，只是**对端没有软件接管
+         * 这条管道**。最典型的原因有三条，都指向同一个动作（去装/拉起配套 App）：
+         *
+         * 1. 没装 `com.uav.accessory`；
+         * 2. 装了但被 `force-stop` 过 —— 系统此后不再派发配件 intent，只能手动打开；
+         * 3. 权限被拒（首次插线时那句"是否打开该 App 处理 USB 配件"点了否）。
+         *
+         * 所以这个阶段必须和 [ERROR] 分开：ERROR 等自动重连，这里再等也没用。
+         */
+        NO_ACCESSORY_APP,
+
+        /**
          * 手机端无输出（10.30）：链路**还连着**，但对方不再产帧。
          *
          * 与 [ERROR] 的区别很关键：ERROR 是"链路出了问题"，而这个是"链路好着、对面不动了"——
@@ -105,6 +119,9 @@ class HostUiState {
         // 对端用户主动停止之后，原因要钉在副行上 —— 宿主紧接着就会自动重连，
         // 每秒一次的进度事件会把用户刚做的那个动作彻底刷掉（见 onPeerStopped）。
         if (peerStopped) return
+        // 同理："对端没人应答"也要钉住。它是**结论**，而重连时的进度事件只是过程；
+        // 让它被"CNXN 已发送…"刷掉，用户就永远不知道要去装 App，只觉得界面在转圈。
+        if (phase == Phase.NO_ACCESSORY_APP) return
         detail = text
         // 只有"还没定下来"的阶段才会被进度事件推进；已到达的阶段保持不变。
         if (phase == Phase.IDLE || phase == Phase.CONNECTING) {
@@ -195,9 +212,26 @@ class HostUiState {
         detail = text
     }
 
+    /**
+     * 对端在配件模式下**没有任何应答**（见 [Phase.NO_ACCESSORY_APP]）。
+     *
+     * ⚠️ 已经出过画面就不降级：那时对端 App 明明在跑，这条只可能是重连过程中的瞬时现象，
+     * 把「投屏中」改成「缺 App」反而是撒谎（与 [onProgress] 同一条规矩：**结论性的状态
+     * 不能被过程性的事件冲掉**）。
+     *
+     * @param detail 副行说明（本地化文案由 `:app-host` 传入）
+     */
+    fun onPeerAppMissing(
+        detail: String = "对端在配件模式下没有任何应答 —— 通常是没装配套 App"
+    ) {
+        if (phase == Phase.MIRRORING || phase == Phase.RENEGOTIATING || phase == Phase.REPLAY) return
+        peerStopped = false
+        phase = Phase.NO_ACCESSORY_APP
+        this.detail = detail
+    }
+
     /** 用户点了 Scan / Retry ⇒ 从任何阶段回到连接中。 */
-    fun onScanRequested() {
-        if (phase == Phase.REPLAY) return
+    fun onScanRequested() {        if (phase == Phase.REPLAY) return
         // 用户主动点了扫描 ⇒ 他已经在推动恢复，那条"请去手机上点授权"的提示可以撤了。
         peerStopped = false
         phase = Phase.CONNECTING

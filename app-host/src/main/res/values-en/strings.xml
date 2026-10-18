@@ -18,6 +18,7 @@
     <string name="host_chip_replay">Replay</string>
     <string name="host_chip_no_signal">No output</string>
     <string name="host_chip_error">Error</string>
+    <string name="host_chip_peer_app_missing">No app</string>
 
     <!-- Main status line only states the current phase (10.23); progress text goes to the subtitle. -->
     <string name="host_status_idle">Idle — plug in the accessory phone</string>
@@ -27,10 +28,14 @@
     <string name="host_status_replay">Replaying capture</string>
     <string name="host_status_no_signal">No output</string>
     <string name="host_status_error">Link error</string>
+    <string name="host_status_peer_app_missing">No reply from device</string>
+    <string name="host_detail_peer_app_missing">Switched into accessory mode, but the other side never replied — usually the companion app is not installed (a force-stopped app behaves the same). Tap the button below to download it.</string>
 
     <string name="host_btn_scan">Scan / Retry</string>
     <string name="host_btn_force">Rehandshake</string>
     <string name="host_btn_replay">Replay</string>
+    <string name="host_btn_get_app">Get companion app</string>
+    <string name="host_link_copied">No browser on this device — download link copied to clipboard</string>
 
     <string name="host_section_quality">Quality</string>
     <string name="host_seg_11">1:1</string>
