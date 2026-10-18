@@ -7,7 +7,7 @@
     配置设备 → activate(0x40/0x52/wIndex=2) → 等配置 5 出现 → set_configuration(5)
     → claim if#2 → 读循环：
         PING  → 回 PING
-        CWPA  → 回 HPD1 + clock_reply + HPA1      （音频时钟）
+        CWPA  → 回 HPD1 + clock_reply [+ HPA1]    （音频时钟；HPA1 默认不发，见 SEND_HPA1）
         AFMT  → 回 afmt_reply
         CVRP  → 回 NEED + clock_reply             （视频时钟）
         CLOK  → clock_reply
@@ -27,6 +27,11 @@ import libusb0_win as U
 
 VID, PID = 0x05AC, 0x12AB
 EP_IN, EP_OUT = 0x86, 0x05
+
+# ★ 是否向设备声明"本机可作音频 sink"（ASYN/HPA1）。
+#   默认关闭：发了之后 iPad 会把音频路由到 USB，若拿不到 EAT 帧，
+#   设备上的播放器会**卡在暂停态**（真机实测，安卓端同因）。
+SEND_HPA1 = os.environ.get('QT_HPA1', '0') == '1'
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'capture')
 
 # ---------------------------------------------------------------- 报文构造
@@ -259,8 +264,12 @@ def main():
                         audio_clock = read_u64(payload, 24)
                         U.bulk_write(h, EP_OUT, make_hpd1(), 1000)
                         U.bulk_write(h, EP_OUT, clock_reply(corr, audio_clock + 0x1000), 1000)
-                        U.bulk_write(h, EP_OUT, make_hpa1(audio_clock), 1000)
-                        print(f'  ◆ CWPA audio_clock={audio_clock} → HPD1+clock+HPA1')
+                        if SEND_HPA1:
+                            U.bulk_write(h, EP_OUT, make_hpa1(audio_clock), 1000)
+                            print(f'  ◆ CWPA audio_clock={audio_clock} → HPD1+clock+HPA1')
+                        else:
+                            print(f'  ◆ CWPA audio_clock={audio_clock} → HPD1+clock'
+                                  '（未声明音频，避免掐住设备播放）')
                     elif sub == fcc('cvrp') and len(payload) >= 32:
                         stats['cvrp'] += 1
                         video_clock = read_u64(payload, 24)
