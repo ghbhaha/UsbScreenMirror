@@ -118,6 +118,24 @@ object PairStore {
     fun save(dir: File, key: String, rec: PairRecord): File =
         recordFile(dir, key).also { it.writeText(rec.encode()) }
 
+    /**
+     * 补记设备版本（**纯诊断信息**，不参与任何行为决策）。
+     *
+     * 单独一个方法而不是塞进 [confirm]，因为 [confirm] 只处理 `provisional` 记录；
+     * 而版本刷新对**所有**记录都有意义，且不该受"是不是暂时接管"影响。
+     *
+     * ⚠️ **只在真的变了才写盘**：这条在每次投屏建立后都会被调用，
+     * 而 sessions 会反复重建；无条件写 = 每次都动用户存储（也会无谓地更新 mtime）。
+     */
+    fun recordVersion(dir: File, key: String, version: DeviceVersion) {
+        if (version == DeviceVersion.UNKNOWN) return
+        val own = recordFile(dir, key)
+        if (!own.exists()) return
+        val rec = runCatching { PairRecord.decode(own.readText()) }.getOrNull() ?: return
+        if (rec.deviceVersion == version) return
+        runCatching { own.writeText(rec.withDeviceVersion(version).encode()) }
+    }
+
     /** 已记住的设备键（界面用来显示"换回来不用再点信任"）。 */
     fun knownKeys(dir: File): List<String> = records(dir).map { it.first }.sorted()
 

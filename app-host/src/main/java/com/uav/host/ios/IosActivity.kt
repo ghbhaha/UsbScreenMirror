@@ -17,6 +17,7 @@ import androidx.core.content.IntentCompat
 import com.uav.host.R
 import com.uav.host.common.DebugTools
 import com.uav.host.ios.ui.IosPanel
+import com.uav.protocol.ios.DeviceVersion
 import com.uav.protocol.ios.PairStore
 import com.uav.protocol.ios.QtStats
 import com.uav.protocol.ios.SampleParser
@@ -91,6 +92,15 @@ class IosActivity : Activity() {
      * 后者才是红药丸。混成一种，用户会以为是自己把程序弄坏了。
      */
     private val deviceDetached = AtomicBoolean(false)
+
+    /**
+     * 本次会话读到的设备版本（纯诊断，见 [DeviceVersion]）。
+     *
+     * 存在字段里是因为 [MuxLink] 是 [capture] 内部的局部变量，
+     * 而"要不要给用户一句版本相关的提示"要等到**收尾判失败**时才决定。
+     */
+    @Volatile
+    private var lastDeviceVersion: DeviceVersion = DeviceVersion.UNKNOWN
 
     private val running = AtomicBoolean(false)
     private var permissionLatch: CountDownLatch? = null
@@ -609,6 +619,8 @@ class IosActivity : Activity() {
                     if (link.trusted) {
                         log("★★ 自检通过：设备已信任 HostID=$hostId，可以点「开始采集」")
                         PairStore.confirm(filesDir, devKey, ::log)
+                        // 顺手补记版本（纯诊断；老记录没这个字段，补上不用重新配对）
+                        PairStore.recordVersion(filesDir, devKey, link.deviceVersion)
                     } else {
                         log("✗ 自检未通过：TLS=${link.tlsReady} 原因=${link.failed ?: "未取得 Value"}")
                         PairStore.dropProvisional(filesDir, devKey, ::log)
@@ -658,10 +670,18 @@ class IosActivity : Activity() {
                 panel.render(IosPanel.Stage.IDLE, getString(R.string.ios_detail_link_lost))
                 panel.setMenuVisible(true)
             }
-            stats == null -> panel.render(
-                if (devicePresent) IosPanel.Stage.ERROR else IosPanel.Stage.IDLE,
-                if (devicePresent) null else getString(R.string.ios_detail_no_device)
-            )
+            stats == null -> {
+                // ★ 设备在、但一个帧都没进来 —— 最需要"说清为什么"的失败态。
+                //   版本提示只在这里出现：它是**解释**不是**预测**（协议层没有版本差异），
+                //   对 iOS 27+ 补一句"可能还需要开发者模式/媒体流授权"，
+                //   免得用户以为配对成功就该一定出画面。
+                val hint = lastDeviceVersion.failureHint()
+                if (hint != null) log("⚠ $hint")
+                panel.render(
+                    if (devicePresent) IosPanel.Stage.ERROR else IosPanel.Stage.IDLE,
+                    if (devicePresent) hint else getString(R.string.ios_detail_no_device),
+                )
+            }
             else -> panel.render(IosPanel.Stage.IDLE, null)
         }
         if (stats != null) {
@@ -779,11 +799,16 @@ class IosActivity : Activity() {
                         muxLink = link
                         if (link.open(IosFeatures.TLS_WAIT_MS)) {
                             log("★★ lockdown 会话在线（TLS=${link.tlsReady} 信任=${link.trusted}），开始保活")
+                            lastDeviceVersion = link.deviceVersion
                             // ★ 归属校验：「暂时接管」的旧版记录要靠**真的信任成功**才能转正。
                             //   TLS 窗口被缩短后 `trusted` 恒为 false —— 这时**不能** dropProvisional，
                             //   否则会把刚迁移过来的记录删掉。宁可让它停在"暂管"。
                             if (link.trusted) {
                                 PairStore.confirm(filesDir, Pairing.deviceKey(dev), ::log)
+                                // 顺手补记版本（纯诊断；变化时才写盘，见 PairStore.recordVersion）
+                                PairStore.recordVersion(
+                                    filesDir, Pairing.deviceKey(dev), link.deviceVersion,
+                                )
                             }
                             muxThread = Thread({
                                 while (keepAlive.get() && link.failed == null) {

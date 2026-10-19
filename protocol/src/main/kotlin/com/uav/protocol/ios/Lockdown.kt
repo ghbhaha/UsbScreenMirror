@@ -155,7 +155,17 @@ class PairRecord(
      * （[PairStore.confirm]）。若 TLS 没通过 ⇒ 说明认错人了，把这条临时记录丢掉
      * （[PairStore.dropProvisional]），旧单文件仍在，可以还给对的那台。
      */
-    val provisional: Boolean = false
+    val provisional: Boolean = false,
+    /**
+     * 这台设备的 iOS 版本（`ProductVersion` / `ProductType`）。
+     *
+     * ⚠️ **纯诊断信息，不参与任何行为决策**（见 [DeviceVersion] 类注释）：
+     *   协议层没有版本差异，这里只为「跑不起来时能一眼区分'版本问题'和'会话问题'」。
+     *
+     * 老记录没有这个字段 ⇒ null（= 未知）⇒ 行为与从前完全一致。
+     * 一旦会话走通（[PairStore.confirm]）就顺手刷新，不必重新配对。
+     */
+    val deviceVersion: DeviceVersion = DeviceVersion.UNKNOWN,
 ) {
 
     fun encode(): String {
@@ -171,6 +181,8 @@ class PairRecord(
         p["escrowBag"] = escrowBag?.let { b64(it) } ?: ""
         p["deviceSerial"] = deviceSerial ?: ""
         p["provisional"] = if (provisional) "1" else ""
+        p["productVersion"] = deviceVersion.productVersion ?: ""
+        p["productType"] = deviceVersion.productType ?: ""
         val out = java.io.StringWriter()
         p.store(out, "UsbScreenMirror · iOS pairing record (self-paired)")
         return out.toString()
@@ -209,6 +221,25 @@ class PairRecord(
         provisional = value,
     )
 
+    /**
+     * 复制一份，只填[DeviceVersion]（纯诊断信息）。
+     *
+     * 用法：会话走通后调一次，把版本补记进去——**不必重新配对**。
+     */
+    fun withDeviceVersion(v: DeviceVersion): PairRecord = PairRecord(
+        hostId = hostId,
+        systemBuid = systemBuid,
+        wifiMac = wifiMac,
+        hostCertPem = hostCertPem,
+        hostKeyPem = hostKeyPem,
+        rootCertPem = rootCertPem,
+        deviceCertPem = deviceCertPem,
+        escrowBag = escrowBag,
+        deviceSerial = deviceSerial,
+        provisional = provisional,
+        deviceVersion = v,
+    )
+
     companion object {
         private fun b64(b: ByteArray): String = B64.encode(b)
         private fun unb64(s: String): ByteArray = B64.decode(s)
@@ -227,7 +258,12 @@ class PairRecord(
                 escrowBag = p.getProperty("escrowBag")?.takeIf { it.isNotBlank() }?.let { unb64(it) },
                 // 老记录没有这个字段 ⇒ null（归属未知）
                 deviceSerial = p.getProperty("deviceSerial")?.takeIf { it.isNotBlank() },
-                provisional = p.getProperty("provisional")?.isNotBlank() == true
+                provisional = p.getProperty("provisional")?.isNotBlank() == true,
+                // 老记录没这两个字段 ⇒ UNKNOWN（行为与从前完全一致）
+                deviceVersion = DeviceVersion(
+                    productVersion = p.getProperty("productVersion")?.takeIf { it.isNotBlank() },
+                    productType = p.getProperty("productType")?.takeIf { it.isNotBlank() },
+                )
             )
         }.getOrNull()
     }

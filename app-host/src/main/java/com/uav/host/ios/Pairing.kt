@@ -3,6 +3,7 @@ package com.uav.host.ios
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbInterface
 import com.uav.protocol.ios.CertKit
+import com.uav.protocol.ios.DeviceVersion
 import com.uav.protocol.ios.Lockdown
 import com.uav.protocol.ios.PValue
 import com.uav.protocol.ios.PairRecord
@@ -143,10 +144,12 @@ internal class Pairing(
             }
 
             val devicePub = fetchDevicePublicKey(l) ?: return null
-            val wifiMac = fetchWifiMac(l)
+            val info = fetchDeviceInfo(l)
+            val wifiMac = info.wifiMac
+            val deviceVersion = info.version
             // 记录按设备分开存：键只在"配对之前"可用（见 deviceKey 的说明）
             val key = deviceKey(dev)
-            log("设备 WiFiAddress=${wifiMac ?: "（未报）"}；设备键=$key")
+            log("设备 WiFiAddress=${wifiMac ?: "（未报）"}；设备键=$key；${deviceVersion.summary()}")
 
             val hostId = Lockdown.hostIdFor(HOST_NAME)
             val material = CertKit.generate(devicePub, hostId)
@@ -156,6 +159,7 @@ internal class Pairing(
             val record = doPair(
                 l, material, wifiMac,
                 deviceSerial = if (key == KEY_UNKNOWN) null else key,
+                deviceVersion = deviceVersion,
             ) ?: return null
             val file = PairStore.save(filesDir, key, record)
             log(
@@ -194,11 +198,29 @@ internal class Pairing(
         return raw
     }
 
-    /** 全量 `GetValue` 里取 `WiFiAddress`（设备 MAC）。取不到就省略该字段。 */
-    private fun fetchWifiMac(link: MuxLink): String? {
-        val reply = link.request(Lockdown.getValue("UsbScreenMirror"))
-        if (reply == null) return null
-        return reply.dict("Value")?.str("WiFiAddress")
+    /**
+     * 配对前从全量 `GetValue` 拿到的一次性设备信息。
+     *
+     * ⚠️ 特意**不用** `kotlin.Pair` —— 本包已有一个同名的 `Pair`（历史遗留），
+     *   用 `Pair<String?, DeviceVersion>` 会命中"component1() is ambiguous"的编译错误，
+     *   而且编译器报错完全指不到真正的原因（不说是哪个 `Pair`）。具名类是更省事的选择。
+     */
+    private class DeviceInfo(val wifiMac: String?, val version: DeviceVersion)
+
+    /**
+     * 全量 `GetValue`：取 `WiFiAddress`（设备 MAC）与 `ProductVersion` / `ProductType`。
+     *
+     * ⚠️ 一次请求拿两样 —— 这条回包本来就包含全部键，分两次问只是多一个 RTT。
+     *
+     * 两者都可能取不到（老设备/字段缺失）：`wifiMac` 为 null 时 `Pair` 请求里省略该字段，
+     * 版本为 [DeviceVersion.UNKNOWN] ⇒ **不影响配对**，也不做任何版本相关降级。
+     */
+    private fun fetchDeviceInfo(link: MuxLink): DeviceInfo {
+        val dict = link.request(Lockdown.getValue("UsbScreenMirror"))?.dict("Value")
+        return DeviceInfo(
+            wifiMac = dict?.str("WiFiAddress"),
+            version = DeviceVersion.fromReply(dict),
+        )
     }
 
     /**
@@ -212,6 +234,7 @@ internal class Pairing(
         material: CertKit.Material,
         wifiMac: String?,
         deviceSerial: String?,
+        deviceVersion: DeviceVersion,
     ): PairRecord? {
         val request = Lockdown.pair(
             label = "UsbScreenMirror",
@@ -247,7 +270,8 @@ internal class Pairing(
                         rootCertPem = material.rootCertPem,
                         deviceCertPem = material.deviceCertPem,
                         escrowBag = bag,
-                        deviceSerial = deviceSerial
+                        deviceSerial = deviceSerial,
+                        deviceVersion = deviceVersion
                     )
                 }
                 "PairingDialogResponsePending" ->

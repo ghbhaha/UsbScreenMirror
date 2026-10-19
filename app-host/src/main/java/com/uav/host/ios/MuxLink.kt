@@ -3,6 +3,7 @@ package com.uav.host.ios
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import com.uav.protocol.Bytes
+import com.uav.protocol.ios.DeviceVersion
 import com.uav.protocol.ios.Lockdown
 import com.uav.protocol.ios.PValue
 import com.uav.protocol.ios.PlistXml
@@ -105,6 +106,17 @@ internal class MuxLink(
     /** GetValue 是否成功（= 设备真的把我们当受信任主机）。 */
     @Volatile
     var trusted = false
+        private set
+
+    /**
+     * 会话建立时读到的设备版本（`ProductVersion` / `ProductType`）。
+     *
+     * ⚠️ **纯诊断**：协议层没有版本差异（见 `DeviceVersion` 类注释），
+     *   这里只用来在"跑不起来"时能一眼区分「版本问题」与「会话问题」，
+     *   以及给界面一句有依据的提示。**读不到就是 UNKNOWN，不做任何降级。**
+     */
+    @Volatile
+    var deviceVersion: DeviceVersion = DeviceVersion.UNKNOWN
         private set
 
     @Volatile
@@ -289,11 +301,13 @@ internal class MuxLink(
         //   排「已信任但 0 B」时先看这两行，比反复重启设备省事。
         val all = request(Lockdown.getValue("UsbScreenMirror"))?.dict("Value")
         if (all != null) {
+            // ★ 把版本记下来（纯诊断）。放在这里是因为全量 GetValue 的时机最自然：
+            //   紧接着 GetValue 成功、连接还活着，拿到的值最可信。
+            deviceVersion = DeviceVersion.fromReply(all)
             log(
                 "   设备状态：屏幕${if (all.bool("ScreenLocked") == true) "已锁定" else "已解锁"}" +
                     " / 是否设密码=${all.bool("PasswordProtected") ?: "?"}" +
-                    " / iOS=${all.str("ProductVersion") ?: "?"}" +
-                    " / 机型=${all.str("ProductType") ?: "?"}"
+                    " / ${deviceVersion.summary()}"
             )
         }
         return true
