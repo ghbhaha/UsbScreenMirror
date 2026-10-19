@@ -178,9 +178,31 @@ HPA1 全字节、afmt_reply 全字节、codec 必须是反转后的 `lpcm`、`OG
 | `HostPrivateKey` | **不进请求**，等 `EscrowBag` 回来才写本地记录 | 一起发 → 设备拒 |
 | 应答里的 `PairingDialogResponsePending` | **每分钟重发一次**（用户还没点信任时的常态） | 当失败 → 永远配不上 |
 
-配对完成后：`EscrowBag`（本机 32B）即成功凭据，记录存 `filesDir/ios_pair.properties`；
+配对完成后：`EscrowBag`（本机 32B）即成功凭据，记录存
+`filesDir/ios_pair_<设备序列号>.properties`（**一台设备一条**，见下）；
 紧接着用这套身份走一次 `StartSession → TLS → GetValue` 自证，日志里应出现
 `★★★ GetValue 成功 —— 设备确认本主机已受信任`。
+
+#### ★ 配对记录是"主机 × 设备"一对，必须按设备分开存
+
+记录里既有主机身份（HostID / 证书链 / 私钥），也有**设备专属**的 `DeviceCertificate`
+与 `EscrowBag`。所以：
+
+- 多台设备共用一条 ⇒ 换一台 iPad 就把上一台的信任**覆盖**掉，换回来还得在 iPad 上
+  重新点一次「信任」（这就是"换设备需要重新认证"的真因）；
+- 一台设备一条 ⇒ 只有**第一次**碰到某台 iPad 才需要点一次信任，之后来回换都不用再点
+  （新设备上那一次点是 iOS 的机制，绕不过去）。
+
+设备键取 **USB 序列号**（`UsbDevice.getSerialNumber()`）：它是唯一一个"还没配对就能拿到、
+且写/查两个方向一致"的标识。⚠️ 不要改用 lockdown 的 `UniqueDeviceID` —— 那要先起
+usbmux 会话，而且它与 USB 序列号**可能不一致**，"写"和"查"用了两个来源就会永远查不到、
+每次都重新配对。
+
+旧版单文件 `ios_pair.properties` 的迁移是**先暂时接管、再转正**：
+它的内容不带归属，无法确定属于哪台设备，所以第一台插上的设备先按 `provisional` 接管
+（旧文件**先留着**）；真的跑通一次 TLS（`link.trusted`）后才删掉旧文件；
+若没通过 ⇒ 说明认错人，丢掉这条临时记录、把旧文件留给对的那台（正常配对出来的记录
+**永远不会**被自动删，免得一次接触不良就清掉用户的信任关系）。
 
 #### ⚠️ 证书 DN 不能留空（与 libimobiledevice 的唯一偏差）
 

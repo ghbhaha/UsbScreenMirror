@@ -6,6 +6,7 @@ import com.uav.protocol.ios.CertKit
 import com.uav.protocol.ios.Lockdown
 import com.uav.protocol.ios.PValue
 import com.uav.protocol.ios.PairRecord
+import com.uav.protocol.ios.PairStore
 import java.io.File
 
 /**
@@ -46,12 +47,51 @@ internal class Pairing(
         /** 等用户点「信任」的上限。 */
         private const val USER_ACCEPT_TIMEOUT_MS = 90_000L
 
-        fun recordFile(filesDir: File): File = File(filesDir, Identity.PAIR_FILE)
+        /** 旧版单文件（不分设备）。只用于**迁移**与"拿不到设备键"的兜底。 */
+        const val LEGACY_PAIR_FILE = PairStore.LEGACY_FILE
 
-        fun hasRecord(filesDir: File): Boolean = recordFile(filesDir).let { it.exists() && it.length() > 0 }
+        /** 拿不到设备键时的占位键（会退回旧版单文件）。 */
+        const val KEY_UNKNOWN = PairStore.KEY_UNKNOWN
 
-        fun loadRecord(filesDir: File): PairRecord? =
-            runCatching { PairRecord.decode(recordFile(filesDir).readText()) }.getOrNull()
+        /**
+         * 设备键 —— 用 **USB 序列号**。
+         *
+         * ## 为什么必须是"能在配对之前拿到"的东西
+         *
+         * 流程是"先查有没有记录，没有才配对"，所以键只能在**还没信任**的状态下取得：
+         *  - USB 序列号：随设备描述符来，不需要配对 ✅
+         *  - lockdown 的 `UniqueDeviceID` / `SerialNumber`：要先起 usbmux 会话，更重；
+         *    而且它与 USB 序列号**可能不一致** ⇒ 一旦拿它做键，"写"和"查"用两个来源，
+         *    就会永远查不到、每次都重新配对。
+         *
+         * ⇒ 全程只认 USB 序列号一个来源。取不到（老机型不报 iSerial，或权限还没授予）
+         *   返回 [KEY_UNKNOWN]，由 [PairStore.load] 走"只有一台设备记录就直接用它"的兜底。
+         */
+        fun deviceKey(dev: UsbDevice): String {
+            val raw = runCatching { dev.serialNumber }.getOrNull()?.trim().orEmpty()
+            val clean = raw.filter { it.isLetterOrDigit() || it == '-' || it == '_' }
+            return if (clean.isEmpty()) KEY_UNKNOWN else clean.take(48)
+        }
+
+        /** 某台设备的记录文件（布局见 [PairStore]）。 */
+        fun recordFile(filesDir: File, key: String = KEY_UNKNOWN): File =
+            PairStore.recordFile(filesDir, key)
+
+        fun hasRecord(filesDir: File, key: String = KEY_UNKNOWN): Boolean =
+            PairStore.has(filesDir, key)
+
+        /** 读某台设备的配对记录（含旧版单文件迁移）。 */
+        fun loadRecord(
+            filesDir: File,
+            key: String = KEY_UNKNOWN,
+            log: ((String) -> Unit)? = null,
+        ): PairRecord? = PairStore.load(filesDir, key, log)
+
+        /** 已记住的设备键（界面显示"换回来不用再点信任"用）。 */
+        fun knownDeviceKeys(filesDir: File): List<String> = PairStore.knownKeys(filesDir)
+
+        /** 旧版单文件是否还在（还没被迁移）。 */
+        fun hasLegacyRecord(filesDir: File): Boolean = PairStore.hasLegacy(filesDir)
     }
 
     /**
@@ -102,16 +142,24 @@ internal class Pairing(
 
             val devicePub = fetchDevicePublicKey(link) ?: return null
             val wifiMac = fetchWifiMac(link)
-            log("设备 WiFiAddress=${wifiMac ?: "（未报）"}")
+            // 记录按设备分开存：键只在"配对之前"可用（见 deviceKey 的说明）
+            val key = deviceKey(dev)
+            log("设备 WiFiAddress=${wifiMac ?: "（未报）"}；设备键=$key")
 
             val hostId = Lockdown.hostIdFor(HOST_NAME)
             val material = CertKit.generate(devicePub, hostId)
             log("已生成主机证书链（HostID=$hostId），开始 Pair…")
             log("★ 请在 iPad 上点「信任」")
 
-            val record = doPair(link, material, wifiMac) ?: return null
-            recordFile(filesDir).writeText(record.encode())
-            log("★★ 配对成功并已保存：${recordFile(filesDir).absolutePath}（${recordFile(filesDir).length()} B）")
+            val record = doPair(
+                link, material, wifiMac,
+                deviceSerial = if (key == KEY_UNKNOWN) null else key,
+            ) ?: return null
+            val file = PairStore.save(filesDir, key, record)
+            log(
+                "★★ 配对成功并已保存：${file.name}（${file.length()} B，设备 ${record.deviceSerial ?: "未知"}）" +
+                    "—— 每台设备一条记录，换回来不用再点信任"
+            )
             return record
         } finally {
             if (claimed) runCatching { transport.release(conn, itf) }
@@ -149,7 +197,12 @@ internal class Pairing(
      * 设备在用户还没点时会回 `PairingDialogResponsePending`，这不是失败，
      * 按 PC 实现的做法每秒重发一次。
      */
-    private fun doPair(link: MuxLink, material: CertKit.Material, wifiMac: String?): PairRecord? {
+    private fun doPair(
+        link: MuxLink,
+        material: CertKit.Material,
+        wifiMac: String?,
+        deviceSerial: String?,
+    ): PairRecord? {
         val request = Lockdown.pair(
             label = "UsbScreenMirror",
             hostName = HOST_NAME,
@@ -183,7 +236,8 @@ internal class Pairing(
                         hostKeyPem = material.hostKeyPem,
                         rootCertPem = material.rootCertPem,
                         deviceCertPem = material.deviceCertPem,
-                        escrowBag = bag
+                        escrowBag = bag,
+                        deviceSerial = deviceSerial
                     )
                 }
                 "PairingDialogResponsePending" ->

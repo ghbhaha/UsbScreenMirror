@@ -123,9 +123,13 @@ object Lockdown {
 }
 
 /**
- * 本地保存的配对记录（`filesDir/ios_pair.properties`）。
+ * 本地保存的配对记录（`filesDir/ios_pair_<设备序列号>.properties`）。
  *
- * 只存**这台主机自己配出来的**那一套；PC 导入的凭证仍走 assets 那条老路。
+ * 只存**这台主机对某台设备**自己配出来的那一套；PC 导入的凭证仍走 assets 那条老路。
+ *
+ * ★ **一台设备一条记录**（按 [deviceSerial] 分文件）：配对记录里既有主机身份，也有
+ *   **设备专属**的 `DeviceCertificate` / `EscrowBag`，所以它本质是"主机 × 设备"这一对的关系，
+ *   不能多台设备共用一条 —— 共用就等于"换一台 iPad 就把上一台的信任覆盖掉"（换回来还要再点信任）。
  */
 class PairRecord(
     val hostId: String,
@@ -135,7 +139,23 @@ class PairRecord(
     val hostKeyPem: ByteArray,
     val rootCertPem: ByteArray,
     val deviceCertPem: ByteArray,
-    val escrowBag: ByteArray? = null
+    val escrowBag: ByteArray? = null,
+    /**
+     * 这条记录属于哪台设备（iPad 的序列号）。
+     *
+     * 两个用途：① 迁移旧版单文件记录时判定归属；② 界面上说清"这台是哪台"。
+     * 老记录没有这个字段 ⇒ 解码为 null（= 归属未知，只允许被"当前唯一在插的那台"接管）。
+     */
+    val deviceSerial: String? = null,
+    /**
+     * **暂时接管**（还没经过实机校验）。
+     *
+     * 只有一种来源：旧版单文件记录被某台设备认领（见 [PairStore.load]）。旧记录不带归属，
+     * 无法确定它属于哪台设备，所以先"试着接管"；**真正跑通一次 TLS** 之后才转正
+     * （[PairStore.confirm]）。若 TLS 没通过 ⇒ 说明认错人了，把这条临时记录丢掉
+     * （[PairStore.dropProvisional]），旧单文件仍在，可以还给对的那台。
+     */
+    val provisional: Boolean = false
 ) {
 
     fun encode(): String {
@@ -149,10 +169,45 @@ class PairRecord(
         p["rootCert"] = b64(rootCertPem)
         p["deviceCert"] = b64(deviceCertPem)
         p["escrowBag"] = escrowBag?.let { b64(it) } ?: ""
+        p["deviceSerial"] = deviceSerial ?: ""
+        p["provisional"] = if (provisional) "1" else ""
         val out = java.io.StringWriter()
         p.store(out, "UsbScreenMirror · iOS pairing record (self-paired)")
         return out.toString()
     }
+
+    /**
+     * 复制一份，只把"归属设备"改成 [serial]。
+     *
+     * 用途：旧版单文件记录没有归属字段，被某台设备接管时要**盖章** ——
+     * 否则下次再出现旧文件（备份恢复之类）会被另一台设备重复认领。
+     */
+    fun withDeviceSerial(serial: String, asProvisional: Boolean = false): PairRecord = PairRecord(
+        hostId = hostId,
+        systemBuid = systemBuid,
+        wifiMac = wifiMac,
+        hostCertPem = hostCertPem,
+        hostKeyPem = hostKeyPem,
+        rootCertPem = rootCertPem,
+        deviceCertPem = deviceCertPem,
+        escrowBag = escrowBag,
+        deviceSerial = serial,
+        provisional = asProvisional,
+    )
+
+    /** 复制一份，只改 [provisional] 标记（实机校验通过 ⇒ 转正）。 */
+    fun withProvisional(value: Boolean): PairRecord = PairRecord(
+        hostId = hostId,
+        systemBuid = systemBuid,
+        wifiMac = wifiMac,
+        hostCertPem = hostCertPem,
+        hostKeyPem = hostKeyPem,
+        rootCertPem = rootCertPem,
+        deviceCertPem = deviceCertPem,
+        escrowBag = escrowBag,
+        deviceSerial = deviceSerial,
+        provisional = value,
+    )
 
     companion object {
         private fun b64(b: ByteArray): String = Base64.getEncoder().encodeToString(b)
@@ -169,7 +224,10 @@ class PairRecord(
                 hostKeyPem = unb64(p.getProperty("hostKey")!!),
                 rootCertPem = unb64(p.getProperty("rootCert")!!),
                 deviceCertPem = unb64(p.getProperty("deviceCert")!!),
-                escrowBag = p.getProperty("escrowBag")?.takeIf { it.isNotBlank() }?.let { unb64(it) }
+                escrowBag = p.getProperty("escrowBag")?.takeIf { it.isNotBlank() }?.let { unb64(it) },
+                // 老记录没有这个字段 ⇒ null（归属未知）
+                deviceSerial = p.getProperty("deviceSerial")?.takeIf { it.isNotBlank() },
+                provisional = p.getProperty("provisional")?.isNotBlank() == true
             )
         }.getOrNull()
     }

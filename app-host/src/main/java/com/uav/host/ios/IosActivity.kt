@@ -17,6 +17,7 @@ import androidx.core.content.IntentCompat
 import com.uav.host.R
 import com.uav.host.common.DebugTools
 import com.uav.host.ios.ui.IosPanel
+import com.uav.protocol.ios.PairStore
 import com.uav.protocol.ios.QtStats
 import com.uav.protocol.ios.SampleParser
 import com.uav.protocol.ios.QtPacket
@@ -183,10 +184,16 @@ class IosActivity : Activity() {
         log("QuickTime USB 采集（Android）—— 插上 iPad 即自动配对并投屏，拔线即停")
         refreshDeviceInfo(state = "空闲")
         panel.render(IosPanel.Stage.IDLE, null)
-        if (Pairing.hasRecord(filesDir)) {
-            log("配对记录：已有（${Pairing.loadRecord(filesDir)?.hostId ?: "读取失败"}）")
-        } else {
-            log("配对记录：无 ⇒ 首次会自动发起配对，请留意 iPad 上的「信任」弹窗")
+        // 配对记录**按设备**分开存：每台 iPad 一条，互不覆盖（换回来不用再点信任）
+        val known = Pairing.knownDeviceKeys(filesDir)
+        when {
+            known.isNotEmpty() -> log(
+                "配对记录：已记住 ${known.size} 台设备（${known.joinToString()}）" +
+                    "—— 换设备只在新设备上点一次「信任」"
+            )
+            Pairing.hasLegacyRecord(filesDir) ->
+                log("配对记录：旧版单文件 ⇒ 插上 iPad 后会自动迁移成按设备存放")
+            else -> log("配对记录：无 ⇒ 首次会自动发起配对，请留意 iPad 上的「信任」弹窗")
         }
 
         // ★ 录制 / 回放都只在 adb 上开，界面不留入口：
@@ -249,8 +256,11 @@ class IosActivity : Activity() {
         Thread({
             var stats: QtStats? = null
             runCatching {
-                // ① 没有配对记录 ⇒ 先配对（iPad 上点一次「信任」）
-                if (!Pairing.hasRecord(filesDir)) {
+                // ① 这台设备还没有配对记录 ⇒ 先配对（iPad 上点一次「信任」）
+                //    ★ 记录按设备分开：换过一台 iPad 只影响新的那台，旧的记录原样保留
+                val pairKey = currentDeviceKey() ?: Pairing.KEY_UNKNOWN
+                log("本次设备键=$pairKey（配对记录按它区分设备）")
+                if (!Pairing.hasRecord(filesDir, pairKey)) {
                     panel.render(IosPanel.Stage.PAIRING, getString(R.string.ios_detail_pair_hint))
                     if (!pairNow()) {
                         log("配对未完成，本次不投屏 —— 拔插一次或点「重新唤醒」可再试")
@@ -272,7 +282,10 @@ class IosActivity : Activity() {
      */
     private fun refreshDeviceInfo(state: String) {
         val dev = transport.findAppleDevice()
-        val pair = Pairing.loadRecord(filesDir)?.hostId
+        // 「配对」这一行说的是**当前插着的这台**；下面再补一句本机记住了几台
+        val key = dev?.let { Pairing.deviceKey(it) }
+        val pair = key?.let { Pairing.loadRecord(filesDir, it) }?.hostId
+        val known = Pairing.knownDeviceKeys(filesDir)
         val sb = StringBuilder()
         if (dev == null) {
             sb.append("未连接\n")
@@ -281,11 +294,22 @@ class IosActivity : Activity() {
             sb.append("配置数 ").append(dev.configurationCount)
                 .append(if (dev.configurationCount >= 5) "（采集态）" else "（普通态）").append('\n')
         }
-        sb.append("配对 ").append(if (pair != null) "已信任" else "未配对")
+        sb.append("配对 ").append(
+            when {
+                pair != null -> "已信任"
+                Pairing.hasLegacyRecord(filesDir) -> "旧版记录（插上后自动迁移）"
+                else -> "未配对（首次需在 iPad 上点「信任」）"
+            }
+        )
         if (pair != null) sb.append('\n').append(pair)
+        sb.append('\n').append("已记住 ").append(known.size).append(" 台设备")
         sb.append('\n').append("状态 ").append(state)
         panel.setDeviceInfo(sb.toString())
     }
+
+    /** 当前插着的那台 iPad 的设备键（USB 序列号）；没有设备返回 null。 */
+    private fun currentDeviceKey(): String? =
+        transport.findAppleDevice()?.let { Pairing.deviceKey(it) }
 
     override fun onResume() {
         super.onResume()
@@ -476,12 +500,13 @@ class IosActivity : Activity() {
         }
 
         // 配对成功后立刻自证一次：StartSession → TLS → GetValue
-        val rec = Pairing.loadRecord(filesDir)
+        val key = currentDeviceKey() ?: Pairing.KEY_UNKNOWN
+        val rec = Pairing.loadRecord(filesDir, key, ::log)
         if (rec != null) {
             log("自检：用刚配好的身份走一次 StartSession + TLS…")
             verifyTrust(rec.hostId)
         }
-        return Pairing.hasRecord(filesDir)
+        return Pairing.hasRecord(filesDir, key)
     }
 
     /**
@@ -558,7 +583,7 @@ class IosActivity : Activity() {
         val dev = transport.findAppleDevice()
         if (dev == null) { log("自检跳过：设备不可见"); return }
         runCatching {
-            val rec = Pairing.loadRecord(filesDir) ?: return
+            val rec = Pairing.loadRecord(filesDir, Pairing.deviceKey(dev)) ?: return
             val identity = Identity.fromRecord(rec)
             val cfg = (0 until dev.configurationCount).mapNotNull {
                 runCatching { dev.getConfiguration(it) }.getOrNull()
@@ -575,10 +600,14 @@ class IosActivity : Activity() {
                 val link = MuxLink(conn, epIn, epOut, identity, ::log)
                 if (link.openRaw()) {
                     link.establishSession(identity)
-                    log(
-                        if (link.trusted) "★★ 自检通过：设备已信任 HostID=$hostId，可以点「开始采集」"
-                        else "✗ 自检未通过：TLS=${link.tlsReady} 原因=${link.failed ?: "未取得 Value"}"
-                    )
+                    val devKey = Pairing.deviceKey(dev)
+                    if (link.trusted) {
+                        log("★★ 自检通过：设备已信任 HostID=$hostId，可以点「开始采集」")
+                        PairStore.confirm(filesDir, devKey, ::log)
+                    } else {
+                        log("✗ 自检未通过：TLS=${link.tlsReady} 原因=${link.failed ?: "未取得 Value"}")
+                        PairStore.dropProvisional(filesDir, devKey, ::log)
+                    }
                 } else {
                     log("✗ 自检隧道失败：${link.failed}")
                 }
@@ -714,7 +743,8 @@ class IosActivity : Activity() {
         }
 
         // 6) 先建 lockdown 会话（可选）
-        val identity = Identity.load(this, ::log)
+        //    ★ 身份按设备取：配对记录是"主机 × 设备"这一对的关系，换设备各用各的
+        val identity = Identity.load(this, ::log, Pairing.deviceKey(dev))
         var connMux: UsbDeviceConnection? = null
         val keepAlive = java.util.concurrent.atomic.AtomicBoolean(true)
         var muxThread: Thread? = null
@@ -741,6 +771,10 @@ class IosActivity : Activity() {
                         val link = MuxLink(cm, mi, mo, identity, ::log)
                         if (link.open()) {
                             log("★★ lockdown 会话在线（TLS=${link.tlsReady} 信任=${link.trusted}），开始保活")
+                            // ★ 归属校验：「暂时接管」的旧版记录要靠**真的信任成功**才能转正
+                            val devKey = Pairing.deviceKey(dev)
+                            if (link.trusted) PairStore.confirm(filesDir, devKey, ::log)
+                            else PairStore.dropProvisional(filesDir, devKey, ::log)
                             muxThread = Thread({
                                 while (keepAlive.get() && link.failed == null) {
                                     runCatching { link.pumpOnce(200) }
@@ -748,6 +782,7 @@ class IosActivity : Activity() {
                             }, "mux-keepalive").apply { isDaemon = true; start() }
                         } else {
                             log("✗ lockdown 会话未建立：${link.failed}")
+                            PairStore.dropProvisional(filesDir, Pairing.deviceKey(dev), ::log)
                         }
                     }
                 }

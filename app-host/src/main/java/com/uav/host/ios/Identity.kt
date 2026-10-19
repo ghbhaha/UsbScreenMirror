@@ -35,7 +35,8 @@ internal class Identity(
 
     companion object {
 
-        const val PAIR_FILE = "ios_pair.properties"
+        /** 旧版单文件名（一台设备一个文件后只剩迁移用途）。 */
+        const val PAIR_FILE = Pairing.LEGACY_PAIR_FILE
 
         fun fromRecord(rec: PairRecord): Identity = Identity(
             hostId = rec.hostId,
@@ -45,14 +46,24 @@ internal class Identity(
             selfPaired = true
         )
 
-        /** 读本地配对记录；没有再退回 assets。 */
-        fun load(ctx: android.content.Context, log: (String) -> Unit): Identity? {
-            val f = java.io.File(ctx.filesDir, PAIR_FILE)
-            if (f.exists()) {
+        /**
+         * 读**这台设备**的配对记录；没有再退回 assets。
+         *
+         * @param deviceKey [Pairing.deviceKey]（USB 序列号）；取不到传 [Pairing.KEY_UNKNOWN]
+         */
+        fun load(
+            ctx: android.content.Context,
+            log: (String) -> Unit,
+            deviceKey: String = Pairing.KEY_UNKNOWN,
+        ): Identity? {
+            val rec = Pairing.loadRecord(ctx.filesDir, deviceKey, log)
+            if (rec != null) {
                 runCatching {
-                    val rec = PairRecord.decode(f.readText()) ?: error("记录格式不认识")
                     val id = fromRecord(rec)
-                    log("已载入 App 自建配对记录：HostID=${id.hostId}（${f.length()} B）")
+                    log(
+                        "已载入 App 自建配对记录：HostID=${id.hostId}" +
+                            "（设备 ${rec.deviceSerial ?: "未知"}）"
+                    )
                     return id
                 }.onFailure { log("（自建配对记录读取失败：${it.message}，回退 assets）") }
             }
