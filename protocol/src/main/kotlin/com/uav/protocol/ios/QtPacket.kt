@@ -62,6 +62,18 @@ object QtPacket {
 
     // ---- 具体报文 ----
 
+    /**
+     * `HPD1` / `HPD0` 共用的显示尺寸（"未识别机型的面板参数"）。
+     *
+     * ⚠️ 这**不是**编码分辨率（上游 PROTOCOL.md §7：
+     * 「HPD1 DisplaySize 是主机能力/显示参数，不是可靠的 USB 编码分辨率控制」）。
+     * 真实尺寸由设备 `vdim`/timing 决定，我们从 SPS 取。
+     * iPhoneMirror 按完整 ProductType 查表给不同机型不同值；我们固定用这一个
+     * **已实测可流** 的值——换机型要重新验证，不要以为它安全。
+     */
+    const val DEFAULT_DISPLAY_WIDTH = 1640
+    const val DEFAULT_DISPLAY_HEIGHT = 2360
+
     /** PING：16 字节固定包，原样回写即可。 */
     fun ping(): ByteArray = u32(16) + fcc("ping") + u32(0) + u32(1)
 
@@ -69,7 +81,7 @@ object QtPacket {
      * ASYN/HPD1：显示描述。
      * `Valeria=true` 是 iPad / 新机型的"演示模式"（iPhoneMirror 的 A 模式）。
      */
-    fun hpd1(width: Int = 1640, height: Int = 2360): ByteArray {
+    fun hpd1(width: Int = DEFAULT_DISPLAY_WIDTH, height: Int = DEFAULT_DISPLAY_HEIGHT): ByteArray {
         val display = dict(listOf(
             "Width" to numF64(width.toDouble()),
             "Height" to numF64(height.toDouble())
@@ -103,6 +115,41 @@ object QtPacket {
     /** ASYN/NEED：向设备要下一帧（带设备视频时钟）。 */
     fun need(deviceVideoClock: Long): ByteArray =
         u32(20) + fcc("asyn") + u64(deviceVideoClock) + fcc("need")
+
+    // ---- 停止序列（与 hpd1 / hpa1 对称） ----
+
+    /**
+     * ASYN/HPD0：声明显示能力撤销（[hpd1] 的反向）。
+     *
+     * 结构与 [hpd1] 完全对称，只是 fourcc 从 `hpd1` 变成 `hpd0` ——
+     * ★ 记得 fourcc 也要反转（`fcc()` 已处理）。
+     *
+     * 上游 `iPhoneMirror/docs/PROTOCOL.md` §4 结束段：
+     * 「停止顺序是 HPA0、HPD0、处理 STOP/RPLY 与 RELS，然后释放接口」。
+     */
+    fun hpd0(width: Int = DEFAULT_DISPLAY_WIDTH, height: Int = DEFAULT_DISPLAY_HEIGHT): ByteArray {
+        val display = dict(listOf(
+            "Width" to numF64(width.toDouble()),
+            "Height" to numF64(height.toDouble())
+        ))
+        return asyncDict("hpd0", 0L, dict(listOf(
+            "Valeria" to boolValue(true),
+            "HEVCDecoderSupports444" to boolValue(false),
+            "DisplaySize" to display
+        )))
+    }
+
+    /**
+     * ASYN/HPA0：撤销音频请求（[hpa1] 的反向）。
+     *
+     * ★ 注意它**不带** `formats` 等协商字段 —— 停止是"关"，不是"重新协商"。
+     * 若把 `hpa1` 的 body 原样搬过来，设备可能当成一次新的音频协商而继续推 `EAT!`。
+     */
+    fun hpa0(audioClock: Long): ByteArray =
+        asyncDict("hpa0", audioClock, dict(listOf(
+            "deviceUID" to strValue("Valeria"),
+            "deviceName" to strValue("Valeria")
+        )))
 
     /** RPLY：时钟应答。 */
     fun clockReply(correlation: Long, clock: Long): ByteArray =

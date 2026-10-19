@@ -77,6 +77,18 @@ class IosActivity : Activity() {
      */
     private val useLockdown = true
 
+    /**
+     * `HPD1` / `HPD0` 里声明的显示尺寸。
+     *
+     * ⚠️ 这**不是**编码分辨率（上游 PROTOCOL.md §7 明确：
+     * 「HPD1 DisplaySize 是主机能力/显示参数，不是可靠的 USB 编码分辨率控制」）。
+     * 真实分辨率由设备自己的 `vdim`/timing 决定，我们从 SPS 取（见 [H264Decoder]）。
+     * 停止时的 `HPD0` 声明同一组尺寸，只是为了与 `HPD1` 成对——
+     * **不能让这里与 `QtPacket.hpd1()` 的默认值漂移**，所以两处都显式传参。
+     */
+    private val iPadDisplayWidth = QtPacket.DEFAULT_DISPLAY_WIDTH
+    private val iPadDisplayHeight = QtPacket.DEFAULT_DISPLAY_HEIGHT
+
     /** 用户点了「停止投屏」 */
     @Volatile
     private var stopRequested = false
@@ -936,6 +948,17 @@ class IosActivity : Activity() {
                 //   —— 这正是「必须重启 iPad」的真正原因。
                 keepAlive.set(false)
                 runCatching { muxThread?.interrupt() }
+                // ★★ 先发停止序列（HPA0/HPD0），**再**放接口 ——
+                //   顺序反了等于没发：接口一 release，OUT 端点就不可写，bulkTransfer 静默返回 -1。
+                //   依据 iPhoneMirror PROTOCOL.md §4「停止顺序是 HPA0、HPD0、…然后释放接口」。
+                //   之前完全没发这段，实测反复开关 3 次也正常，但设备侧不知道会话已结束，
+                //   可能保留上一会话的时钟状态；长期反复插拔的累积风险未验证。
+                runCatching {
+                    activeSession?.sendStopSequence(
+                        displayWidth = iPadDisplayWidth,
+                        displayHeight = iPadDisplayHeight,
+                    )
+                }
                 // ★ 先 FIN 再放接口：设备侧那条 TCP 不主动关的话会一直 ESTABLISHED，
                 //   下次插上连 VERSION 都收不到（只能拔插 iPad）。
                 runCatching { muxLink?.shutdown("停止投屏") }

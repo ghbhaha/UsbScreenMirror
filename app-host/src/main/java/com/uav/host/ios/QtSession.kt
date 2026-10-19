@@ -287,6 +287,54 @@ internal class QtSession(
         }
     }
 
+    /**
+     * 发停止序列：`HPA0` → `HPD0`，然后停写线程。
+     *
+     * ★ **必须同步写，不能走 [write] 队列**。
+     *   理由：调用点一定在"收尾"路径上 —— 紧接着就会 [stopWriter]、释放接口、close。
+     *   若走队列，这两条报文会**永远留在队列里被丢掉**，等于什么都没发
+     *   （这正是补这个功能时最容易犯的错：函数写了、日志打了、实际一字节没上线）。
+     *
+     * ★ **必须在释放接口之前调用**。顺序错了：接口一 release，OUT 端点就不可写，
+     *   `bulkTransfer` 直接返回 -1，且**不报错也看不出**。
+     *
+     * 依据：`RayrenSX/iPhoneMirror` `docs/PROTOCOL.md` §4 结束段
+     * 「停止顺序是 HPA0、HPD0、处理 STOP/RPLY 与 RELS，然后释放接口」。
+     * `STOP/RELS` 是设备→主机方向，由 [run] 的读循环被动接收即可，本方法不处理。
+     *
+     * @return 两条各写多少字节（`-1` = 失败）。**失败不抛异常**：
+     *         收尾路径不该因为"礼貌通知没送到"而中断释放。
+     */
+    fun sendStopSequence(
+        displayWidth: Int = QtPacket.DEFAULT_DISPLAY_WIDTH,
+        displayHeight: Int = QtPacket.DEFAULT_DISPLAY_HEIGHT,
+    ): Pair<Int, Int> {
+        val ep = epOut
+        if (ep == null) {
+            log("停止序列：无 OUT 端点，跳过")
+            return -1 to -1
+        }
+        var audioBytes = -1
+        var videoBytes = -1
+        // ⚠️ 别用 fccString(packet, 16) 反推子类型名：偏移 16 之后是 payload
+        //   （dict 的第一个键），会把 "deviceUID" 之类当成报文名打进日志。
+        //   报文是自己造的，子类型名直接跟着走，最不容易错。
+        for ((label, packet) in listOf(
+            "ASYN/hpa0" to QtPacket.hpa0(0L),
+            "ASYN/hpd0" to QtPacket.hpd0(displayWidth, displayHeight),
+        )) {
+            // ★ 300ms 足够：这两个包都只有几十字节，不该像 NEED 那样等 1s。
+            //   超时只记日志，不重试 —— 停止报文重发没有意义。
+            val w = runCatching {
+                conn.bulkTransfer(ep, packet, packet.size, 300)
+            }.getOrDefault(-1)
+            log("  停止 $label → $w/${packet.size}B${if (w != packet.size) "（未送达）" else ""}")
+            if (label.endsWith("hpa0")) audioBytes = w else videoBytes = w
+        }
+        stopWriter()
+        return audioBytes to videoBytes
+    }
+
     private fun startWriter() {
         val ep = epOut ?: return
         writerStop = false
