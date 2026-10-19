@@ -55,6 +55,12 @@
     </LinearLayout>
 
     <!-- 入口 1：安卓手机（AOA） -->
+
+    <!--
+      ★ 两张卡片都带 focusableInTouchMode：触摸模式下 focusable 不够，
+        requestFocus() 会拿不到焦点（详见 common/FocusRing 的注释）。
+      焦点环由 FocusRing.install 递归挂上，本页不写 foreground。
+    -->
     <LinearLayout
         android:id="@+id/card_aoa"
         android:layout_width="match_parent"
@@ -63,6 +69,7 @@
         android:background="@drawable/bg_card"
         android:clickable="true"
         android:focusable="true"
+        android:focusableInTouchMode="true"
         android:orientation="vertical"
         android:padding="18dp">
 
@@ -92,6 +99,7 @@
         android:background="@drawable/bg_card"
         android:clickable="true"
         android:focusable="true"
+        android:focusableInTouchMode="true"
         android:orientation="vertical"
         android:padding="18dp">
 

@@ -13,6 +13,7 @@ import android.view.View
 import android.widget.TextView
 import androidx.core.content.IntentCompat
 import com.uav.host.common.DebugTools
+import com.uav.host.common.FocusRing
 import com.uav.host.ios.IosActivity
 import com.uav.host.aoa.HostActivity
 import com.uav.host.aoa.usb.BulkPair
@@ -62,12 +63,23 @@ class ChooserActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_chooser)
 
-        findViewById<View>(R.id.card_aoa).setOnClickListener {
+        val cardAoa = findViewById<View>(R.id.card_aoa)
+        val cardIos = findViewById<View>(R.id.card_ios)
+        cardAoa.setOnClickListener {
             startActivity(Intent(this, HostActivity::class.java))
         }
-        findViewById<View>(R.id.card_ios).setOnClickListener {
+        cardIos.setOnClickListener {
             startActivity(Intent(this, IosActivity::class.java))
         }
+
+        // ★ 遥控器/D-pad 焦点：本页也是机顶盒的主要入口，必须能移焦。
+        //   1) 焦点环 —— 系统自带高亮是 API 26 才有，这台是 Android 7.1，
+        //      而且 selector 的 state_focused 在触摸模式下不生效 ⇒ 统一走 FocusRing。
+        //   2) 初始焦点 —— 不给的话第一下方向键没有"起点"，看着像遥控器坏了。
+        //      用 post{} 推到下一帧：onCreate 时 View 还没 attach，
+        //      requestFocus() 会因 isShown==false **静默失败**。
+        FocusRing.install(findViewById(android.R.id.content))
+        cardAoa.post { if (!cardAoa.hasFocus()) cardAoa.requestFocus() }
 
         // 基线 = 进本页时已经插着的东西，它们不参与"新插入"判定
         seenDeviceIds.addAll(usbDevices().map { it.deviceId })
