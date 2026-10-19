@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  系统签名变体（buildType = system）专用清单 —— 只在 `assembleSystem` 时合并进来。
+
+  ★ 为什么需要 `android:sharedUserId="android.uid.system"`：
+    进程 uid 变成 1000（system）之后，AOSP 的 USB 权限判据直接放行 ——
+    ```
+    // UsbSettingsManager.hasPermission(UsbDevice)  (Android 7.1.2)
+    if (uid == Process.SYSTEM_UID || mDisablePermissionDialogs) return true;
+    ```
+    这是"没有 SystemUI 的定制宿主"唯一能自己解决的路：那种 ROM 里
+    `com.android.systemui.usb.UsbPermissionActivity` 根本不存在，
+    `requestPermission()` 既不弹窗也不回调（表现为每 60s 超时一次、界面永远停在"等待 USB 授权"）；
+    而 attach 时的自动授权又要求"唯一匹配 **且** 该 App 是 `FLAG_SYSTEM`"，普通安装拿不到。
+
+  ⚠️ 三条硬约束，别忽略：
+    1. **必须用平台证书签名**（`usbscreen.platform.*`），否则安装直接被系统拒；
+    2. 装它要先**卸载**旧包（uid 从 app 变成 1000 ⇒ `INSTALL_FAILED_UID_CHANGED`），
+       卸载会清空 filesDir（iOS 配对记录要重新配一次）；
+    3. `sharedUserId` 自 API 29 起被标记弃用，但功能仍在。这个变体只面向老的定制宿主，
+       普通手机/平板的 `release` / `debug` 包**不带**这个属性。
+
+  ⚠️ 不要把它加进主清单（`src/main/AndroidManifest.xml`）—— 那样所有变体都会
+     要求平台签名，普通用户就装不上了。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sharedUserId="android.uid.system" />

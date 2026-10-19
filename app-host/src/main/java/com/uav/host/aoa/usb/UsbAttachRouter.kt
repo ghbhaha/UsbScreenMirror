@@ -222,7 +222,13 @@ class UsbAttachRouter(
             callback.onStatus("检测到设备，等待 USB 授权…")
         }
         if (!ensurePermission(device)) {
-            callback.onError("USB 授权被拒绝或超时（设备 ${device.deviceId}）")
+            callback.onError(
+                if (permissionUiMissing) {
+                    "本机没有「USB 授权」界面，拿不到 USB 权限 —— 这台设备无法投屏"
+                } else {
+                    "USB 授权被拒绝或超时（设备 ${device.deviceId}）"
+                }
+            )
             return
         }
 
@@ -311,6 +317,26 @@ class UsbAttachRouter(
             return true
         }
 
+        // ★ 先确认"这台机器上有没有 USB 授权界面"。
+        //
+        //   `UsbManager.requestPermission()` 的弹窗由 AOSP **硬编码在 SystemUI** 里
+        //   （`com.android.systemui.usb.UsbPermissionActivity`）。商显 / 一体机 / 广告机
+        //   的定制 ROM 常把整个 SystemUI 裁掉（实测 CVTE V31103 / Android 7.1.2：
+        //   `/system/priv-app` 里连 SystemUI.apk 都没有）——
+        //   这时 requestPermission 既不弹窗也不回调，只能干等 60s 超时，然后每 60s 循环一次，
+        //   界面永远停在"等待 USB 授权…"（用户只会以为程序坏了）。
+        //   ⇒ 探一次组件，缺失就**立刻**失败并说明原因，一次都不重试。
+        if (!hasUsbPermissionUi()) {
+            permissionUiMissing = true
+            logger.e(
+                TAG,
+                "本机没有 USB 授权界面（SystemUI 被裁剪：com.android.systemui.usb.UsbPermissionActivity 不存在）" +
+                    " ⇒ 拿不到 USB 权限，AOA 投屏在这台设备上不可用"
+            )
+            callback.onStatus("本机没有 USB 授权界面（系统被裁剪）")
+            return false
+        }
+
         val latch = CountDownLatch(1)
         permissionLatch = latch
 
@@ -329,8 +355,26 @@ class UsbAttachRouter(
         return usbManager.hasPermission(device)
     }
 
-    /** 设备拔出（计划 2.10：与读写异常统一收敛到 onError）。 */
-    fun onDetached(device: UsbDevice?) {
+    /** 本机是否根本没有 USB 授权界面（见 [ensurePermission] 里的说明）。 */
+    @Volatile
+    private var permissionUiMissing = false
+
+    /**
+     * 本机有没有「USB 授权」界面。
+     *
+     * AOSP 把 USB 权限弹窗放在 **SystemUI** 里，所以判据就是"这两个组件存不存在"。
+     * 商显/一体机/广告机的定制 ROM 会把 SystemUI 整个裁掉，此时这个探针直接命中。
+     */
+    private fun hasUsbPermissionUi(): Boolean {
+        val pm = context.packageManager
+        return USB_PERMISSION_ACTIVITIES.any { cls ->
+            runCatching {
+                pm.getActivityInfo(android.content.ComponentName("com.android.systemui", cls), 0)
+            }.isSuccess
+        }
+    }
+
+    /** 设备拔出（计划 2.10：与读写异常统一收敛到 onError）。 */    fun onDetached(device: UsbDevice?) {
         logger.i(TAG, "USB detached: ${device?.deviceId}")
         // 允许同一台设备重新插入后从头再试
         device?.let { attemptCounts.remove(it.deviceId) }
@@ -375,6 +419,17 @@ class UsbAttachRouter(
 
         /** 自定义权限广播 action（包内私有）。 */
         const val ACTION_USB_PERMISSION = "com.uav.host.USB_PERMISSION"
+
+        /**
+         * USB 授权弹窗的组件名（**SystemUI 里**，AOSP 硬编码）。
+         *
+         * 两个都要试：正常授权用 `UsbPermissionActivity`；"已设置过默认行为"时走
+         * `UsbConfirmActivity`。任一存在即说明这台机器有授权界面。
+         */
+        private val USB_PERMISSION_ACTIVITIES = listOf(
+            "com.android.systemui.usb.UsbPermissionActivity",
+            "com.android.systemui.usb.UsbConfirmActivity",
+        )
 
         /** 构建 attach/detach 的 IntentFilter（供 Activity 注册 DETACHED 用）。 */
         fun detachFilter(): IntentFilter =
