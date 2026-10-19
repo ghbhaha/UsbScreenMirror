@@ -310,4 +310,97 @@ adb shell am start -n com.uav.host/.ios.IosActivity --ez replay true
 3. **提示里必须写明「这不是协议不兼容」**，否则用户会去查错方向。
 
 存在意义只有一个：**下次遇到新系统设备，日志里能一眼看出版本**，
-不用再从头 A/B 一遍（10.18 那一轮浪费的时间）。
+不用再从头 A/B 一遍（10.18 那一轮浪费的时间）。---
+
+## 九、与上游 PROTOCOL.md 的逐条核对（2026-10-19）
+
+对照 [RayrenSX/iPhoneMirror `docs/PROTOCOL.md`](https://github.com/RayrenSX/iPhoneMirror/blob/main/docs/PROTOCOL.md)（v2026-10-17 复审版）。
+
+**结论：协议核心逐条一致，无冲突。发现 2 处差异 + 3 处已知未做，都不是 bug。**
+
+### 9.1 一致的部分（逐条核对过）
+
+| 上游文档 | 我们的实现 | 位置 |
+|---|---|---|
+| vendor request `0x40/0x52/0x0000/0x0002` | 同 | `QtTransport.activate` |
+| 隐藏配置 subclass `0x2A`，bulk IN/OUT 独立端点 | 同（`interfaceClass==0xFF && subclass==0x2A`） | `QtTransport.isCapture` |
+| ★ **激活前的 `0xFD` 不能当屏幕流接口** | 正是靠 subclass 精确定位，不按 interface class | 同上 |
+| 包格式 `[uint32_le totalLen][uint32_le magic]` | 同 | `QtPacket.u32At` |
+| ★ **fourcc 线上字节反转**（`ASYN=0x6173796e` → 线上`6e 79 73 61`） | 同，`fcc()` 统一反转 | `QtPacket.fcc` |
+| PING 固定 16B，原样回写 | 同（**同步**写，不排队） | `QtProtocolCore` |
+| SYNC/ASYN 的子类型在**偏移 12** | 同 | `QtPacket.matches(p, 12, …)` |
+| RPLY 带 64-bit correlation id | 同 | `QtPacket.clockReply` |
+| CWPA→RPLY、CVRP→NEED+RPLY、AFMT→回 Error=0 | 同 | `QtProtocolCore` |
+| ★ **每收一个 FEED 就再发一个带视频时钟的 NEED**（背压） | 同，`videoClock != 0` 时补发 | `QtProtocolCore:173` |
+| `SPRP` 携带参数集 | 同 | `SampleParser.csd` |
+| FEED/EAT 外层 `ASYN\|clock\|FEED\|len\|sbuf\|chunks` | 同 | `SampleParser` |
+| `sbuf` 内 `uint32_le len + uint32_le magic + payload` | 同 | 同 |
+| 视频 `sdat` 用 **AVCC 大端长度前缀**，不是 Annex-B | 同（`Bytes.getIntBE`） | `SampleParser:24` |
+| SPS/PPS 藏在尾部字典的 `avcC` 里 | 同 | `SampleParser.csd` |
+| `mdia=vide` / `codc=avc1` / `vdim` | 同（SPS 尺寸解析已覆盖） | `SpsInfo` |
+| `mdia=soun` + 40B ASBD，**48k lpcm 非 AAC** | 同（已按 PCM 出声） | `AudioParser` |
+| CMTime 24 字节小端 | 同 | — |
+| ★ 跨 read 可含半包/多包 | 同（`tail` 保留半包 + 非法长度重同步） | `QtSession:245` |
+
+> 上游明确标注"参考实现无法重组跨 read 的大包，这是高码率下的稳定性风险"
+> （文档 §5，Windows 参考仓库把跨 read 标了 TODO）——**我们这块比参考实现更稳。**
+
+### 9.2 ★ 差异 1：停止流程完全没实现（**唯一的真实缺口**）
+
+上游 §4 结束段：
+
+> 停止顺序是 **HPA0、HPD0、处理 STOP/RPLY 与 RELS**，然后释放接口、恢复 USBMux 配置。
+
+我们：**直接release 接口 + close**，不发任何停止报文。
+
+| | 上游 | 我们 |
+|---|---|---|
+| 停止 | `HPA0` → `HPD0` → `STOP/RPLY/RELS` | 释放接口 |
+
+实测**反复开关 3 次都正常**（`docs/iOS_USB投屏_安卓实现.md` §一），所以这不构成故障。
+但它是**协议对称性上的缺口**：
+
+- 设备侧不知道会话结束，可能保留上一会话的资源与时钟状态；
+- 长时间反复插拔 / 一天几十次时，累积行为的风险无法验证；
+- 若将来出现"拔线后再插推流异常"，这里是第一嫌疑。
+
+`QtPacket` 侧没有任何停止报文构造函数，需要时按 `hpa1`/`hpd1` 的结构补`hpa0`/`hpd0`
+（**记得 fourcc 要反转**）；`STOP/RELS` 是**设备→主机**方向，只需被动应答。
+
+### 9.3 ★ 差异 2：`HPA1` 的 `mFormatFlags` = 0，我们与上游夹具不同
+
+| | mBytesPerPacket | mFramesPerPacket | mBytesPerFrame | mChannels | mBitsPerChannel | **mFormatFlags** |
+|---|---|---|---|---|---|---|
+| 上游夹具 | 4 | 1 | 4 | 2 | 16 | **76** |
+| 我们 | 4 | 1 | 4 | 2 | 16 | **0** |
+
+其余五个字段逐项相同；`formatFlags` 不同。
+
+注意**这不是我们解码侧的默认值**—— [AudioParser.DEFAULT_FORMAT] 是 `12`
+（`kAudioFormatFlagIsSignedInteger or kAudioFormatFlagIsPacked`），那是**从设备 `AFMT` 报文读到的实际值**。
+`HPA1` 里那一个 `0` 是我们**自己声明**的格式标志。
+
+实践上没影响（`AFMT` 阶段设备会用它的真实值覆盖），但严格对齐更稳妥。
+
+### 9.4 已知未做（上游有、上游自己也在演进）
+
+| 项 | 上游状态 | 我们的选择 |
+|---|---|---|
+| **HEVC/HVCC** | 支持（含 VPS/IRAP NAL） | 只做 H.264 |
+| `satt/keyv` 显示方向（`idxk=29`，iPad15,7 需180/90/270 校正） | 已实现，且2026-10-17 推翻过自己的旧判断 | 未做。**我们靠 SPS 变化感知转屏**，iPad8,9 实测转屏正常 ⇒该`keyv` 方向修正对本机型不必要 |
+| HPD1 的A/B/C 三模式（演示 / AirPlay /爱思兼容） | 按机型尺寸表请求 | 固定 `Valeria=true + 1640×2360` |
+| 色彩范围 full-range BT.709 归一化 | 有 | 无 |
+
+★ **HPD1 的 DisplaySize 不是编码分辨率控制**（上游 §7 明确）
+——这点我们理解正确：请求 1640×2360，设备实际输出按它自己的 `vdim`/timing 走。
+我们从 SPS 取真实尺寸正是这个道理（见 `docs` §四 的"画面横向拉宽"修复）。
+
+> ⚠️ 上游文档自己也说明："HPD1 分辨率硬编码为 2160×3840，不代表实际输出能力"
+> 是**它自己批评旧参考实现**的话。我们固定尺寸不是同一个错误，
+> 但真要改分辨率，得知道**没有 USB 侧开关**，只能改本地渲染上限（上游也是这么做的）。
+
+### 9.5 采纳上游的一条经验（已在代码里）
+
+上游 §10「兼容性风险」：*"协议是逆向结果，不是 Apple 公共 API，
+Apple 可以在任意 iOS 版本更改…"* —— 这与 `docs/iOS_USB投屏_安卓实现.md` §八
+「不要为版本写分支」的结论一致：我们不写版本分支，但**保留版本号记录用于失败诊断**。
