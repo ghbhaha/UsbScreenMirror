@@ -228,11 +228,14 @@ internal class MuxLink(
      * 会话模式：QueryType（已在 [openRaw] 做完）→ StartSession → TLS → GetValue。
      *
      * 返回 true 只代表"流程跑完且没炸"，是否真受信任看 [trusted]。
+     *
+     * @param tlsWaitMs 等 TLS 握手的时长，到点就带着"半开"的连接继续投屏。
+     *   见 [IosFeatures.TLS_WAIT_MS] —— 这个窗口不能省成 0，设备要靠它放行 QT 推流。
      */
-    fun open(): Boolean {
+    fun open(tlsWaitMs: Long = 8_000L): Boolean {
         if (!openRaw()) return false
         val id = identity ?: return true
-        return establishSession(id)
+        return establishSession(id, tlsWaitMs)
     }
 
     /**
@@ -240,7 +243,7 @@ internal class MuxLink(
      *
      * 单独抽出来是为了让**配对刚做完**的那条连接能立刻自证一次（不必让用户再点一次开始采集）。
      */
-    fun establishSession(id: Identity): Boolean {
+    fun establishSession(id: Identity, tlsWaitMs: Long = 8_000L): Boolean {
         val started = request(Lockdown.startSession("UsbScreenMirror", id.hostId, id.systemBuid))
         if (started == null) {
             log("✗ StartSession 无回复：${failed ?: "超时"}")
@@ -265,10 +268,12 @@ internal class MuxLink(
         if (hello.isNotEmpty()) sendTcp(0x10, hello)
 
         val t3 = System.currentTimeMillis()
-        while (!tlsReady && failed == null && System.currentTimeMillis() - t3 < 8000) pumpOnce(300)
+        while (!tlsReady && failed == null && System.currentTimeMillis() - t3 < tlsWaitMs) pumpOnce(300)
         if (!tlsReady) {
-            log("✗ TLS 未完成：${failed ?: "超时"}（${t.describe()}）")
-            return false
+            // ★ 这条**不是投屏故障**：TLS 只承载控制面（设备信息/唤醒/事件），
+            //   视频音频走 QT 明文通道。iOS 27 上设备本来就不回 ServerHello。
+            log("（TLS 未完成：${failed ?: "超时"}（${t.describe()}）—— 只影响控制面，投屏不受影响）")
+            return true
         }
 
         log("→ GetValue（判决信任是否成立）")

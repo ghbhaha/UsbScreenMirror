@@ -502,9 +502,12 @@ class IosActivity : Activity() {
         // 配对成功后立刻自证一次：StartSession → TLS → GetValue
         val key = currentDeviceKey() ?: Pairing.KEY_UNKNOWN
         val rec = Pairing.loadRecord(filesDir, key, ::log)
-        if (rec != null) {
+        if (rec != null && IosFeatures.TLS_WAIT_MS >= 8_000L) {
             log("自检：用刚配好的身份走一次 StartSession + TLS…")
             verifyTrust(rec.hostId)
+        } else if (rec != null) {
+            // TLS 窗口被缩短 ⇒ 握手必然来不及完成，自证只会打一行"失败"误导人
+            log("（TLS 窗口 ${IosFeatures.TLS_WAIT_MS}ms ⇒ 跳过信任自检；配对结果以上面的写入为准）")
         }
         return Pairing.hasRecord(filesDir, key)
     }
@@ -772,12 +775,14 @@ class IosActivity : Activity() {
                         log("建立 lockdown 会话（if#${itfMux.id}）…")
                         val link = MuxLink(cm, mi, mo, identity, ::log)
                         muxLink = link
-                        if (link.open()) {
+                        if (link.open(IosFeatures.TLS_WAIT_MS)) {
                             log("★★ lockdown 会话在线（TLS=${link.tlsReady} 信任=${link.trusted}），开始保活")
-                            // ★ 归属校验：「暂时接管」的旧版记录要靠**真的信任成功**才能转正
-                            val devKey = Pairing.deviceKey(dev)
-                            if (link.trusted) PairStore.confirm(filesDir, devKey, ::log)
-                            else PairStore.dropProvisional(filesDir, devKey, ::log)
+                            // ★ 归属校验：「暂时接管」的旧版记录要靠**真的信任成功**才能转正。
+                            //   TLS 窗口被缩短后 `trusted` 恒为 false —— 这时**不能** dropProvisional，
+                            //   否则会把刚迁移过来的记录删掉。宁可让它停在"暂管"。
+                            if (link.trusted) {
+                                PairStore.confirm(filesDir, Pairing.deviceKey(dev), ::log)
+                            }
                             muxThread = Thread({
                                 while (keepAlive.get() && link.failed == null) {
                                     runCatching { link.pumpOnce(200) }
@@ -785,7 +790,6 @@ class IosActivity : Activity() {
                             }, "mux-keepalive").apply { isDaemon = true; start() }
                         } else {
                             log("✗ lockdown 会话未建立：${link.failed}")
-                            PairStore.dropProvisional(filesDir, Pairing.deviceKey(dev), ::log)
                         }
                     }
                 }
