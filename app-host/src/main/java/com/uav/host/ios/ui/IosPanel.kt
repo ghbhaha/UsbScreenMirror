@@ -120,6 +120,15 @@ class IosPanel(private val activity: Activity) {
         render(Stage.IDLE, null)
         hideSystemBars()
 
+        // 遥控器：给所有可聚焦控件挂焦点环（API 25 没有系统自带的高亮，见 FocusRing 说明）
+        com.uav.host.common.FocusRing.install(rootView)
+
+        // ★ 日志区绝不能吃焦点：`ScrollView` 在**构造期**自己 `setFocusable(true)`，
+        //   XML 里的 `focusable="false"` 会被它覆盖；而且我们每 120ms `fullScroll()` 一次，
+        //   它会顺势把焦点抢过来 —— 表现就是"遥控器按了半天，焦点永远停在日志上"。
+        logScroll.isFocusable = false
+        logScroll.descendantFocusability = android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
+
         // ★ 日志「插入即贴底」的真正收口在这里。
         //   `logView.text = …` 之后立刻 fullScroll 是滚不动的（滚动范围还没随布局更新），
         //   表现为"新日志被切在底部看不见"。内容高度一变就滚 —— 这时范围才是对的。
@@ -317,7 +326,29 @@ class IosPanel(private val activity: Activity) {
             overlayView.visibility = View.GONE
         }
         chipView.visibility = if (menuShown) View.GONE else View.VISIBLE
+        syncFocusToMenu()
     }
+
+    /**
+     * 遥控器/D-pad：把焦点放到"当前唯一可见的入口"（面板展开→收起按钮，收起→药丸）。
+     *
+     * ⚠️ 必须显式做：机顶盒没有触摸屏，也没有鼠标 —— 一旦焦点落在 `GONE` 的控件上
+     * （收起动画结束后就是这种情况），方向键就**完全无处可去**，用户以为遥控器坏了。
+     */
+    private fun syncFocusToMenu() {
+        val target = if (menuShown) btnCollapse else chipView
+        if (target.isShown && !target.hasFocus() && !target.requestFocus()) {
+            android.util.Log.w("UAV-IosQt", "焦点请求失败（${if (menuShown) "面板" else "药丸"}）")
+        }
+    }
+
+    /**
+     * 界面起来时先给一个焦点（否则方向键第一次按下去什么都不发生）。
+     *
+     * ⚠️ 用 `post`：`onCreate` 里 View 还没 attach，`isShown` 是 false，`requestFocus()`
+     * 会被静默丢掉 —— 必须等这一帧布局完再请求。
+     */
+    fun focusFirst() = onUi { chipView.post { syncFocusToMenu() } }
 
     fun currentSurface(): Surface? = if (surfaceReady) surfaceView.holder.surface else null
 

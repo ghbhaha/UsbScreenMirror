@@ -37,6 +37,7 @@
         android:background="@drawable/ios_bg_chip"
         android:clickable="true"
         android:focusable="true"
+        android:focusableInTouchMode="true"
         android:gravity="center_vertical"
         android:orientation="horizontal"
         android:paddingStart="12dp"
@@ -117,6 +118,7 @@
                 android:clickable="true"
                 android:contentDescription="@string/ios_btn_collapse"
                 android:focusable="true"
+                android:focusableInTouchMode="true"
                 android:padding="6dp"
                 android:src="@drawable/ios_ic_arrow_left"
                 android:tint="@color/ios_text_dim" />
@@ -219,6 +221,7 @@
                 android:layout_height="0dp"
                 android:layout_marginTop="5dp"
                 android:layout_weight="1"
+                android:focusable="false"
                 android:scrollbars="none">
 
                 <TextView
@@ -228,7 +231,7 @@
                     android:fontFamily="monospace"
                     android:lineSpacingExtra="2dp"
                     android:textColor="@color/ios_text_dim"
-                    android:textIsSelectable="true"
+                    android:focusable="false"
                     android:textSize="10sp" />
             </ScrollView>
         </LinearLayout>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  遥控器/D-pad 焦点环。
+
+  ⚠️ 两件事都踩过：
+  1. `android:defaultFocusHighlightEnabled`（系统自带焦点高亮）**API 26 才有** ——
+     这台机顶盒是 Android 7.1（API 25），遥控器移焦时屏幕毫无变化；
+  2. **`state_focused` 在触摸模式下不进 drawable state**（实测：view 明明
+     `hasFocus()==true`，selector 的 focused 分支却不生效）。
+  ⇒ 所以这里是**一张固定样式的环**，由 `FocusRing` 在 `onFocusChange` 里手动挂/摘，
+     不依赖任何 selector。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#263D7BFF" />
+    <stroke
+        android:width="2dp"
+        android:color="@color/host_accent" />
+    <corners android:radius="12dp" />
+</shape>

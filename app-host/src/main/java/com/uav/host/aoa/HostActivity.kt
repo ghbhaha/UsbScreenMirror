@@ -212,6 +212,8 @@ class HostActivity : Activity() {
             onGetApp = { openCompanionAppPage() },
             onDisplayAreaChanged = { quality.onDisplayAreaChanged() },
         )
+        // ★ 遥控器/D-pad：先给一个初始焦点，否则第一下方向键什么都不发生
+        panel.focusFirst()
 
         hidTouch = HidTouchController(logger)
         touch = TouchForwarder(panel.surfaceView, logger).also { f ->

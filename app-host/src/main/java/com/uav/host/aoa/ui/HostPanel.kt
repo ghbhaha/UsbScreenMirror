@@ -65,6 +65,9 @@ class HostPanel(private val activity: Activity) {
     private lateinit var chipDot: View
     private lateinit var chipText: TextView
 
+    /** 面板右上角的"收起"（遥控器焦点在面板里时的第一个落点）。 */
+    private lateinit var collapseView: View
+
     /** 画质分段控件的两段（"1:1 像素" / "高清"）。 */
     private lateinit var segOneToOne: TextView
     private lateinit var segHighQuality: TextView
@@ -131,6 +134,7 @@ class HostPanel(private val activity: Activity) {
         statsText = r.findViewById(R.id.stats)
         overlayView = r.findViewById(R.id.overlay)
         chipView = r.findViewById(R.id.status_chip)
+        collapseView = r.findViewById(R.id.btn_collapse)
         chipDot = r.findViewById(R.id.chip_dot)
         chipText = r.findViewById(R.id.chip_state)
         segOneToOne = r.findViewById(R.id.btn_pixel_11)
@@ -152,6 +156,9 @@ class HostPanel(private val activity: Activity) {
 
         segOneToOne.setOnClickListener { onTogglePixelMode(true) }
         segHighQuality.setOnClickListener { onTogglePixelMode(false) }
+
+        // 遥控器：给所有可聚焦控件挂焦点环（API 25 没有系统自带高亮，见 FocusRing 说明）
+        com.uav.host.common.FocusRing.install(rootView)
     }
 
     private inline fun <reified T : View> findViewById(id: Int): T = activity.findViewById(id)
@@ -343,6 +350,25 @@ class HostPanel(private val activity: Activity) {
             overlayView.visibility = View.GONE
             overlayView.translationX = 0f
         }
+        // 遥控器/D-pad：焦点跟着"当前唯一可见的入口"走（面板↔药丸）。
+        // 不做的话，收起动画结束后焦点还留在 GONE 的按钮上，方向键就彻底没反应了。
+        overlayView.post { syncFocusToMenu() }
+    }
+
+    /** 把焦点放到当前可见的入口：面板展开 → 收起按钮；收起 → 常驻药丸。 */
+    private fun syncFocusToMenu() {
+        val target = if (menuShown) collapseView else chipView
+        if (target.isShown && !target.hasFocus()) target.requestFocus()
+    }
+
+    /** 界面起来时先给一个焦点（否则第一下方向键没有起点）。 */
+    fun focusFirst() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            activity.runOnUiThread { focusFirst() }
+            return
+        }
+        // ⚠️ post：onCreate 里 View 还没 attach，isShown=false，requestFocus() 会被静默丢弃
+        chipView.post { syncFocusToMenu() }
     }
 
     /**

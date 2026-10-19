@@ -37,6 +37,7 @@
     -->
     <style name="HostTileRow">
         <item name="android:background">@drawable/bg_tile</item>
+        <item name="android:focusableInTouchMode">true</item>
         <item name="android:textColor">@color/host_text</item>
         <item name="android:textSize">13sp</item>
         <item name="android:textAllCaps">false</item>
@@ -57,6 +58,7 @@
     <!-- 画质分段控件的一段（选中/未选中由代码换背景与文字色） -->
     <style name="HostSegment">
         <item name="android:background">@drawable/bg_segment_off</item>
+        <item name="android:focusableInTouchMode">true</item>
         <item name="android:textColor">@color/host_text_dim</item>
         <item name="android:textSize">13sp</item>
         <item name="android:gravity">center</item>
@@ -88,6 +90,7 @@
     </style>
 <style name="IosTileRow">
         <item name="android:background">@drawable/bg_tile</item>
+        <item name="android:focusableInTouchMode">true</item>
         <item name="android:textColor">@color/ios_text</item>
         <item name="android:textSize">13sp</item>
         <item name="android:textAllCaps">false</item>
@@ -106,6 +109,7 @@
     </style>
 <style name="IosSegment">
         <item name="android:background">@drawable/bg_segment_off</item>
+        <item name="android:focusableInTouchMode">true</item>
         <item name="android:textColor">@color/ios_text_dim</item>
         <item name="android:textSize">13sp</item>
         <item name="android:gravity">center</item>

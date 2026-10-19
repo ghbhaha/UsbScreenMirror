@@ -162,6 +162,8 @@ class IosActivity : Activity() {
         )
         // 投屏期间别让屏幕自己熄掉（熄屏会连带把 Surface 收走）
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // ★ 遥控器/D-pad：先给药丸一个焦点，否则第一下方向键没有"起点"
+        panel.focusFirst()
 
         transport = QtTransport(this, usb, ::log)
         // ★ 必须走 ContextCompat：三分量 registerReceiver 是 API 26+ 的，
