@@ -9,14 +9,20 @@
 
   英文用户由 values-en/ 覆盖（系统按语言自动选择），两边键名必须一一对应。
 
-  app_name 是**桌面显示名**：中文用「投屏接收」/「投屏发送」，英文用 Cast In / Cast Out
+  app_name是**桌面显示名**：中文用「投屏接收」/「投屏发送」，英文用 Cast In / Cast Out
   （cast = 投屏的通用词，In/Out 表方向且与图标箭头一致）。
   ⚠️ 名字要短：桌面格子窄，实测 6 个字符就会被截断（旧名 UAV Host 在平板上显示成 "UAV Hos…"）。
+
+  ⚠️ 格式约定：键名按 **模块前缀** 分组，组间空一行；前缀 ios_ 的那批已于 10.19
+  与 host_ 侧的重复项合并（文案/颜色/样式/图标全部共用 host_ 版），详见 docs/排错手册.md。
 -->
 <resources>
+
+    <!-- ===== 桌面 ===== -->
     <string name="app_name">投屏接收</string>
 
-    <!-- 面板标题栏 -->
+    <!-- ===== 宿主（AOA）面板 ===== -->
+    <!-- 标题栏 -->
     <string name="host_title">USB 投屏</string>
     <string name="host_btn_collapse">收起面板</string>
 
@@ -28,14 +34,14 @@
     <string name="host_chip_replay">回放</string>
     <string name="host_chip_no_signal">无输出</string>
     <string name="host_chip_error">出错</string>
-    <string name="host_chip_peer_app_missing">缺 App</string>
+    <string name="host_chip_peer_app_missing">缺App</string>
 
-    <!-- 状态行 -->
-    <string name="host_status_idle">空闲中 —— 请把配件手机插上来</string>
     <!--
+      状态行。
       主状态行只说"处于哪个阶段"（10.23）。它**不能**包含任何"正在等你…"式的进度语义 ——
       进度文本归副行。原先两者共用一行，导致原地重协商时画面没断却被说成"等待视频流"。
     -->
+    <string name="host_status_idle">空闲中 —— 请把配件手机插上来</string>
     <string name="host_status_connecting">正在建立连接…</string>
     <string name="host_status_mirroring">投屏中</string>
     <string name="host_status_renegotiating">投屏中 · 正在重协商…</string>
@@ -51,7 +57,7 @@
     <string name="host_btn_scan">扫描 / 重试</string>
     <string name="host_btn_force">强制重握手</string>
     <string name="host_btn_replay">回放抓流</string>
-    <string name="host_btn_get_app">获取配套 App</string>
+    <string name="host_btn_get_app">获取配套App</string>
     <!-- 下载地址：与 AOA SEND_STRING[4]（AccessoryIdentity.URI）保持一致，指向 Releases 最新版 -->
     <string name="host_app_url" translatable="false">https://github.com/ghbhaha/UsbScreenMirror/releases/latest</string>
     <string name="host_link_copied">本机没有浏览器，下载链接已复制到剪贴板</string>
@@ -74,32 +80,34 @@
       "自动旋转"是已支持功能（计划 10.7）的前提条件，写出来避免"转不动"被当成 bug。
     -->
     <string name="host_hint">点画面外的空白处显示 / 隐藏此面板 · 手机上需开启自动旋转</string>
-<string name="ios_title">iOS 投屏</string>
-<string name="ios_btn_collapse">收起面板</string>
-<string name="ios_btn_expand">展开面板</string>
-<string name="ios_chip_idle">空闲</string>
-<string name="ios_chip_pairing">配对中</string>
-<string name="ios_chip_connecting">连接中</string>
-<string name="ios_chip_mirroring">投屏中</string>
-<string name="ios_chip_rearm">唤醒中</string>
-<string name="ios_chip_replay">回放</string>
-<string name="ios_chip_error">出错</string>
-<string name="ios_status_idle">空闲中 —— 把 iPad 用数据线插到本机</string>
-<string name="ios_status_unpaired">这台 iPad 还没被本机信任</string>
-<string name="ios_status_pairing">等待你在 iPad 上点「信任」…</string>
-<string name="ios_status_connecting">正在建立连接…</string>
-<string name="ios_status_mirroring">投屏中</string>
-<string name="ios_status_rearm">正在唤醒 iPad 的采集通道…</string>
-<string name="ios_status_replay">回放录制流</string>
-<string name="ios_status_error">链路出错</string>
-<string name="ios_btn_rearm">重新唤醒采集通道</string>
-<string name="ios_section_device">设备</string>
-<string name="ios_section_log">运行日志</string>
-<string name="ios_detail_no_device">未检测到 Apple 设备（VID 0x05AC）</string>
-<string name="ios_detail_link_lost">iPad 已断开 —— 把数据线插回去就能重新开始</string>
-<string name="ios_detail_pair_hint">配对成功后本机即成为受信任主机，以后不用再点</string>
-<string name="ios_detail_rearm_hint">配对完成后第一次投屏、或长时间无数据时才需要</string>
-<string name="ios_hint">插上 iPad 自动配对并投屏，拔线即停 · 点画面空白处或左上角药丸可显示 / 隐藏此面板</string>
+
+    <!-- ===== 宿主（iOS）面板 ===== -->
+    <string name="ios_title">iOS 投屏</string>
+    <string name="ios_btn_expand">展开面板</string>
+
+    <string name="ios_chip_pairing">配对中</string>
+    <string name="ios_chip_rearm">唤醒中</string>
+
+    <string name="ios_status_idle">空闲中 —— 把 iPad 用数据线插到本机</string>
+    <string name="ios_status_unpaired">这台 iPad 还没被本机信任</string>
+    <string name="ios_status_pairing">等待你在 iPad 上点「信任」…</string>
+    <string name="ios_status_connecting">正在建立连接…</string>
+    <string name="ios_status_rearm">正在唤醒 iPad 的采集通道…</string>
+    <string name="ios_status_replay">回放录制流</string>
+
+    <string name="ios_btn_rearm">重新唤醒采集通道</string>
+
+    <string name="ios_section_device">设备</string>
+    <string name="ios_section_log">运行日志</string>
+
+    <string name="ios_detail_no_device">未检测到 Apple 设备（VID 0x05AC）</string>
+    <string name="ios_detail_link_lost">iPad 已断开 —— 把数据线插回去就能重新开始</string>
+    <string name="ios_detail_pair_hint">配对成功后本机即成为受信任主机，以后不用再点</string>
+    <string name="ios_detail_rearm_hint">配对完成后第一次投屏、或长时间无数据时才需要</string>
+
+    <string name="ios_hint">插上 iPad 自动配对并投屏，拔线即停 · 点画面空白处或左上角药丸可显示 / 隐藏此面板</string>
+
+    <!-- ===== 设备选择页 ===== -->
     <string name="chooser_title">USB 投屏</string>
     <string name="chooser_subtitle">选择要投屏的设备类型（插线后会自动识别）</string>
     <string name="chooser_aoa_title">安卓手机</string>
@@ -109,4 +117,5 @@
     <string name="chooser_detected_aoa">已检测到 %1$d 个配件设备（安卓手机已就绪）</string>
     <string name="chooser_detected_ios">已检测到 %1$d 台 Apple 设备（可走 iPad 投屏）</string>
     <string name="chooser_detected_none">当前未检测到可用于投屏的设备，插线后会自动识别</string>
+
 </resources>

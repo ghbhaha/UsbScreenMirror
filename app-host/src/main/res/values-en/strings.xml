@@ -1,16 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  English UI strings. Key names must match values/strings.xml one-to-one.
+  English UI strings. Key names must match values/strings.xml one-to-one
+  (host_app_url is translatable="false" and therefore intentionally absent here).
 
   app_name（桌面显示名）= "Cast In" / "Cast Out"：cast 是英文里"投屏"的通用词，
   In/Out 表示方向且与图标箭头一致；再长就会被桌面截断成 "Cast Re..."。
+
+  ⚠️ 格式约定：分组与顺序跟values/strings.xml 完全一致，方便逐段对照检查。
 -->
 <resources>
+
+    <!-- ===== Launcher ===== -->
     <string name="app_name">Cast In</string>
 
+    <!-- ===== Host (AOA) panel ===== -->
+    <!-- Title bar -->
     <string name="host_title">USB Screen Mirror</string>
     <string name="host_btn_collapse">Collapse panel</string>
 
+    <!-- Status pill (short words, top-left corner) -->
     <string name="host_chip_idle">Idle</string>
     <string name="host_chip_connecting">Connecting</string>
     <string name="host_chip_mirroring">Mirroring</string>
@@ -31,49 +39,56 @@
     <string name="host_status_peer_app_missing">No reply from device</string>
     <string name="host_detail_peer_app_missing">Switched into accessory mode, but the other side never replied — usually the companion app is not installed (a force-stopped app behaves the same). After installing, tap Scan / Retry, or replug the cable.</string>
 
+    <!-- Actions (tiles: icon on top, caption below — keep them short) -->
     <string name="host_btn_scan">Scan / Retry</string>
     <string name="host_btn_force">Rehandshake</string>
     <string name="host_btn_replay">Replay</string>
     <string name="host_btn_get_app">Get companion app</string>
     <string name="host_link_copied">No browser on this device — download link copied to clipboard</string>
 
+    <!-- Quality segmented control -->
     <string name="host_section_quality">Quality</string>
     <string name="host_seg_11">1:1</string>
     <string name="host_seg_hd">HD</string>
     <string name="host_quality_note">1:1 encodes at the host display area (low CPU); HD encodes at the panel long side and is downscaled by the host — looks sharper.</string>
 
+    <!-- Stats card title -->
     <string name="host_section_link">LINK</string>
 
+    <!-- Detail rows when switching quality (10.23: subtitle only) -->
     <string name="host_status_switch_11">Switched to 1:1 pixels (encodes at display area)</string>
     <string name="host_status_switch_hd">Switched to HD (encodes at panel long side)</string>
 
+    <!-- Bottom hint: the panel auto-collapses on first frame, so tell the user how to bring it back. -->
     <string name="host_hint">Tap outside the video to show / hide this panel · enable auto-rotate on the phone</string>
+
+    <!-- ===== Host (iOS) panel ===== -->
     <string name="ios_title">iOS Mirroring</string>
-    <string name="ios_btn_collapse">Collapse panel</string>
     <string name="ios_btn_expand">Expand panel</string>
-    <string name="ios_chip_idle">Idle</string>
+
     <string name="ios_chip_pairing">Pairing</string>
-    <string name="ios_chip_connecting">Connecting</string>
-    <string name="ios_chip_mirroring">Mirroring</string>
     <string name="ios_chip_rearm">Arming</string>
-    <string name="ios_chip_replay">Replay</string>
-    <string name="ios_chip_error">Error</string>
+
     <string name="ios_status_idle">Idle - connect the iPad with a USB data cable</string>
     <string name="ios_status_unpaired">This iPad does not trust this device yet</string>
     <string name="ios_status_pairing">Tap Trust on the iPad…</string>
     <string name="ios_status_connecting">Establishing connection…</string>
-    <string name="ios_status_mirroring">Mirroring</string>
     <string name="ios_status_rearm">Arming the iPad capture channel…</string>
     <string name="ios_status_replay">Replaying recorded stream</string>
-    <string name="ios_status_error">Link error</string>
+
     <string name="ios_btn_rearm">Re-arm capture channel</string>
+
     <string name="ios_section_device">Device</string>
     <string name="ios_section_log">Log</string>
+
     <string name="ios_detail_no_device">No Apple device found (VID 0x05AC)</string>
     <string name="ios_detail_link_lost">iPad disconnected — plug the cable back in to start again</string>
     <string name="ios_detail_pair_hint">Once paired this device is a trusted host, no need to tap again</string>
     <string name="ios_detail_rearm_hint">Only needed for the first session after pairing, or after a long silence</string>
+
     <string name="ios_hint">Plug in the iPad to pair and mirror automatically; unplug to stop - tap the empty area or the pill to toggle this panel</string>
+
+    <!-- ===== Device chooser ===== -->
     <string name="chooser_title">USB Mirroring</string>
     <string name="chooser_subtitle">Pick the device type to mirror (auto-detected when plugged in)</string>
     <string name="chooser_aoa_title">Android phone</string>
@@ -83,4 +98,5 @@
     <string name="chooser_detected_aoa">%1$d accessory device(s) detected (Android phone ready)</string>
     <string name="chooser_detected_ios">%1$d Apple device(s) detected (iPad mirroring available)</string>
     <string name="chooser_detected_none">No mirrorable device detected - it is picked up once plugged in</string>
+
 </resources>

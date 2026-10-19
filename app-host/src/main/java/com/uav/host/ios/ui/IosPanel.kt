@@ -65,14 +65,14 @@ class IosPanel(private val activity: Activity) {
 
     /** 阶段 → 药丸文案 / 圆点颜色 / 主行文案。 */
     enum class Stage(val chip: Int, val dot: Int, val status: Int) {
-        IDLE(R.string.ios_chip_idle, R.color.ios_idle, R.string.ios_status_idle),
-        UNPAIRED(R.string.ios_chip_idle, R.color.ios_warn, R.string.ios_status_unpaired),
-        PAIRING(R.string.ios_chip_pairing, R.color.ios_warn, R.string.ios_status_pairing),
-        CONNECTING(R.string.ios_chip_connecting, R.color.ios_warn, R.string.ios_status_connecting),
-        MIRRORING(R.string.ios_chip_mirroring, R.color.ios_ok, R.string.ios_status_mirroring),
-        REARM(R.string.ios_chip_rearm, R.color.ios_warn, R.string.ios_status_rearm),
-        REPLAY(R.string.ios_chip_replay, R.color.ios_accent, R.string.ios_status_replay),
-        ERROR(R.string.ios_chip_error, R.color.ios_err, R.string.ios_status_error),
+        IDLE(R.string.host_chip_idle, R.color.host_idle, R.string.ios_status_idle),
+        UNPAIRED(R.string.host_chip_idle, R.color.host_warn, R.string.ios_status_unpaired),
+        PAIRING(R.string.ios_chip_pairing, R.color.host_warn, R.string.ios_status_pairing),
+        CONNECTING(R.string.host_chip_connecting, R.color.host_warn, R.string.ios_status_connecting),
+        MIRRORING(R.string.host_chip_mirroring, R.color.host_ok, R.string.host_status_mirroring),
+        REARM(R.string.ios_chip_rearm, R.color.host_warn, R.string.ios_status_rearm),
+        REPLAY(R.string.host_chip_replay, R.color.host_accent, R.string.ios_status_replay),
+        ERROR(R.string.host_chip_error, R.color.host_err, R.string.host_status_error),
     }
 
     /**
