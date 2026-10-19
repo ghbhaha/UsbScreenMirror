@@ -513,9 +513,12 @@ class Connection(
         val headersSeen = ConcurrentHashMap<Int, StreamHeader>()
 
         internal fun frameAt(streamId: Int, frame: Frame) {
-            bytesPerStream.computeIfAbsent(streamId) { AtomicLong() }.addAndGet(frame.size.toLong())
+            // ⚠️ 用 `getOrPut` 而不是 `ConcurrentHashMap.computeIfAbsent`：
+            //   后者是 **API 24** 才有的方法，宿主 minSdk 是 23 —— 在 Android 6 上
+            //   走到这里会 `NoSuchMethodError`（lint 只查 android.jar，抓不到这种 JDK 缺口）。
+            bytesPerStream.getOrPut(streamId) { AtomicLong() }.addAndGet(frame.size.toLong())
             val map = if (frame.isConfig) configFramesPerStream else framesPerStream
-            map.computeIfAbsent(streamId) { AtomicLong() }.incrementAndGet()
+            map.getOrPut(streamId) { AtomicLong() }.incrementAndGet()
         }
 
         internal fun headerAt(streamId: Int, header: StreamHeader) {
