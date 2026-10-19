@@ -54,7 +54,24 @@ internal class QtSession(
      * 靠耗时区分也只是启发式。真正能一锤定音的是 `UsbManager.deviceList` 里还有没有它。
      * 不给（null）时退化成纯计数判据。
      */
-    private val linkAlive: (() -> Boolean)? = null
+    private val linkAlive: (() -> Boolean)? = null,
+    /**
+     * ★ **Activity 级停止判据**（2026-10-19 补）。
+     *
+     * 为什么必须有它：读循环只看自己的 [stopRequested]，而上层要停它有两条路 ——
+     * 点「停止投屏」按钮（置 [stopRequested]，这条路本来就通）、以及
+     * **点返回键**（Activity 走 `onDestroy`，那时 [IosActivity.activeSession]
+     * 已经被`finishRun` 置 null，`activeSession?.stopRequested = true` 变成空操作）。
+     *
+     * 实测后果：返回键关掉界面后后台继续无限收流（`FEED` 计数照涨），
+     * USB 被长期占用、`ios-auto` 线程不退出。
+     *
+     * ⇒ 把 Activity 的 `stopRequested` 以**函数**形式传进来（不是快照值），
+     * 读循环每轮重新求值，Activity 那边置位即刻生效。
+     *
+     * 不给（null）时退化成只看 [stopRequested]，行为与从前一致。
+     */
+    private val stopSignal: (() -> Boolean)? = null,
 ) {
 
     private var tail = ByteArray(0)
@@ -181,7 +198,12 @@ internal class QtSession(
         // 判据在 `:protocol`（阈值边界必须可单测，见 LinkLossGateTest）
         val lossGate = LinkLossGate()
 
-        while (!stopRequested && System.currentTimeMillis() < deadline) {
+        // ★ `shouldStop()` 把 [stopRequested] 与外部 [stopSignal] 合成一个判据，
+        //   循环只认它—— 这样"谁想停"与"怎么停"就分开了（见构造参数 stopSignal 的说明）。
+        fun shouldStop(): Boolean =
+            stopRequested || (stopSignal?.invoke() == true)
+
+        while (!shouldStop() && System.currentTimeMillis() < deadline) {
             val t0 = System.currentTimeMillis()
             val n = conn.bulkTransfer(epIn, readBuf, readBuf.size, 500)
             val dt = System.currentTimeMillis() - t0

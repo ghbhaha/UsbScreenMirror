@@ -77,6 +77,7 @@
     <string name="ios_status_replay">Replaying recorded stream</string>
 
     <string name="ios_btn_rearm">Re-arm capture channel</string>
+    <string name="ios_btn_stop">Stop mirroring</string>
 
     <string name="ios_section_device">Device</string>
     <string name="ios_section_log">Log</string>

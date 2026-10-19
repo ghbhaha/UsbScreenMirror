@@ -180,7 +180,11 @@ class IosActivity : Activity() {
         panel = IosPanel(this)
         panel.bind(
             onSurface = { ready -> if (ready) resumeRendering() else suspendRendering() },
-            onRearm = { if (!running.get()) rearm() }
+            onRearm = { if (!running.get()) rearm() },
+            // ★ 停止：只置停止信号，真正的收尾在 capture() 的 finally 里做。
+            //   这里**不要**直接 close/杀线程 —— 那会跳过发 HPA0/HPD0 与还配置，
+            //   下次 activate 就成了空操作（= 必须重启 iPad）。
+            onStop = { stopProjection() }
         )
         // 投屏期间别让屏幕自己熄掉（熄屏会连带把 Surface 收走）
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -545,7 +549,35 @@ class IosActivity : Activity() {
      *
      * ⚠️ activate 之后**绝不能再碰任何配置**，一碰就打断重枚举（踩过：以为没反应，实际是被自己搅黄的）。
      */
+    /**
+     * 用户点了「停止投屏」。
+     *
+     * ★ **只置停止信号**，其余一概不做。理由：收尾必须走 capture() 的 finally ——
+     *   那里才会发`HPA0`/`HPD0`、放接口、把配置还回普通态、发 TCP FIN。
+     *   在这里直接关线程会跳过全部这些，下次 activate 变空操作（必须重启 iPad）。
+     *
+     * 为什么以前缺这个入口：只能靠返回键或拔线，而返回键那条路当时是断的
+     *（onDestroy 时 activeSession 已被置 null ⇒ 读循环收不到停止信号，2026-10-19 实测）。
+     */
+    private fun stopProjection() {
+        if (!running.getAndSet(false)) {
+            log("停止投屏：当前没有在投屏")
+            return
+        }
+        stopRequested = true
+        // 读循环的外部判据（见 QtSession.stopSignal）—— 这一行才是真正让会话停下来的
+        activeSession?.stopRequested = true
+        panel.setBusy(false)
+        panel.render(IosPanel.Stage.IDLE, getString(R.string.ios_status_idle))
+        log("用户请求停止投屏（已置停止信号，等待读循环退出并收尾）")
+    }
+
     private fun rearm() {
+        // ★ 必须复位 stopRequested ——
+        //   「停止投屏」把它置成 true 后，若不复位，本次 rearm 的等待循环
+        //   会在第一轮就退出（"收到停止信号，提前退出等待"），按钮等于白按。
+        //   autoRun() 也有同样一行，两条入口都要复位。
+        stopRequested = false
         running.set(true)
         panel.setBusy(true)
         panel.render(IosPanel.Stage.REARM, getString(R.string.ios_detail_rearm_hint))
@@ -579,7 +611,9 @@ class IosActivity : Activity() {
                 var sawLeave = false
                 var lastReport = 0L
                 var current: UsbDevice = dev
-                while (System.currentTimeMillis() - t0 < 240_000) {
+                // ★ 循环要认停止信号：否则用户点返回/停止后，这个线程还会占着 USB
+                //   最长 4 分钟（每 700ms 查一次设备表），而 Activity 已经没了。
+                while (!stopRequested && System.currentTimeMillis() - t0 < 240_000) {
                     val d = transport.findAppleDevice()
                     if (d != null) {
                         current = d
@@ -597,7 +631,8 @@ class IosActivity : Activity() {
                     }
                     Thread.sleep(700)
                 }
-                if (sawLeave) log("✗ 设备离开采集态后 240s 内没回来")
+                if (stopRequested) log("重新武装：已收到停止信号，提前退出等待")
+                else if (sawLeave) log("✗ 设备离开采集态后 240s 内没回来")
                 else log("✗ 240s 内设备根本没重枚举 ⇒ 只能拔插线或重启 iPad")
             }.onFailure { log("重新武装异常：${it.message}") }
             running.set(false)
@@ -661,7 +696,10 @@ class IosActivity : Activity() {
         val detached = deviceDetached.get()
 
         running.set(false)
-        activeSession = null
+        // ★ 这里**不能**立刻 activeSession = null —— 它是 onDestroy 唯一的停止通道：
+        //   `activeSession?.stopRequested = true` 走到这里已经是空操作，读循环收不到信号。
+        //   capture() 的 finally 已经跑完（收尾已完成），所以此刻置位不会有副作用。
+        //   真正的置 null 放到最后（return 之前），保持"字段非空 = 会话还在"的语义。
         // ★ 解码器停在最后一帧会让人以为"界面卡死了"：主动收掉，把画面让回黑底。
         //   下次开始时 QtSession 会重新收到 csd，`onCsdArrived` 会自己重建解码器。
         runCatching { decoder?.stop() }
@@ -701,6 +739,8 @@ class IosActivity : Activity() {
                 "FEED ${stats.feed}（${stats.feedBytes} B） / EAT ${stats.eat}（${stats.audioBytes} B）" +
                 " / 共 ${stats.bytes} B ===")
         }
+        // 收尾全部做完才清空会话引用 —— 见上面那条注释：早清会让 onDestroy 的停止信号落空
+        activeSession = null
     }
 
     private fun capture(): QtStats? {
@@ -823,8 +863,23 @@ class IosActivity : Activity() {
                                 )
                             }
                             muxThread = Thread({
+                                // ★ 连续失败也要能退出：端点真的死了（拔线 / USB 半释放）
+                                //   时会一直返回负值。pumpOnce 已经保证每次迭代至少 200ms，
+                                //   但没有上限就等于"永远重试"，线程和 USB 都得不到休息。
+                                val gate = com.uav.protocol.ios.LinkLossGate()
                                 while (keepAlive.get() && link.failed == null) {
-                                    runCatching { link.pumpOnce(200) }
+                                    val n = runCatching { link.pumpOnce(200) }.getOrDefault(-1)
+                                    if (n > 0) {
+                                        gate.onData()
+                                    } else {
+                                        val cause = gate.onFastFailure(
+                                            devicePresent = transport.findAppleDevice() != null
+                                        )
+                                        if (cause != null) {
+                                            log("✗ lockdown 保活中止：$cause（保活线程退出）")
+                                            break
+                                        }
+                                    }
                                 }
                             }, "mux-keepalive").apply { isDaemon = true; start() }
                         } else {
@@ -899,7 +954,11 @@ class IosActivity : Activity() {
                     onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) },
                     requestAudio = requestAudio,
                     // 读循环靠它判断"设备是不是已经不在设备表里了"（拔线检测的权威判据）
-                    linkAlive = { transport.findAppleDevice() != null }
+                    linkAlive = { transport.findAppleDevice() != null },
+                    // ★ 把 Activity 的停止信号接进读循环：返回键走 onDestroy 时
+                    //   activeSession 已被置 null，那边置位到不了这里（2026-10-19 实测
+                    //   「返回后界面没了、后台还在无限收流」）。传**函数**不是快照值。
+                    stopSignal = { stopRequested }
                 )
 
                 activeSession = session
@@ -938,7 +997,11 @@ class IosActivity : Activity() {
                     },
                     onAudio = { pcm, fmt -> audio?.feed(pcm, fmt) },
                     requestAudio = requestAudio,
-                    linkAlive = { transport.findAppleDevice() != null }
+                    linkAlive = { transport.findAppleDevice() != null },
+                    // ★ 把 Activity 的停止信号接进读循环：返回键走 onDestroy 时
+                    //   activeSession 已被置 null，那边置位到不了这里（2026-10-19 实测
+                    //   「返回后界面没了、后台还在无限收流」）。传**函数**不是快照值。
+                    stopSignal = { stopRequested }
                 )
                 activeSession = session
                 st = session.run(maxSeconds = 0, idleAbortSeconds = 12)

@@ -54,6 +54,7 @@ class IosPanel(private val activity: Activity) {
     private val logView: TextView = view(R.id.log)
     private val logScroll: ScrollView = view(R.id.log_scroll)
     private val btnRearm: Button = view(R.id.btn_rearm)
+    private val btnStop: Button = view(R.id.btn_stop)
     private val btnCollapse: View = view(R.id.btn_collapse)
 
     @Volatile
@@ -88,7 +89,8 @@ class IosPanel(private val activity: Activity) {
      */
     fun bind(
         onSurface: (Boolean) -> Unit,
-        onRearm: () -> Unit
+        onRearm: () -> Unit,
+        onStop: () -> Unit
     ) {
         surfaceView.holder.addCallback(object : android.view.SurfaceHolder.Callback {
             override fun surfaceCreated(holder: android.view.SurfaceHolder) {
@@ -105,6 +107,7 @@ class IosPanel(private val activity: Activity) {
         })
 
         btnRearm.setOnClickListener { onRearm() }
+        btnStop.setOnClickListener { onStop() }
         btnCollapse.setOnClickListener { setMenuVisible(false) }
         chipView.setOnClickListener { toggleMenu() }
 

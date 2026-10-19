@@ -334,9 +334,44 @@ internal class MuxLink(
     }
 
     /** 读一轮；超时返回 0。供握手与后台保活共用。 */
+    /**
+     * 读一次 mux 通道（保活用）。
+     *
+     * ★★★ **失败时必须睡满 [timeoutMs]，不能立刻返回**。
+     *
+     * 实测事故（2026-10-19 16:17）：`bulkTransfer` 在端点失效/USB 半释放时
+     * **瞬间返回 -1**（既不超时也不阻塞）。而调用方是这么写的：
+     *
+     * ```
+     * while (keepAlive.get() && link.failed == null) { link.pumpOnce(200) }
+     * ```
+     *
+     * 于是它变成**没有任何休眠的死循环**—— 实测 `mux-keepalive` 线程 5 秒内
+     * 烧掉 596 个时钟节拍（约 6 秒 CPU 时间），而主线程/解码线程全都在等它，
+     * 表现就是「App 卡死、画面全黑、解码器像是挂了」。
+     *
+     * ⚠️ 讽刺的是：这个空转把 USB 端点反复 submit/cancel URB，
+     *   **正好制造了它自己无法退出的那种状态**（另一轮里 `mux-keepalive`
+     *   卡进 D 状态 `usb_start_wait_urb`）⇒ 自锁。
+     *
+     * 所以：只要这一轮没拿到数据，就保证 [timeoutMs] 到点再返回，
+     * 让调用方每次迭代都有 200ms 的天然节流。
+     *
+     * @return 读到的字节数；`<= 0` 表示本轮没数据（超时或失败）
+     */
     fun pumpOnce(timeoutMs: Int): Int {
+        val t0 = android.os.SystemClock.elapsedRealtime()
         val n = conn.bulkTransfer(epIn, readBuf, readBuf.size, timeoutMs)
-        if (n <= 0) return n
+        if (n <= 0) {
+            // ★ 端点失效时 bulkTransfer 会瞬间返回，绝不能直接 return ——
+            //   必须把剩下的时间睡掉，否则调用方的 while 变成忙等死循环。
+            val spent = android.os.SystemClock.elapsedRealtime() - t0
+            val left = timeoutMs - spent
+            if (left > 0) {
+                runCatching { android.os.SystemClock.sleep(left) }
+            }
+            return n
+        }
         acc += readBuf.copyOfRange(0, n)
         var handled = 0
         while (true) {

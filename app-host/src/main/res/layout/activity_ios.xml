@@ -193,6 +193,22 @@
             android:drawableStart="@drawable/ic_refresh"
             android:text="@string/ios_btn_rearm" />
 
+        <!--
+          停止投屏：以前只能靠"返回键或拔线"结束，而返回键那条路当时是断的
+          （Activity 已销毁但读循环收不到停止信号 ⇒ 后台继续无限收流）。
+          这个按钮是用户唯一能明确表达"我要停"的入口。
+          ★ 它只置停止信号：真正的收尾（发 HPA0/HPD0 → 放接口 → 还配置）在
+            capture() 的 finally 里做，不在这里抢。
+        -->
+        <Button
+            android:id="@+id/btn_stop"
+            style="@style/HostTileRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:drawableStart="@drawable/ic_close"
+            android:text="@string/ios_btn_stop" />
+
         <!-- 日志卡片：吃掉剩余高度 -->
         <LinearLayout
             android:layout_width="match_parent"
