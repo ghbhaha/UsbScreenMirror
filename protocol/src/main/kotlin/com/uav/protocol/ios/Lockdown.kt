@@ -1,7 +1,7 @@
 package com.uav.protocol.ios
 
+import com.uav.protocol.B64
 import java.security.MessageDigest
-import java.util.Base64
 import java.util.Properties
 
 /**
@@ -210,8 +210,8 @@ class PairRecord(
     )
 
     companion object {
-        private fun b64(b: ByteArray): String = Base64.getEncoder().encodeToString(b)
-        private fun unb64(s: String): ByteArray = Base64.getDecoder().decode(s)
+        private fun b64(b: ByteArray): String = B64.encode(b)
+        private fun unb64(s: String): ByteArray = B64.decode(s)
 
         fun decode(text: String): PairRecord? = runCatching {
             val p = Properties()

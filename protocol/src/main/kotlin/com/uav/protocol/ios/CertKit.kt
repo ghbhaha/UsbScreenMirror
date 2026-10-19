@@ -1,5 +1,6 @@
 package com.uav.protocol.ios
 
+import com.uav.protocol.B64
 import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.KeyPair
@@ -13,7 +14,6 @@ import java.security.interfaces.RSAPublicKey
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.RSAPublicKeySpec
 import java.security.spec.X509EncodedKeySpec
-import java.util.Base64
 
 /**
  * 自建配对身份 —— 生成 lockdown `Pair` 请求要的那一整套证书/密钥。
@@ -266,7 +266,7 @@ object CertKit {
 
     /** 仅供自检：PEM 的 base64 是否可解。 */
     fun selfCheck(pem: ByteArray): Boolean = runCatching {
-        Base64.getDecoder().decode(
+        B64.decode(
             String(pem, Charsets.US_ASCII).lineSequence()
                 .filter { !it.startsWith("-----") && it.isNotBlank() }.joinToString("")
         )

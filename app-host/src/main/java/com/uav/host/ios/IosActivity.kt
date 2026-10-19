@@ -611,6 +611,7 @@ class IosActivity : Activity() {
                 } else {
                     log("✗ 自检隧道失败：${link.failed}")
                 }
+                link.shutdown("自检结束")
                 runCatching { transport.release(conn, itf) }
             } finally {
                 runCatching { conn.close() }
@@ -746,6 +747,7 @@ class IosActivity : Activity() {
         //    ★ 身份按设备取：配对记录是"主机 × 设备"这一对的关系，换设备各用各的
         val identity = Identity.load(this, ::log, Pairing.deviceKey(dev))
         var connMux: UsbDeviceConnection? = null
+        var muxLink: MuxLink? = null
         val keepAlive = java.util.concurrent.atomic.AtomicBoolean(true)
         var muxThread: Thread? = null
         val itfMux = if (!useLockdown) {
@@ -769,6 +771,7 @@ class IosActivity : Activity() {
                     } else {
                         log("建立 lockdown 会话（if#${itfMux.id}）…")
                         val link = MuxLink(cm, mi, mo, identity, ::log)
+                        muxLink = link
                         if (link.open()) {
                             log("★★ lockdown 会话在线（TLS=${link.tlsReady} 信任=${link.trusted}），开始保活")
                             // ★ 归属校验：「暂时接管」的旧版记录要靠**真的信任成功**才能转正
@@ -793,13 +796,17 @@ class IosActivity : Activity() {
         val connQt = conn
         if (!transport.claim(connQt, itf)) {
             log("claim QT 接口失败")
-            keepAlive.set(false); runCatching { connMux?.close() }; runCatching { connQt.close() }
+            keepAlive.set(false)
+            runCatching { muxLink?.shutdown("claim QT 失败") }
+            runCatching { connMux?.close() }; runCatching { connQt.close() }
             return null
         }
         val (epIn, epOut) = transport.bulkEndpoints(itf)
         if (epIn == null) {
             log("接口里没有 bulk IN 端点")
-            keepAlive.set(false); runCatching { connMux?.close() }; runCatching { connQt.close() }
+            keepAlive.set(false)
+            runCatching { muxLink?.shutdown("无 bulk IN") }
+            runCatching { connMux?.close() }; runCatching { connQt.close() }
             return null
         }
         log("QT 接口 if#${itf.id} 已 claim；IN=0x${epIn.address.toString(16)} " +
@@ -898,6 +905,9 @@ class IosActivity : Activity() {
                 //   —— 这正是「必须重启 iPad」的真正原因。
                 keepAlive.set(false)
                 runCatching { muxThread?.interrupt() }
+                // ★ 先 FIN 再放接口：设备侧那条 TCP 不主动关的话会一直 ESTABLISHED，
+                //   下次插上连 VERSION 都收不到（只能拔插 iPad）。
+                runCatching { muxLink?.shutdown("停止投屏") }
                 runCatching { itfMux?.let { transport.release(connMux!!, it) } }
                 runCatching { transport.release(connQt, itf) }
                 runCatching {

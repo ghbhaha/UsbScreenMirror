@@ -117,6 +117,7 @@ internal class Pairing(
             return null
         }
         var claimed = false
+        var link: MuxLink? = null
         try {
             if (!transport.setConfiguration(conn, cfg)) {
                 log("✗ 切到配置 id=${cfg.id} 失败")
@@ -134,14 +135,15 @@ internal class Pairing(
             }
 
             // 配对阶段还没有身份 —— MuxLink 只建隧道 + QueryType
-            val link = MuxLink(conn, epIn, epOut, null, log)
-            if (!link.openRaw()) {
-                log("✗ lockdown 隧道建立失败：${link.failed}")
+            link = MuxLink(conn, epIn, epOut, null, log)
+            val l = link
+            if (!l.openRaw()) {
+                log("✗ lockdown 隧道建立失败：${l.failed}")
                 return null
             }
 
-            val devicePub = fetchDevicePublicKey(link) ?: return null
-            val wifiMac = fetchWifiMac(link)
+            val devicePub = fetchDevicePublicKey(l) ?: return null
+            val wifiMac = fetchWifiMac(l)
             // 记录按设备分开存：键只在"配对之前"可用（见 deviceKey 的说明）
             val key = deviceKey(dev)
             log("设备 WiFiAddress=${wifiMac ?: "（未报）"}；设备键=$key")
@@ -152,7 +154,7 @@ internal class Pairing(
             log("★ 请在 iPad 上点「信任」")
 
             val record = doPair(
-                link, material, wifiMac,
+                l, material, wifiMac,
                 deviceSerial = if (key == KEY_UNKNOWN) null else key,
             ) ?: return null
             val file = PairStore.save(filesDir, key, record)
@@ -162,6 +164,9 @@ internal class Pairing(
             )
             return record
         } finally {
+            // ★ 先发 FIN 再放接口：否则设备侧那条 TCP 一直 ESTABLISHED，
+            //   下次插上连 VERSION 都收不到（只能拔插 iPad）。
+            link?.let { runCatching { it.shutdown("配对流程结束") } }
             if (claimed) runCatching { transport.release(conn, itf) }
             runCatching { conn.close() }
         }
@@ -171,7 +176,12 @@ internal class Pairing(
     private fun fetchDevicePublicKey(link: MuxLink): ByteArray? {
         val reply = link.request(Lockdown.getValue("UsbScreenMirror", key = "DevicePublicKey"))
         if (reply == null) {
-            log("✗ GetValue(DevicePublicKey) 无回复：${link.failed ?: "超时"}")
+            // ★ `request()` 返回的是"解析出来的 plist"，所以 null 有两种含义：
+            //   ① 真的没回包；② **回包来了但解析失败**（MuxLink 那边会单独打原文）。
+            //   以前一律说"超时"，会把②误导成链路/时序问题（实测踩过）。
+            val why = link.failed
+                ?: if (link.lastRequestReplied) "回包无法解析（见上一行原文）" else "超时"
+            log("✗ GetValue(DevicePublicKey) 无回复：$why")
             return null
         }
         reply.str("Error")?.let { log("✗ 取设备公钥被拒：$it"); return null }

@@ -84,6 +84,14 @@ internal class MuxLink(
     var lastReplyText: String? = null
         private set
 
+    /**
+     * 上一次 [request] 是否**收到了**回包（哪怕解析失败）。
+     *
+     * 用来区分"真超时"和"回包到了但 plist 不认"——后者以前会被报成超时。
+     */
+    var lastRequestReplied: Boolean = false
+        private set
+
     /** 设备是否要求 SSL（StartSession 的回复里）。 */
     @Volatile
     var sslRequired = false
@@ -172,7 +180,10 @@ internal class MuxLink(
 
         var pre = ByteArray(0)
         val end = System.currentTimeMillis() + 2000
-        while (System.currentTimeMillis() < end && pre.size < 8) {
+        // ⚠️ 必须攒够 20B 再判：设备的 VERSION 应答是 8B 头 + 12B 体，而一次 `bulkTransfer`
+        //   完全可能只回来头那 8B。原来这里写的是 `pre.size < 8` —— 拿到头就退出循环，
+        //   紧接着 `pre.size < 20` 判失败，把"只到了一半"错报成"设备没有应答"。
+        while (System.currentTimeMillis() < end && pre.size < 20) {
             val n = conn.bulkTransfer(epIn, readBuf, readBuf.size, 300)
             if (n > 0) pre += readBuf.copyOfRange(0, n)
         }
@@ -296,7 +307,10 @@ internal class MuxLink(
         while (replyCount == base && failed == null && System.currentTimeMillis() - t0 < timeoutMs) {
             pumpOnce(300)
         }
-        if (replyCount == base) return null
+        // ★ 回报"这次到底有没有回包"：request 返回 null 有两种含义 ——
+        //   真超时 / **回包到了但 plist 解析失败**，调用方要能分清（否则日志一律写"超时"）。
+        lastRequestReplied = replyCount != base
+        if (!lastRequestReplied) return null
         return lastReply
     }
 
@@ -387,19 +401,55 @@ internal class MuxLink(
 
     private fun onLockdown(msg: ByteArray) {
         val text = String(msg, Charsets.UTF_8)
-        val parsed = PlistXml.parse(text)
+        val result = PlistXml.parseDetailed(text)
+        val parsed = result.getOrNull()
         lastReplyText = text
         lastReply = parsed
         replyCount++
 
         val flat = text.replace("\n", " ").replace("\r", "").replace(Regex("\\s+"), " ")
         val err = parsed?.str("Error")
-        if (err != null) log("← lockdownd 报错 Error=$err")
-        else log("← lockdownd ${msg.size}B: ${flat.take(160)}")
+        if (err != null) {
+            log("← lockdownd 报错 Error=$err")
+        } else if (parsed == null) {
+            // ★ 解析失败要说清楚**为什么**：`request()` 返回的是 lastReply，解析不出来就等于
+            //   "没有应答"，上层只会看到"无回复/超时"，排查时会被带偏。
+            //   实测两回事都踩过：一是 `<data/>` 自闭合标签读不出来；二是 `java.util.Base64`
+            //   在 Android 7.1 上根本不存在（API 26+ 才有），异常被吞掉后同样只表现为"没回复"。
+            log("✗ lockdownd ${msg.size}B 回包**解析失败**：${result.exceptionOrNull()?.message ?: "未知原因"}")
+            log("  原文：${flat.take(900)}")
+        } else {
+            log("← lockdownd ${msg.size}B: ${flat.take(160)}")
+        }
     }
 
     /** 后台保活用：只推进管道，不解析语义。 */
     fun keepAliveTick() {
         runCatching { pumpOnce(200) }
+    }
+
+    /** 收尾是否已经做过（FIN 只能发一次）。 */
+    @Volatile
+    private var shutdownDone = false
+
+    /**
+     * 收尾：给设备发一个 **FIN**，让 usbmuxd 释放这条 TCP。
+     *
+     * ★ 不做这一步，设备侧那条连接会一直停在 ESTABLISHED（USB 没有"连接关闭"的概念，
+     *   我们只是把 fd 关了）⇒ 下一次插上时 VERSION 一个字节都等不到
+     *   （`2s 内无有效 VERSION 回复（0B）`），只能靠**拔插 iPad / 重启 iPad** 才恢复。
+     *   实测这台 V31103 上：成功过一次 VERSION 之后放弃，下一次必然 0B。
+     *
+     * 幂等：重复调用只发一次。
+     */
+    fun shutdown(reason: String = "结束会话") {
+        if (shutdownDone) return
+        shutdownDone = true
+        if (!connected) return
+        runCatching {
+            sendTcp(0x11)            // FIN
+            pumpOnce(150)            // 顺手把 FIN/ACK 读掉，别留半包
+        }
+        log("已向设备发 FIN（$reason），避免下次 VERSION 收不到")
     }
 }

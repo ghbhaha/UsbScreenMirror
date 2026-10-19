@@ -1,5 +1,6 @@
 package com.uav.protocol.ios
 
+import com.uav.protocol.B64
 import java.math.BigInteger
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -136,7 +137,7 @@ object Der {
 
     /** PEM 包装（64 字符换行）。 */
     fun pem(label: String, der: ByteArray): ByteArray {
-        val b64 = java.util.Base64.getEncoder().encodeToString(der)
+        val b64 = B64.encode(der)
         val sb = StringBuilder(b64.length + 64)
         sb.append("-----BEGIN ").append(label).append("-----\n")
         var i = 0
@@ -161,6 +162,6 @@ object Der {
         val b64 = text.lineSequence()
             .filter { !it.startsWith("-----") && it.isNotBlank() }
             .joinToString("")
-        return java.util.Base64.getDecoder().decode(b64)
+        return B64.decode(b64)
     }
 }

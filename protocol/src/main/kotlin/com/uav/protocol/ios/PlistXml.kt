@@ -1,5 +1,7 @@
 package com.uav.protocol.ios
 
+import com.uav.protocol.B64
+
 /**
  * lockdown 用的最小 plist 值模型 + XML 编解码。
  *
@@ -79,7 +81,7 @@ object PlistXml {
             is PValue.Data -> {
                 // 单行 base64：设备不关心换行，单行更好对照抓包
                 sb.append("<data>")
-                    .append(java.util.Base64.getEncoder().encodeToString(v.v))
+                    .append(B64.encode(v.v))
                     .append("</data>")
             }
             is PValue.Bool -> sb.append(if (v.v) "<true/>" else "<false/>")
@@ -106,7 +108,15 @@ object PlistXml {
     // ---------------------------------------------------------------- 解析
 
     /** 解析设备回包（XML plist）。失败返回 null —— 调用方按原文打日志。 */
-    fun parse(text: String): PValue? = runCatching { Parser(text).document() }.getOrNull()
+    fun parse(text: String): PValue? = parseDetailed(text).getOrNull()
+
+    /**
+     * 同 [parse]，但把失败原因带出来。
+     *
+     * ★ 排查时必须有这条：`parse` 返回 null 会被上层当成"设备没回复"，
+     *   只说"超时"永远定位不到是哪种元素读不出来（实测踩过一次 914B 回包解析失败）。
+     */
+    fun parseDetailed(text: String): Result<PValue> = runCatching { Parser(text).document() }
 
     private class Parser(private val s: String) {
         private var i = 0
@@ -144,8 +154,24 @@ object PlistXml {
             if (i >= s.length || s[i] != '<') return null
             val tagEnd = s.indexOf('>', i)
             require(tagEnd > i) { "标签截断" }
+            // ★ 自闭合标签（`<data/>`、`<string/>`）：**不能**再去正文里找 `</data>` ——
+            //   找不到会抛异常，整条 plist 直接被判"解析失败"。设备侧把空值写成自闭合是合法的，
+            //   实测就有一台 iPad 的 `GetValue` 回包因此解析不出来（表现成"无回复/超时"）。
+            val selfClosing = s[tagEnd - 1] == '/'
             val tag = s.substring(i + 1, tagEnd).trim().trimEnd('/')
             i = tagEnd + 1                      // ★ 先越过开标签，readText/readData 才从正文开始
+            if (selfClosing) {
+                return when (tag) {
+                    "dict" -> PValue.Dict(emptyList())
+                    "array" -> PValue.Array(emptyList())
+                    "string", "date", "real" -> PValue.Str("")
+                    "data" -> PValue.Data(ByteArray(0))
+                    "integer" -> PValue.Int(0L)
+                    "true" -> PValue.Bool(true)
+                    "false" -> PValue.Bool(false)
+                    else -> null
+                }
+            }
             return when (tag) {
                 "dict" -> dict(i)
                 "array" -> array(i)
@@ -208,7 +234,7 @@ object PlistXml {
             require(close > 0) { "<data> 未闭合" }
             val b64 = s.substring(i, close).filter { !it.isWhitespace() }
             i = close + 7
-            return java.util.Base64.getDecoder().decode(b64)
+            return B64.decode(b64)
         }
 
         private fun skipElement(from: Int, tag: String) {

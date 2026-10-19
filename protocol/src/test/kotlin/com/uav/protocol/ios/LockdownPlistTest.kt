@@ -135,4 +135,105 @@ class LockdownPlistTest {
         assertTrue(rec.hostCertPem.contentEquals(back.hostCertPem))
         assertTrue(rec.escrowBag!!.contentEquals(back.escrowBag!!))
     }
+
+    // ---------------------------------------------------------------- 解析健壮性
+
+    /**
+     * 自闭合标签（`<data/>`、`<string/>`）以前会把整条 plist 判成"解析失败"：
+     * [PlistXml] 遇到 `<data/>` 仍去正文找 `</data>`，找不到就抛异常 ——
+     * 上层只能看到 `request()` 返回 null，日志写成"无回复/超时"（实测一台 iPad
+     * 的 `GetValue` 回包就栽在这里）。
+     */
+    @Test
+    fun `自闭合标签不再让整条 plist 解析失败`() {
+        val text = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>Request</key><string>GetValue</string>
+                <key>Value</key><data/>
+                <key>Empty</key><string/>
+                <key>Nested</key><dict/>
+                <key>OK</key><true/>
+            </dict>
+            </plist>
+        """.trimIndent()
+
+        val v = PlistXml.parse(text)
+        assertNotNull("自闭合标签不应该让整条回包解析失败", v)
+        assertEquals("GetValue", v!!.str("Request"))
+        assertEquals(0, v.blob("Value")?.size)          // 空 data ⇒ 空数组，不是 null
+        assertEquals("", v.str("Empty"))
+        assertEquals(true, v.bool("OK"))
+    }
+
+    /** 真机形态：`GetValue(DevicePublicKey)` 回包，`Value` 是多行 base64 的 `<data>`。 */
+    @Test
+    fun `GetValue 回包里的多行 base64 data 能读出来`() {
+        val key = ByteArray(294) { (it * 7).toByte() }
+        val b64 = java.util.Base64.getEncoder().encodeToString(key)
+        val wrapped = b64.chunked(64).joinToString("\n\t")
+        val text = """
+            <plist version="1.0">
+            <dict>
+                <key>DevicePublicKey</key>
+                <data>
+                    $wrapped
+                </data>
+                <key>Type</key><string>com.apple.mobile.lockdown</string>
+            </dict>
+            </plist>
+        """.trimIndent()
+
+        val v = PlistXml.parse(text)
+        assertNotNull(v)
+        val got = v!!.blob("DevicePublicKey")
+        assertNotNull(got)
+        assertTrue("多行 base64 必须能还原", key.contentEquals(got!!))
+    }
+
+    /**
+     * 逐字复刻真机回包（iPad8,9 / iOS 27.2，`GetValue(DevicePublicKey)` 的 914B 应答）。
+     *
+     * 原文抓自 logcat，只把行尾统一成 `\n`。这条用例的意义是**锁住"设备怎么发我们就能读"**：
+     * 之前正是这条回包解析失败、被上层当成"设备没回复"，白排查了一轮链路。
+     */
+    @Test
+    fun `真机 GetValue(DevicePublicKey) 回包能被解析`() {
+        val reply = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+            	<key>Key</key>
+            	<string>DevicePublicKey</string>
+            	<key>Request</key>
+            	<string>GetValue</string>
+            	<key>Value</key>
+            	<data>
+            LS0tLS1CRUdJTiBSU0EgUFVCTElDIEtFWS0tLS0tCk1JSUJDZ0tDQVFFQXMxWFhFZEMz
+            cVB2T2t0TmVEMWlSVzNxeGJManZJckwxQ1IwdUhHVFgwRTRmMlFiVVo2Q3MNCnV5emRI
+            Z0pLeURmZlh3T3duK3VJTEdwNUlkN3EzakgrTlZpWGd2THBKQ1Q3UTR6UGl1c01YYVlI
+            Z1VTVDZjaGcNCmpaSmJFbVFGdHBRMHdOeFc1ZG9LZkNDUWRkRTVrSlNoYzNuM2VXTHU5
+            aUZXanZrSHZ3U3ZoYU5QSE4wSUM0d0sNClFNcHF5MVE1ejhiYzdMSXkyK2FWNm44ZmpN
+            UXdCUkpqRy9EQUc4alRqOUdaejZZV1RDN1hVZE04UG1JNE81bkcNCkEyWWdpSWJVM09G
+            WFRnRWdDK0I2K2g2TEgrSzU1OHdTVElEVXJTbERxc0s1b0pWREsvdWN6Ymovc2VKaTl2
+            VTANCk9FeEwwU1Zvdk9VWTZYZndPRis4WFJkYkVJcGttQlN3SFFJREFRQUIKLS0tLS1F
+            TkQgUlNBIFBVQkxJQyBLRVktLS0tLQo=
+            	</data>
+            </dict>
+            </plist>
+        """.trimIndent()
+
+        val r = PlistXml.parseDetailed(reply)
+        assertTrue("解析失败：${r.exceptionOrNull()}", r.isSuccess)
+        val v = r.getOrThrow()
+        assertEquals("DevicePublicKey", v.str("Key"))
+        val pem = v.blob("Value")
+        assertNotNull(pem)
+        val text = String(pem!!, Charsets.UTF_8)
+        assertTrue("解出来的必须是 PEM 公钥文本，实际开头：${text.take(40)}",
+            text.startsWith("-----BEGIN RSA PUBLIC KEY-----"))
+    }
 }
