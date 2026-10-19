@@ -1,7 +1,10 @@
-# QuickTime USB 协议在 Windows 上的复现（2026-10-18）
+# QuickTime USB 协议在 Windows 上的复现（2026-10-18，§四 于 10.19 更新）
 
 > 目标：用**自己写的源码**（Python + libusb0）驱动 Apple 设备的 QuickTime 采集接口，
 > 跑到「拿到视频流」这一步。代码在 `tools/qt-repro/`。
+>
+> ⚠️ **Android 端已按本文跑通**（2026-10-18 晚）。本文仍是协议的唯一权威参考——
+> Android 侧 `:protocol/ios/QtProtocolCore` 的每条应答都对齐到这里描述的行为。
 
 ---
 
@@ -42,6 +45,10 @@ pkt2: len=14140  magic='asyn'  clock=519940009743  sub='feed'
 
 其中 `ASYN/sprp 62B`、`57B` 与 iPhoneMirror 日志里的 `async_sprp bytes=62/57` **逐字节对得上**，
 说明我们解析到的包边界与官方实现一致。
+
+> **后续（10.18 晚）**：Android 宿主（`app-host/ios` + `:protocol/ios`）按同一套流程跑通，
+> 出画面出声音。**两端唯一的本质差异是 Android 必须自己建 lockdown 可信会话**，
+> 详见 §四。
 
 ---
 
@@ -102,23 +109,96 @@ activate → USBError [Errno 5]
 
 ## 四、★ 与 Android 端的关键差异
 
-**同一台 iPad、同一套协议，Windows 全通，Android 停在 PING。**
+> ⚠️ **本节已在 Android 端跑通后重写（10.19）。**
+> 原文把「PING 次数不同」当成了突破口，那是**把症状当原因**——见 4.4。
 
-| 阶段 | Windows（本复现） | Android（`app-probe`） |
+### 4.1 现状：两端都通，报文层逐字节一致
+
+Android 端（`:protocol/ios` + `app-host/ios`）现已跑通完整链路，出画面出声音：
+
+```
+PING#1 → 回写 16 B
+PING#2 → 回写 16 B
+CWPA audio=… → HPD1+clock+HPA1
+AFMT  → reply
+CVRP video=… → NEED+clock
+ASYN sprp 62B/57B、tbas 24B、tjmp 72B、srat 48B
+FEED #1 …（帧长 17~82KB 随画面浮动）
+```
+
+Windows 与 Android 的**报文层没有差异**：`QtProtocolCore` 的每条应答都是照
+`RayrenSX/iPhoneMirror` 的 `QuickTimeSession.cpp` 逐字节对齐的，两端抓包可对上。
+
+真正不同的只有**驱动/栈层**，以及一段**顺序**。
+
+### 4.2 真正的差异（实测会咬人的那些）
+
+| 维度 | Windows（libusb0） | Android（`UsbDeviceConnection`） | 踩过的坑 |
+|---|---|---|---|
+| **驱动栈** | libusb0 叠在 `AppleLowerFilter` 上 | 内核 `usbfs` | 切到描述符里不存在的配置会**蓝屏**（本机两次） |
+| **选配置** | `usb_set_configuration(5)` 显式切 | `captureConfiguration()` **定位**含 0x2A 的配置 | `dev.getInterface()` 那张扁平表是**所有配置的接口并集**，找到 0x2A ≠ 它当前活动 |
+| **setAltInterface** | **不做**（做了蓝屏） | **不做** | 参考实现会做，我们不做反而对 |
+| **clearHalt** | **不做** | **不做** | 做了会把 FIFO 里待读的 PING 冲掉，iOS 不重发 ⇒ 连 PING 都没有 |
+| **回写 PING** | 同步写 | **同步写**（`writeNow`） | 这是唯一不能进队列的报文：它是设备等着的握手 |
+| **会话顺序** | 靠系统 AMDS 借道 | **必须自己建** lockdown 会话 | 见 4.3 |
+
+> ⚠️ 三个"不做"（alt / clearHalt / kick）是 Windows 上踩出来、再被 Android 复用的。
+> 详见 `QtTransport` 的类注释——**别把它们加回去**，它们不是"省事"，是"正确"。
+
+### 4.3 ★ 唯一的本质差异：Android 必须自己建 lockdown 会话
+
+这是两端**唯一**的本质区别，也是 Android 从"只有 PING×1"到"拿到视频流"的全部原因。
+
+Windows 上 `usb_set_configuration(5)` 之后，系统里的 **Apple Mobile Device Service（AMDS）**
+已经替我们建好了 usbmux/lockdown 可信会话（PC 侧配对记录）。
+Android 没有这个服务—— **`setConfiguration(5)` 本身不会让设备开始推流**。
+
+所以 Android 端必须自己把整条会话走一遍，且**顺序不能反**：
+
+```
+activate(0x40/0x52, wIndex=2)   → 触发真实重枚举（激活可能延迟数十秒）
+  ↓ 等配置出现（别 deactivate！见 §3.3）
+mux if#1：VERSION → SETUP → TCP SYN → QueryType
+  → Pair（首次，设备弹「信任」）→ StartSession → TLS → GetValue → **后台保活**
+  ↓ 只有会话可信之后
+claim QT if#2（0xFF/0x2A，IN 0x86 / OUT 0x05）
+  ↓
+PING → CWPA → AFMT → CVRP → FEED
+```
+
+**三个条件必须同时满足，缺一不可**（10.18 逐个 A/B 验证过）：
+
+| 条件 | 缺失时的现象 |
+|---|---|
+| ① 设备刚开机、`activate` 触发**真实重枚举** | 连 PING 都没有 |
+| ② **受信任的 lockdown 会话**（Pair + StartSession + TLS + 保活） | 只有 PING×1，之后永久沉默 |
+| ③ **先建会话、再 claim QT**（AMDS 的顺序） | 同 ②；顺序反了等于没会话 |
+
+### 4.4 结论反转：「PING 次数」是判据，不是原因
+
+原文写「设备在 Windows 上会发第二次 PING，Android 只收到一次，这是最有价值的线索」——
+**方向反了。** 实测：
+
+| | PING×1 | PING×2 |
 |---|---|---|
-| PING | **两次** | **一次** |
-| CWPA | ✅ 第二次 PING 后到达 | ❌ 从不到达 |
-| HPD1 写入 | ✅ 成功 | ❌ `-1`（OUT 端点 STALL） |
-| FEED | ✅ 1260+ 帧 | — |
+| 会话可信？ | ❌ | ✅ |
+| 有 CWPA？ | 无 | 有 |
+| 有 FEED？ | 无 | 有 |
 
-「设备在 Windows 上会发第二次 PING」是目前最有价值的线索。
-Android 侧为什么只收到一次，尚未定位——可能的方向：
+**PING 次数是 lockdown 会话是否可信的"指示灯"，不是推流的开关。**
+在 `setConfiguration(5)` + `claim` 都做对之后，即使一个字节的会话流量都没有，
+设备**照样会发第一个 PING**（这正是当初误判"只差传输层"的由来）。
+第二个 PING 是设备确认"这个主机我认识"之后才发的，它对应的正是 `TrustedHostAttached`。
 
-1. Android 回写 PING 的字节/时序让设备认为"这次会话不需要再 PING"；
-2. Android 的 URB 提交方式（同步 bulkTransfer + 5s 超时）导致第二次 PING 被合并/丢弃；
-3. 两条 USB 主机栈在"短包"语义上的差异。
+所以想复现 Android 侧的失败，**不要去调 USB 读写**——把 `mux/lockdown/Pair/TLS`
+那一段走完，PING 就会变成两次，FEED 就会来。
 
-这条差异比之前所有猜测都具体，值得作为下一步的唯一突破口。
+### 4.5 顺带记一条：「PING×2 = 会推流」这个判据怎么用
+
+它是**免费**的：只看日志头部两行，不用等 20s 超时、不用看 FEED 计数。
+本项目把它同时用作**回归判据**——每次改 `QtProtocolCore` 的握手分支，
+先看 PING 有没有变成两次，再看 FEED 起没起来。
+**PING 仍是 1 ⇒ 别往下查视频，多半是会话/凭证层坏了。**
 
 ---
 
