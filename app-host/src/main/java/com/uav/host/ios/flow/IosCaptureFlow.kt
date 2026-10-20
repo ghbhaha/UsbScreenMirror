@@ -118,6 +118,15 @@ private class MuxGroup(
     /** 保活 Job；没建 lockdown 时为 null。 */
     var job: Job? = null,
 ) {
+    /**
+     * 是否已经完整收尾过。
+     *
+     * ★ 让 [close] 幂等：`rearmAndRunAgain` 切配置前必须先收一次 mux（否则
+     *   `setConfiguration` 一定 false），而 `teardown` 还会再收一次。第二次若照旧执行，
+     *   会多打一行 `releaseInterface(if#1) => false` —— 看着像新故障，其实只是重复收尾。
+     */
+    private val closed = AtomicBoolean(false)
+
     companion object {
         /** 「跳过 lockdown」的合法状态：每一项都空，收尾时全是空操作。 */
         fun empty(transport: QtTransport) = MuxGroup(transport)
@@ -135,6 +144,7 @@ private class MuxGroup(
 
     /** 完整收尾：先 FIN 再放接口再关连接（顺序见 [IosCaptureFlow.teardown]）。 */
     fun close() {
+        if (!closed.compareAndSet(false, true)) return
         closeKeepAliveOnly()
         val c = conn ?: return
         itf?.let { runCatching { transport.release(c, it) } }
@@ -414,6 +424,21 @@ internal class IosCaptureFlow(
         maxFrames: Int,
         idleAbortSeconds: Int,
     ): QtStats? {
+        // ★★ 切配置之前必须先把 mux 接口放掉。
+        //
+        //   内核规则：设备上只要还有一个接口被 claim 着，`setConfiguration` 就**直接返回 false**
+        //   （`QtTransport.setConfiguration` 的注释、`teardown` 里「先 mux.close() 再切配置」的顺序
+        //   都写着这一条）。从前这里只 release 了 QT 接口 if#2 —— 而 lockdown 的 mux 接口 if#1
+        //   挂在**另一条连接**上、保活线程还在 pump，于是 `4→5` 这一刀必然失败。
+        //   2026-10-20 18:10 实测：`setConfiguration(id=4) => false` / `(id=5) => false`，
+        //   而同一函数收尾时（mux 已 close）`setConfiguration(id=3) => true` —— 同一条规则的两面。
+        //
+        //   收掉 mux 同时满足另一条红线：放弃 mux 会话必须发 TCP FIN（`close()` 内部走 shutdown），
+        //   否则下一次连 VERSION 都收不到。
+        //
+        //   ⚠️ 重新武装后**不重建** lockdown：QT 收流本来就不依赖它（`openLockdown` 允许
+        //   "跳过 lockdown，直接 claim QT"），而重建会把刚 claim 回来的接口次序再打乱一遍。
+        s.mux.close()
         transport.release(s.conn, s.itf)
         val cfg4 = transport.configurationById(s.dev, 4)
         if (cfg4 != null) {
@@ -424,7 +449,11 @@ internal class IosCaptureFlow(
             log("  重新切回配置 ${s.cfg.id} 失败")
             return null
         }
-        transport.claim(s.conn, s.itf)
+        // 切配置会让之前的 claim 失效，必须重新 claim；claim 不上就别硬跑（否则又是一个 12s 零字节）
+        if (!transport.claim(s.conn, s.itf)) {
+            log("  重新武装后 claim QT 接口失败")
+            return null
+        }
         val (in2, out2) = transport.bulkEndpoints(s.itf)
         if (in2 == null) {
             log("  重新武装后没有 bulk IN")
