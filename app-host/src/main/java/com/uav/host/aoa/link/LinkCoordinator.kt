@@ -8,12 +8,12 @@ import android.os.SystemClock
 import android.os.Looper
 import com.uav.host.common.AndroidLogger
 import com.uav.host.common.DisplaySize
+import com.uav.host.aoa.flow.AoaStreamFlow
 import com.uav.host.aoa.input.HidTouchController
 import com.uav.host.aoa.session.HostSession
 import com.uav.host.aoa.usb.BulkByteChannel
 import com.uav.host.aoa.usb.BulkPair
 import com.uav.host.aoa.usb.UsbAttachRouter
-import com.uav.protocol.BufferedByteChannel
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.LinkRetry
@@ -26,7 +26,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import com.uav.protocol.aoa.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
 import com.uav.protocol.w
@@ -229,6 +228,86 @@ class LinkCoordinator(
      *   （会话会等不到 Surface 而失败），而且每次握手都会让手机**重新枚举**
      *   USB —— 切后台时反复重枚举纯属浪费，还会把自动重试配额耗掉。
      */
+    /**
+     * `HostSession.Listener` 的翻译层：**只把事实交回本类**，怎么解释留在这里。
+     *
+     * 以前这段内联在 `onReady()` 里，与"建通道/建 Transport"那几十行混在一起；
+     * 改动时很难判断某一行属于"装配"还是"状态机"。搬出去后
+     * [AoaStreamFlow] 只管装配，这里只管状态与界面。
+     */
+    private val streamBridge = object : AoaStreamFlow.Bridge {
+        override fun onStatus(text: String) = listener.onProgress(text)
+
+        override fun onVideoSize(width: Int, height: Int) {
+            // 尺寸（重）配置成功 = 重协商已见效 → 立刻清掉"切换中"标志，
+            // 免得它一直挂到 45s 兜底、把这段窗口里的真错误也吞掉。
+            clearExpectingRestart()
+            listener.onVideoSize(width, height)
+        }
+
+        override fun onFirstFrame() {
+            clearExpectingRestart()
+            waitingForPeerApp = false
+            listener.onFirstFrame()
+        }
+
+        override fun onClosed(reason: String) {
+            listener.onClosed(reason)
+            // ★ 10.32：这里**必须**把会话清掉，理由与 [handleSessionError] 完全一样 ——
+            //   轮询的接管条件是 `session == null`，不清就永远不会自动重连
+            //   （界面会一直停在"正在建立连接…"，实际一次都没去连）。
+            //
+            //   以前漏了没暴露：手机端 `close()` 从不发 CLSE，宿主这边总是因为
+            //   读失败走 `onError`，那条路径会清。后来手机端改成"停止时发 CLSE"，
+            //   才第一次走进这条分支 —— 表现就是"点了停止，宿主界面提示对了，
+            //   但画面再也回不来，还得拔插"。
+            mainHandler.post { stopSession() }
+            retry.onAttemptFailed()
+        }
+
+        override fun onError(message: String, cause: Throwable?) =
+            handleSessionError(message, cause)
+
+        override fun onPeerAppMissing() {
+            // ★ 必须清掉会话：轮询的接管条件是 `session == null`，
+            //   不清就会一直挂着一个已经死掉的会话，用户装好 App 也接不回来。
+            mainHandler.post { stopSession() }
+            // ★ 并且**停掉自动重试**（见 waitingForPeerApp 的说明）：
+            //   这里不计失败次数也没用 —— 链路层每轮都成功、
+            //   计数会被 onReady 清零，退避永远停在最小档。
+            waitingForPeerApp = true
+            peerAppMissingAt = SystemClock.elapsedRealtime()
+            listener.onPeerAppMissing()
+
+            // 自愈仍值得试一次：配件身份可能被"别的宿主 App"改写过，
+            // 那种情况系统不会拉起我们的配件 App，表现和"没装"一模一样。
+            val dev = lastDevice
+            if (fastPathUnverified && !forceRetried && dev != null) {
+                forceRetried = true
+                fastPathUnverified = false
+                logger.w(TAG, "快路径连上但没人应答 → 强制完整 AOA 握手重试一次")
+                listener.onSelfHealRequest(dev)
+            }
+        }
+    }
+
+    /** 装配层：连接 → 通道 → Transport → HostSession（见 [AoaStreamFlow] 的类注释）。 */
+    private val streamFlow = AoaStreamFlow(
+        logger = logger,
+        scope = scope,
+        appVersion = com.uav.host.BuildConfig.VERSION_CODE,
+        surfaceProvider = surfaceProvider,
+        displayArea = displayArea,
+        oneToOne = oneToOne,
+        audioEnabled = audioEnabled,
+        audioDelayMs = audioDelayMs,
+        panelSize = {
+            val p = DisplaySize.of(context)
+            intArrayOf(p.x, p.y)
+        },
+        bridge = streamBridge,
+    )
+
     /** 轮询循环的 Job（关页面时随 [close] 取消）。 */
     private var pollJob: Job? = null
 
@@ -519,90 +598,14 @@ class LinkCoordinator(
         currentConnection = connection
         onLinkEstablished(connection)
 
-        val raw = BulkByteChannel(connection, pair, logger)
-        // ★ 先把上一次会话残留在 FIFO 里的字节丢掉，再开新会话。
-        //   否则第一个 payload 会被当成流头解析，静默配错解码器（实测踩到过）。
-        raw.drainStaleInput()
-        bulkChannel = raw
-        // ★ 10.16 内核 panic 防线：协议层无论要多少（哪怕 24B 报文头），对内核的 bulkTransfer
-        //   永远整块（readChunkSize=16KB ≥ 端点包长 512B）发起，多到货的进残留缓冲续读。
-        //   直接把协议层的小请求透传给内核，MTK 主机栈不截断 actual_length → usercopy BUG → 重启
-        //   （实测：kmalloc-128 被要求拷 391B，Comm: uav-reader）。
-        val channel: ByteChannel = BufferedByteChannel(raw, pair.readChunkSize)
-        val transport = Transport(channel, logger, TAG)
-
-        val screen = DisplaySize.of(context)
-        val s = HostSession(
-            transport = transport,
-            localWidth = screen.x,
-            localHeight = screen.y,
-            // 握手时用它跟对端核对两端版本（10.39）
-            appVersion = com.uav.host.BuildConfig.VERSION_CODE,
-            surfaceProvider = surfaceProvider,
-            displayArea = displayArea,
-            oneToOne = oneToOne,
-            audioEnabled = audioEnabled(),
-            audioDelayMs = audioDelayMs(),
-            scope = scope,
-            logger = logger,
-            listener = object : HostSession.Listener {
-                override fun onStatus(text: String) = listener.onProgress(text)
-
-                override fun onVideoSize(width: Int, height: Int) {
-                    // 尺寸（重）配置成功 = 重协商已见效 → 立刻清掉"切换中"标志，
-                    // 免得它一直挂到 45s 兜底、把这段窗口里的真错误也吞掉。
-                    clearExpectingRestart()
-                    listener.onVideoSize(width, height)
-                }
-
-                override fun onFirstFrame() {
-                    clearExpectingRestart()
-                    waitingForPeerApp = false
-                    listener.onFirstFrame()
-                }
-
-                override fun onClosed(reason: String) {
-                    listener.onClosed(reason)
-                    // ★ 10.32：这里**必须**把会话清掉，理由与 [handleSessionError] 完全一样 ——
-                    //   轮询的接管条件是 `session == null`，不清就永远不会自动重连
-                    //   （界面会一直停在"正在建立连接…"，实际一次都没去连）。
-                    //
-                    //   以前漏了没暴露：手机端 `close()` 从不发 CLSE，宿主这边总是因为
-                    //   读失败走 `onError`，那条路径会清。后来手机端改成"停止时发 CLSE"，
-                    //   才第一次走进这条分支 —— 表现就是"点了停止，宿主界面提示对了，
-                    //   但画面再也回不来，还得拔插"。
-                    mainHandler.post { stopSession() }
-                    retry.onAttemptFailed()
-                }
-
-                override fun onError(message: String, cause: Throwable?) =
-                    handleSessionError(message, cause)
-
-                override fun onPeerAppMissing() {
-                    // ★ 必须清掉会话：轮询的接管条件是 `session == null`，
-                    //   不清就会一直挂着一个已经死掉的会话，用户装好 App 也接不回来。
-                    mainHandler.post { stopSession() }
-                    // ★ 并且**停掉自动重试**（见 waitingForPeerApp 的说明）：
-                    //   这里不计失败次数也没用 —— 链路层每轮都成功、
-                    //   计数会被 onReady 清零，退避永远停在最小档。
-                    waitingForPeerApp = true
-                    peerAppMissingAt = SystemClock.elapsedRealtime()
-                    listener.onPeerAppMissing()
-
-                    // 自愈仍值得试一次：配件身份可能被"别的宿主 App"改写过，
-                    // 那种情况系统不会拉起我们的配件 App，表现和"没装"一模一样。
-                    val dev = lastDevice
-                    if (fastPathUnverified && !forceRetried && dev != null) {
-                        forceRetried = true
-                        fastPathUnverified = false
-                        logger.w(TAG, "快路径连上但没人应答 → 强制完整 AOA 握手重试一次")
-                        listener.onSelfHealRequest(dev)
-                    }
-                }
-            },
-        )
-        session = s
-        s.start()
+        // ★ 装配与回调翻译都在 [AoaStreamFlow]：这里只留"顺序"与"状态"。
+        //   ⚠️ 顺序要求：stopSessionNow() 里会作废旧连接的 HID 注册，所以它必须排在
+        //   onLinkEstablished（绑定新连接）**之前** —— 反过来的话刚绑上就被清掉，
+        //   表现为触摸屏永远注册不上（踩过）。
+        val opened = streamFlow.open(connection, pair)
+        bulkChannel = opened.raw
+        session = opened.session
+        opened.session.start()
         // 建链成功但还没画面 ⇒ "连接中"。⚠️ 不能在这里报"投屏中"（画面还没出来）。
         listener.onProgress("链路已建立，等待 CNXN / 首帧…")
     }
