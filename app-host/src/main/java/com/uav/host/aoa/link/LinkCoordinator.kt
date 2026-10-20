@@ -16,6 +16,7 @@ import com.uav.host.aoa.usb.UsbAttachRouter
 import com.uav.protocol.BufferedByteChannel
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
+import com.uav.protocol.aoa.LinkRetry
 import com.uav.protocol.aoa.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
@@ -119,8 +120,16 @@ class LinkCoordinator(
      * 配件配置、踢掉手机端刚打开的 fd，三轮连发直接把手机打进"配件功能被锁"的死状态
      * （`svc usb getFunctions` 返回 `accessory`，此后软件手段全无效，**只能拔插线**）。
      * 用这个标志把连点合并成一次。
+     *
+     * ★ 2026-10-20：与"连续失败计数 + 退避间隔"合并进 [LinkRetry]（`:protocol`，有单测）。
+     *   三者互相耦合（成功清零 / 失败计数 / 计数决定间隔），分散写最容易出的错是
+     *   "某条路径忘了复位 ⇒ 入口永久锁死"—— 见 [LinkRetry] 的类注释。
      */
-    private val restartQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val retry = LinkRetry(
+        baseDelayMs = POLL_INTERVAL_MS,
+        maxShift = MAX_POLL_BACKOFF_SHIFT,
+        capDelayMs = MAX_POLL_INTERVAL_MS,
+    )
 
     /**
      * 「用户主动切换画质 / 正在重开会话」标志（10.17）。
@@ -150,13 +159,6 @@ class LinkCoordinator(
     /** 是否已经为本次连接做过一次强制重握手，避免死循环。 */
     @Volatile
     private var forceRetried = false
-
-    /**
-     * 连续建链失败次数（成功一次即归零），用于轮询退避。
-     *
-     * 用原子类而不是普通 int：`onError` 可能从会话线程过来，而 `onReady` 与轮询都在主线程。
-     */
-    private val consecutiveFailures = java.util.concurrent.atomic.AtomicInteger()
 
     /**
      * 是否停在"对端没人应答（多半没装配套 App）"上。
@@ -217,11 +219,9 @@ class LinkCoordinator(
      *
      * 为什么要退避：设备一直在、但握手一直失败时（例如它已被别的宿主 App 占成孤儿链路），
      * 固定 2 秒轮询会无休止重试；退避能在**不放弃**的前提下把空转降到最低。
-     * 建链成功后 [consecutiveFailures] 归零，立刻回到最快档。
+     * 建链成功后计数归零，立刻回到最快档。判据本身在 [LinkRetry]（有单测）。
      */
-    private fun nextPollDelayMs(): Long =
-        (POLL_INTERVAL_MS shl consecutiveFailures.get().coerceIn(0, MAX_POLL_BACKOFF_SHIFT))
-            .coerceAtMost(MAX_POLL_INTERVAL_MS)
+    private fun nextPollDelayMs(): Long = retry.pollDelayMs()
 
     // ------------------------------------------------------------------ 用户动作
 
@@ -368,8 +368,8 @@ class LinkCoordinator(
      *   单线程 FIFO 天然保证顺序，而且整段都不在主线程。
      */
     private fun restartSerial(then: () -> Unit) {
-        // 连点合并：见 [restartQueued]
-        if (!restartQueued.compareAndSet(false, true)) {
+        // 连点合并：见 [retry] / [LinkRetry.tryBeginAttempt]
+        if (!retry.tryBeginAttempt()) {
             logger.i(TAG, "已有一次链路重启在排队/执行中，忽略这次重复请求")
             return
         }
@@ -381,7 +381,8 @@ class LinkCoordinator(
                 }
                 then()
             } finally {
-                restartQueued.set(false)
+                // ★ 无条件交还：这里漏一次，之后所有扫描 / 插线都会被当成重复请求丢掉
+                retry.endAttempt()
             }
         }
         try {
@@ -450,7 +451,7 @@ class LinkCoordinator(
         logger.i(TAG, "link ready: aoaVersion=$aoaVersion device=${device.deviceId}")
 
         // 建链成功 -> 退避归零，轮询回到最快档
-        consecutiveFailures.set(0)
+        retry.onAttemptSucceeded()
 
         lastDevice = device
         // aoaVersion == 0 表示这次是按"已是配件、跳过握手"的快路径连的，
@@ -520,7 +521,7 @@ class LinkCoordinator(
                     //   才第一次走进这条分支 —— 表现就是"点了停止，宿主界面提示对了，
                     //   但画面再也回不来，还得拔插"。
                     mainHandler.post { stopSession() }
-                    consecutiveFailures.incrementAndGet()
+                    retry.onAttemptFailed()
                 }
 
                 override fun onError(message: String, cause: Throwable?) =
@@ -531,7 +532,7 @@ class LinkCoordinator(
                     //   不清就会一直挂着一个已经死掉的会话，用户装好 App 也接不回来。
                     mainHandler.post { stopSession() }
                     // ★ 并且**停掉自动重试**（见 waitingForPeerApp 的说明）：
-                    //   这里不计 consecutiveFailures 也没用 —— 链路层每轮都成功、
+                    //   这里不计失败次数也没用 —— 链路层每轮都成功、
                     //   计数会被 onReady 清零，退避永远停在最小档。
                     waitingForPeerApp = true
                     peerAppMissingAt = SystemClock.elapsedRealtime()
@@ -566,7 +567,7 @@ class LinkCoordinator(
             listener.onProgress("重协商未成功（$message），正在自动重试…")
             // ★ 串行：先关干净这条失败的会话，再重连（10.33）
             restartSerial { router?.scanAndAttach() }
-            consecutiveFailures.incrementAndGet()
+            retry.onAttemptFailed()
             return
         }
 
@@ -575,7 +576,7 @@ class LinkCoordinator(
         // ★ 自动重连：链路错误后**必须**把会话清掉 —— 轮询的接管条件是 `session == null`，
         //   不清就永远不会自动重试。注意 stopSession() 有 UI 调用，只能放主线程。
         mainHandler.post { stopSession() }
-        consecutiveFailures.incrementAndGet()
+        retry.onAttemptFailed()
         // 断线是"新情况"（设备可能马上回来），重置自动重试计数；
         // 否则几次偶发断线就会耗光配额，自动重连永久失效
         router?.resetAttempts()

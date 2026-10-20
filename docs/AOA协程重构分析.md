@@ -123,3 +123,16 @@ P3 之后 + P4 之后各做一次真机回归（宿主 P40UCH / 配件 HONOR MAA
 | 日期 | 事件 |
 |---|---|
 | 2026-10-20 | 建文档；基线为 `develop@c83b6d1`（`:protocol:test` 469 项） |
+| 2026-10-20 | **P5（部分）落地**：抽出 `:protocol/aoa/LinkRetry`（运行权 + 失败计数 + 退避间隔），`LinkCoordinator` 的三个原子量换成它；新增 6 项单测（总 475 项）。`P1/P2/P3/P4` 未动 |
+
+### 为什么先做这一小步
+
+`restartQueued` / `consecutiveFailures` / `nextPollDelayMs()` 三者是**耦合**的
+（成功要清零、失败要计数、计数决定轮询间隔），却各用一个原子量分散在 600 行里。
+最容易出的错正是 iOS 那次栽过的："某条路径忘了复位 ⇒ 入口永久锁死"——
+`restartQueued` 漏一次 `set(false)`，之后所有扫描 / 插线都会被当成重复请求丢掉，
+用户看到的就是"插上没反应"。
+
+把它们合成一个有单测的状态机之后，P3（`AoaLinkRun`）就有现成的地基：
+`LinkRetry` 管"谁有权跑一次"，`AoaLinkRun` 管"跑完怎么收尾"。
+
