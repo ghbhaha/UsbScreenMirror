@@ -12,10 +12,11 @@ import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.uav.host.R
-import com.uav.host.aoa.input.TouchForwarder
+import com.uav.host.aoa.capture.input.TouchForwarder
 import com.uav.host.aoa.flow.LinkCoordinator
-import com.uav.host.aoa.capture.HostSession
+import com.uav.host.aoa.capture.session.HostSession
 import com.uav.protocol.ui.HostUiState
+import com.uav.host.aoa.capture.video.AspectRatioSurfaceView
 
 /**
  * 宿主面板的**纯 View 层**（10.24 分层重构，从 [com.uav.host.aoa.HostActivity] 抽出）。

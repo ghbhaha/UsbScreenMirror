@@ -17,8 +17,8 @@ import com.uav.host.common.FocusMode
 import com.uav.host.common.FocusRing
 import com.uav.host.ios.IosActivity
 import com.uav.host.aoa.HostActivity
-import com.uav.host.aoa.capture.BulkPair
-import com.uav.host.aoa.capture.UsbAttachRouter
+import com.uav.host.aoa.capture.usb.BulkPair
+import com.uav.host.aoa.capture.usb.UsbAttachRouter
 import com.uav.protocol.usb.UsbDeviceClassify
 import com.uav.protocol.usb.UsbDeviceKind
 

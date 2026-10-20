@@ -10,11 +10,11 @@ import com.uav.host.common.AndroidLogger
 import com.uav.host.common.DisplaySize
 import com.uav.host.aoa.flow.AoaStreamFlow
 import com.uav.host.aoa.run.AoaLinkRun
-import com.uav.host.aoa.input.HidTouchController
-import com.uav.host.aoa.capture.HostSession
-import com.uav.host.aoa.capture.BulkByteChannel
-import com.uav.host.aoa.capture.BulkPair
-import com.uav.host.aoa.capture.UsbAttachRouter
+import com.uav.host.aoa.capture.input.HidTouchController
+import com.uav.host.aoa.capture.session.HostSession
+import com.uav.host.aoa.capture.usb.BulkByteChannel
+import com.uav.host.aoa.capture.usb.BulkPair
+import com.uav.host.aoa.capture.usb.UsbAttachRouter
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.LinkRetry

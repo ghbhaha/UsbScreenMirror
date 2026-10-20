@@ -1,4 +1,4 @@
-package com.uav.host.aoa.media
+package com.uav.host.aoa.capture.audio
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -6,7 +6,7 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
 import com.uav.host.common.AndroidLogger
-import com.uav.host.aoa.capture.HostSession
+import com.uav.host.aoa.capture.session.HostSession
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.Frame
 import com.uav.protocol.aoa.StreamHeader

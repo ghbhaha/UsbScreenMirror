@@ -1,8 +1,8 @@
-package com.uav.host.aoa.media
+package com.uav.host.aoa.capture.video
 
 import android.content.Context
 import com.uav.host.common.HostPrefs
-import com.uav.host.aoa.capture.HostSession
+import com.uav.host.aoa.capture.session.HostSession
 import com.uav.host.aoa.ui.HostPanel
 import com.uav.protocol.Logger
 import com.uav.protocol.i

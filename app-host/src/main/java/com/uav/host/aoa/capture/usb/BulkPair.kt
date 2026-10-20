@@ -1,4 +1,4 @@
-package com.uav.host.aoa.capture
+package com.uav.host.aoa.capture.usb
 
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection

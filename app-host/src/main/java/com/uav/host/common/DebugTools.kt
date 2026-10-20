@@ -1,7 +1,7 @@
 package com.uav.host.common
 import com.uav.host.BuildConfig
 import com.uav.host.aoa.HostActivity
-import com.uav.host.aoa.debug.FileByteChannel
+import com.uav.host.aoa.capture.debug.FileByteChannel
 /**
  * 宿主侧调试入口总开关（计划 5.2）。
  *

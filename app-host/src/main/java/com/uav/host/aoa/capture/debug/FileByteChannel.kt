@@ -1,4 +1,4 @@
-package com.uav.host.aoa.debug
+package com.uav.host.aoa.capture.debug
 
 import com.uav.host.common.AndroidLogger
 import com.uav.protocol.ByteChannel

@@ -1,8 +1,8 @@
 package com.uav.host.aoa.run
 
 import android.view.Surface
-import com.uav.host.aoa.debug.FileByteChannel
-import com.uav.host.aoa.capture.HostSession
+import com.uav.host.aoa.capture.debug.FileByteChannel
+import com.uav.host.aoa.capture.session.HostSession
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.Transport
 import kotlinx.coroutines.CoroutineScope

@@ -3,10 +3,10 @@ package com.uav.host.aoa.flow
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
-import com.uav.host.aoa.capture.Aoa
-import com.uav.host.aoa.capture.AoaHandshake
-import com.uav.host.aoa.capture.BulkPair
-import com.uav.host.aoa.capture.claimBulkPair
+import com.uav.host.aoa.capture.usb.Aoa
+import com.uav.host.aoa.capture.usb.AoaHandshake
+import com.uav.host.aoa.capture.usb.BulkPair
+import com.uav.host.aoa.capture.usb.claimBulkPair
 import com.uav.protocol.Logger
 
 /**

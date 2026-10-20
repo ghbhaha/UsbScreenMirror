@@ -4,8 +4,8 @@ import android.os.Handler
 import android.os.SystemClock
 import com.uav.host.common.DebugTools
 import com.uav.host.aoa.flow.LinkCoordinator
-import com.uav.host.aoa.capture.HostSession
-import com.uav.host.aoa.media.QualityController
+import com.uav.host.aoa.capture.session.HostSession
+import com.uav.host.aoa.capture.video.QualityController
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.CloseReason
 import com.uav.protocol.aoa.StreamHealth

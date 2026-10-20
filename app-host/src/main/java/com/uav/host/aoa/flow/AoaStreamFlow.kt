@@ -2,9 +2,9 @@ package com.uav.host.aoa.flow
 
 import android.hardware.usb.UsbDeviceConnection
 import android.view.Surface
-import com.uav.host.aoa.capture.HostSession
-import com.uav.host.aoa.capture.BulkByteChannel
-import com.uav.host.aoa.capture.BulkPair
+import com.uav.host.aoa.capture.session.HostSession
+import com.uav.host.aoa.capture.usb.BulkByteChannel
+import com.uav.host.aoa.capture.usb.BulkPair
 import com.uav.protocol.BufferedByteChannel
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger

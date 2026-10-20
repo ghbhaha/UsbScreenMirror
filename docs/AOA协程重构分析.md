@@ -52,20 +52,34 @@
 
 ```
 aoa/
-├── capture/            ← USB 与协议资源，几乎纯搬运
-│   ├── usb/            AoaHandshake, BulkPair, BulkByteChannel, UsbAttachRouter
+├── capture/            ← USB 与协议资源，几乎纯搬运（✅ 已落地）
+│   ├── usb/            AoaHandshake, BulkPair, BulkByteChannel, UsbAttachRouter, HidInjector
 │   ├── session/        HostSession（只瘦身，不重写）
-│   ├── video/ audio/ input/ debug/
-├── flow/               ← 【新】编排，suspend
-│   ├── AoaConnectFlow   权限 → 50/51/52/53 → 等重枚举 → 建 Transport
-│   └── AoaStreamFlow    建会话 → 统计 → 断链判定 → 交回上层决定是否重连
-├── run/                ← 【新】运行权与收尾
-│   └── AoaLinkRun       轮询 / 退避 / 重连去重（现在在 LinkCoordinator 里）
-├── ui/                 HostPanel + HostUiState（不动）
-└── HostActivity        只装配 + 生命周期 + 状态推进（目标 <300 行）
+│   ├── video/          VideoDecoder, QualityController, AspectRatioSurfaceView
+│   ├── audio/          AudioPlayer
+│   ├── input/          TouchForwarder, HidTouchController
+│   └── debug/          DebugIntents, FileByteChannel
+├── flow/               ← 【新】编排（✅ 已落地）
+│   ├── AoaConnectFlow   权限 → 51/52/53 → 等重枚举 → 建 Transport
+│   ├── AoaStreamFlow    建会话 → 统计 → 断链判定 → 交回上层决定是否重连
+│   └── LinkCoordinator  **降级为调度器**：编排"连/断/重连"的先后
+├── run/                ← 【新】运行权与收尾（✅ 已落地）
+│   ├── AoaLinkRun       串行队列 + 运行权（关会话 / 重新握手都排队）
+│   └── AoaReplay        `.uav` 回放（调试通路）
+├── ui/                 HostPanel + HostPresenter（事件 → 状态机 → 面板）
+└── HostActivity        只装配 + 生命周期 + Intent + Surface 回调
 ```
 
 `LinkCoordinator` 保留但**降级为调度器**：不再自己起线程、不再自己判断"该不该重连"。
+
+⚠️ 与本文原稿的两处差异（落地后回填）：
+
+1. `LinkCoordinator` 归 `flow/` 而不是留在 `capture/` —— 它编排的是"连/断/重连的先后"，
+   而运行权本身在 `run/AoaLinkRun`。放在 `capture/` 会让"资源"和"顺序"混在一起。
+2. `HostActivity` 实际 **477 行**，没到 <300。事件翻译（`linkListener` / `qualityListener` /
+   `statsTicker`，~140 行）已搬进 `ui/HostPresenter`；剩下的是 `onCreate` 装配（~80 行）、
+   Surface/Intent/调试入口（~120 行）、回放入口（~40 行）——再往 300 压只能把装配拆成工厂，
+   那是**换个地方放同样的行数**，不做。
 
 ## 五、分阶段计划
 
@@ -128,6 +142,7 @@ P3 之后 + P4 之后各做一次真机回归（宿主 P40UCH / 配件 HONOR MAA
 | 2026-10-20 | **P6 收尾**：`.uav` 回放从 `HostActivity` 搬进 `aoa/run/AoaReplay`（依赖经 `Deps` 注入，`lateinit` 字段用 getter 取）。⚠️ **`HostActivity` 只从 656 降到 651 行** —— 拆出去 77 行、又写回 ~35 行 Deps，本步买到的是"调试通路可单独阅读"，不是瘦身 |
 | 2026-10-20 | **事件翻译出 Activity**：`linkListener` / `qualityListener` / `statsTicker` 三个匿名对象 + `uiState` 字段（~140 行）搬进 `aoa/ui/HostPresenter`（依赖经 `Host` 接口以 getter 注入）。`HostActivity` **659 → 477 行**，主状态行从此只有一个推进者；顺带补回被搬家带走的 `stopStats()`（`onDestroy` 里拔掉自递归的 `postDelayed`，否则它会握着已销毁的 Activity 继续每秒刷新） |
 | 2026-10-20 | **分层落地**（与 iOS 对齐）：`usb/` + `session/` → `capture/`；`link/` → `flow/`；`audio/` + `video/` → `media/`（`AspectRatioSurfaceView` 归 `ui/`）；`input/ ui/ debug/ run/` 不变。纯搬包，一行逻辑没改；⚠️ 布局里两个 Activity 用全限定类名引用那个 View，已同步（漏改 = 装上就 InflateException）。真机：宿主与 iOS 两个页面都能 inflate，AOA 首帧 872x1920 |
+| 2026-10-20 | **按 §四 原稿重排**（`911c5c6` 那版是扁平分层 + 自造 `media/`，偏离本文）：`capture/{usb,session,video,audio,input,debug}` 嵌套、`flow/`（含 `LinkCoordinator`）、`run/`、`ui/`；纯搬包 • 布局类名同步 `capture.video.AspectRatioSurfaceView` • 两个页面真机 inflate 通过 |
 | 2026-10-20 | **P3 + P4 剩余落地**：`AoaConnectFlow`（握手 → 等重枚举 → claim，权限经 `Permission` 回调注入）从 `UsbAttachRouter.runPipeline` 搬出；`AoaLinkRun`（串行队列 + 运行权 + 队列关闭时另起线程）从 `LinkCoordinator` 的内联 `ioExecutor` 搬出。真机：快路径首帧、`force_handshake`（aoaVersion=2）全流程、连点合并（router `busy` 挡下第二次）均正常 |
 | 2026-10-20 | **P1 轮询段真机验证通过**：拔线 → `detach broadcast` 后 31ms `host session stopped`；插回 → 设备在表里约 1.5s 后由 **`轮询发现设备 id=2030（第 1 次尝试）`** 接上（该路径以前只能靠 ATTACHED 广播），握手重枚举 `aoaVersion=2` → 首帧，**拔到画面恢复 6.9s**，全程零告警、HID 只重注册一次 |
 | 2026-10-20 | **P4（第一步）落地**：会话装配从 `LinkCoordinator.onReady()` 搬进 `aoa/flow/AoaStreamFlow`（连接 → 通道 → Transport → HostSession），回调经 `Bridge` 翻译回调度器；`LinkCoordinator` 保留"顺序 + 状态"（**行数基本不变** —— 桥从"方法内内联对象"变成"具名字段"，本步买的是**职责边界**不是行数）。真机：快路径与 `force_handshake` 两条装配路径都正常（第二次 610ms 出首帧） |
