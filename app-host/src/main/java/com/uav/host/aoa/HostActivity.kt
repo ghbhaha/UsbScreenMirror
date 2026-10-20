@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.WindowManager
 import androidx.core.content.IntentCompat
@@ -25,6 +26,7 @@ import com.uav.host.aoa.debug.FileByteChannel
 import com.uav.host.aoa.input.HidTouchController
 import com.uav.host.aoa.input.TouchForwarder
 import com.uav.host.aoa.link.LinkCoordinator
+import com.uav.host.aoa.run.AoaReplay
 import com.uav.host.aoa.session.HostSession
 import com.uav.host.aoa.ui.HostPanel
 import com.uav.host.aoa.usb.BulkPair
@@ -96,8 +98,41 @@ class HostActivity : Activity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** 回放通道（`.uav` 调试模式）；与 USB 会话互斥。 */
-    private var replayChannel: FileByteChannel? = null
+    /**
+     * `.uav` 回放（调试通路，与 USB 会话互斥）。
+     *
+     * 依赖用 getter/方法传进去：`panel` / `link` 都是 `lateinit`，
+     * 不能在构造期取快照；而这些依赖也只有真正回放时才被调用。
+     */
+    private val replay = AoaReplay(object : AoaReplay.Deps {
+        override val scope get() = link.sessionScope
+        override val logger get() = this@HostActivity.logger
+        override val appVersion = com.uav.host.BuildConfig.VERSION_CODE
+
+        override fun panelSize(): IntArray {
+            val p = DisplaySize.of(this@HostActivity)
+            return intArrayOf(p.x, p.y)
+        }
+
+        override fun surface(): Surface? = panel.currentSurface()
+
+        override fun adopt(session: HostSession) = link.adoptReplaySession(session)
+
+        override fun stopCurrentSession() = link.stopSession()
+
+        override fun onProgress(text: String) {
+            uiState.onProgress(text)
+            render()
+        }
+
+        override fun onStarted(label: String) {
+            uiState.onReplay(label)
+            render()
+        }
+
+        override fun onError(message: String, cause: Throwable?) =
+            linkListener.onError(message, cause)
+    })
 
     private var tickCount = 0L
 
@@ -567,53 +602,11 @@ class HostActivity : Activity() {
             logger.w(TAG, "release 构建不支持 .uav 回放（请用 debug 包）: ${file.name}")
             return
         }
-        link.stopSession()
-        // 不回环：抓流里的"流头"只在该流首条 WRTE 有效，循环第二遍时这 12B 会被当成
-        // 一帧解析而报错。要看第二遍就再触发一次回放。
-        // 配速默认开启（按帧 PTS 还原真实速度），否则会把深度 4 的队列冲爆。
-        val channel = FileByteChannel(file, logger, paceByPts = true)
-        replayChannel = channel
-        val transport = Transport(channel, logger, TAG)
-        val screen = DisplaySize.of(this)
-
-        val s = HostSession(
-            transport = transport,
-            localWidth = screen.x,
-            localHeight = screen.y,
-            surfaceProvider = { panel.currentSurface() },
-            logger = logger,
-            replay = true,
-            appVersion = com.uav.host.BuildConfig.VERSION_CODE,
-            listener = replayListener,
-            // 回放也要有个作用域：握手流程在 replay 下会直接返回，但构造参数是必填的
-            scope = link.sessionScope,
-        )
-        link.adoptReplaySession(s)
-        s.start()
-        uiState.onReplay("回放：${file.name}（${channel.totalBytes} 字节）")
-        render()
-    }
-
-    /**
-     * 回放会话的回调：**只接进度**，其余事件一律忽略。
-     *
-     * ⚠️ 回放模式下没有链路可言，报"已断开 / 出错"会让状态机说谎；
-     *   画面与统计照常由 `HostSession` 自己驱动。
-     */
-    private val replayListener = object : HostSession.Listener {
-        override fun onStatus(text: String) {
-            uiState.onProgress(text)
-            render()
-        }
-
-        override fun onError(message: String, cause: Throwable?) {
-            linkListener.onError(message, cause)
-        }
+        replay.start(file)
     }
 
     private fun closeReplay() {
-        replayChannel?.close()
-        replayChannel = null
+        replay.close()
     }
 
     // ------------------------------------------------------------------ 渲染
