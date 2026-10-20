@@ -17,6 +17,12 @@ import com.uav.protocol.BufferedByteChannel
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.LinkRetry
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import com.uav.protocol.aoa.Transport
 import com.uav.protocol.e
 import com.uav.protocol.i
@@ -125,6 +131,18 @@ class LinkCoordinator(
      *   三者互相耦合（成功清零 / 失败计数 / 计数决定间隔），分散写最容易出的错是
      *   "某条路径忘了复位 ⇒ 入口永久锁死"—— 见 [LinkRetry] 的类注释。
      */
+    /**
+     * 会话侧协程作用域。
+     *
+     * 只跑**可挂起**的部分（握手流程、原地重协商）；USB 读写与解码仍在各自的专用线程上
+     * —— `bulkTransfer` 不可中断，协程取消打不断卡在 URB 上的调用。
+     * 生命周期跟着 [close]：`scope.cancel()` 之后所有挂起中的握手立刻退出。
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineName("uav-aoa"))
+
+    /** 给回放会话用：它不在本类里构造，但同样要把握手协程挂在这个作用域上。 */
+    val sessionScope: CoroutineScope get() = scope
+
     private val retry = LinkRetry(
         baseDelayMs = POLL_INTERVAL_MS,
         maxShift = MAX_POLL_BACKOFF_SHIFT,
@@ -209,6 +227,8 @@ class LinkCoordinator(
         router?.close()
         router = null
         stopSession()
+        // ★ 会话先停、作用域后取消：反过来的话握手协程可能在收尾中间被掐断
+        scope.cancel()
         // 不 shutdownNow：正在跑的关闭任务被中断的话，fd 可能真的漏掉
         // （`/dev/usb_accessory` 独占，漏一个就永久连不回来）。
         ioExecutor.shutdown()
@@ -286,12 +306,14 @@ class LinkCoordinator(
         mainHandler.removeCallbacks(clearExpectingRestart)
         mainHandler.postDelayed(clearExpectingRestart, RESTART_FLAG_TIMEOUT_MS)
 
-        Thread({
-            val ok = try {
-                s.renegotiate()
+        // ★ 协程而不是裸线程：`renegotiate()` 内部是可取消的挂起等待（`withTimeoutOrNull`），
+        //   页面销毁时随 [scope] 一起取消，不必等满那 5 秒超时。
+        scope.launch(CoroutineName("uav-renegotiate")) {
+            var ok = false
+            try {
+                ok = s.renegotiate()
             } catch (t: Throwable) {
                 logger.w(TAG, "原地重协商异常: ${t.message}", t)
-                false
             } finally {
                 renegotiating.set(false)
             }
@@ -302,7 +324,7 @@ class LinkCoordinator(
                     router?.scanAndAttach()
                 }
             }
-        }, "uav-renegotiate").apply { isDaemon = true }.start()
+        }
     }
 
     /**
@@ -491,6 +513,7 @@ class LinkCoordinator(
             oneToOne = oneToOne,
             audioEnabled = audioEnabled(),
             audioDelayMs = audioDelayMs(),
+            scope = scope,
             logger = logger,
             listener = object : HostSession.Listener {
                 override fun onStatus(text: String) = listener.onProgress(text)

@@ -124,6 +124,21 @@ P3 之后 + P4 之后各做一次真机回归（宿主 P40UCH / 配件 HONOR MAA
 |---|---|
 | 2026-10-20 | 建文档；基线为 `develop@c83b6d1`（`:protocol:test` 469 项） |
 | 2026-10-20 | **P5（部分）落地**：抽出 `:protocol/aoa/LinkRetry`（运行权 + 失败计数 + 退避间隔），`LinkCoordinator` 的三个原子量换成它；新增 6 项单测（总 475 项）。`P1/P2/P3/P4` 未动 |
+| 2026-10-20 | **P2（握手段）落地**：`HostSession` 的两个 `CountDownLatch` → `CompletableDeferred` + `withTimeoutOrNull`；`sessionFlow` / `sendOpen` / `renegotiate` 变 `suspend`，握手从"占一条 `uav-session` 线程"变成"挂起";`LinkCoordinator` 持有 `scope`，重协商从裸线程改协程。读循环仍为线程（见 §六.1） |
+
+### P2 的具体做法（为什么不是全量协程化）
+
+| 位置 | 之前 | 现在 |
+|---|---|---|
+| 等对端 `CNXN` | `CountDownLatch.await(5s)`，占住 `uav-session` 线程 | `withTimeoutOrNull(5s) { peerCnxnSignal.await() }`，不占线程 |
+| 等 `OKAY` | 同上（`openAckLatch`） | 同上（每次 OPEN 换一只 `CompletableDeferred`） |
+| 收尾 | `sessionThread.interrupt()` | `sessionJob.cancel()`（挂起中的等待立刻退出） |
+| 原地重协商 | 裸 `Thread("uav-renegotiate")` | `scope.launch(CoroutineName("uav-renegotiate"))` |
+| `uav-decode` / `uav-audio-in` | 线程 | **仍是线程**（`MediaCodec`/`AudioTrack` 阻塞写，且与读循环的时序耦合，不动） |
+
+判定标准只有一条：**这个等待"能不能被打断"**。能（纯等待）就协程化；不能（`bulkTransfer`、
+`MediaCodec.release`、`AudioTrack.write`）就留在专用线程上。
+
 
 ### 为什么先做这一小步
 

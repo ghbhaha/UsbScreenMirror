@@ -585,6 +585,8 @@ class HostActivity : Activity() {
             replay = true,
             appVersion = com.uav.host.BuildConfig.VERSION_CODE,
             listener = replayListener,
+            // 回放也要有个作用域：握手流程在 replay 下会直接返回，但构造参数是必填的
+            scope = link.sessionScope,
         )
         link.adoptReplaySession(s)
         s.start()

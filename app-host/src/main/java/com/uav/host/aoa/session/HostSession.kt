@@ -20,6 +20,13 @@ import com.uav.protocol.aoa.FrameQueue
 import com.uav.protocol.aoa.GopTailGate
 import com.uav.protocol.aoa.Protocol
 import com.uav.protocol.aoa.StreamId
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import com.uav.protocol.aoa.Transport
 import com.uav.protocol.d
 import com.uav.protocol.e
@@ -32,8 +39,6 @@ import com.uav.protocol.media.Options
 import com.uav.protocol.media.Scale
 import com.uav.protocol.w
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -103,6 +108,18 @@ class HostSession(
      * 用户切到 1:1 后重协商仍下发 `max_size=1920 display_area=-`）。
      */
     private val oneToOne: () -> Boolean = { true },
+
+    /**
+     * 会话所在的作用域（由 `LinkCoordinator` 持有）。
+     *
+     * 为什么需要它：握手里的两处"等对端"（CNXN / OKAY）以前是 `CountDownLatch`，
+     * 一等就是 5 秒且**不可取消** —— 页面关掉、用户重连，线程还得把 5 秒等完。
+     * 换成协程后超时是 `withTimeoutOrNull`，收尾直接 `cancel()`。
+     *
+     * ⚠️ 读循环（`uav-decode` / `uav-audio-in`）**仍然是线程**：`bulkTransfer` 不可中断，
+     * 协程的取消打不断卡在 URB 上的调用（iOS 侧实测卡死数分钟，只能关连接）。
+     */
+    private val scope: CoroutineScope,
 ) {
 
     interface Listener {
@@ -189,24 +206,25 @@ class HostSession(
     /** 音频 CONFIG 只该生效一次；重复到达时说明手机端重发了（重连），需要重配。 */
     private var audioConfigured = AtomicBoolean(false)
 
-    private val peerCnxnLatch = CountDownLatch(1)
+    private val peerCnxnSignal = CompletableDeferred<Unit>()
 
     /**
      * 等待手机 `OKAY`（OPEN 应答）。
      *
      * ⚠️ 是 `var` 而不是 `val`：**原地重协商**（10.18）要在同一条连接上重发 OPEN，
-     * 每次都得换一只新闩（`CountDownLatch` 是一次性的）。`sendOpen()` 里先换闩再发，
-     * 并用**局部引用**等待，避免与下一次重协商互相干扰。
+     * 每次都得换一只新的 `CompletableDeferred`（一次性、完成即定型）。`sendOpen()` 里
+     * 先换再发，并用**局部引用**等待，避免与下一次重协商互相干扰。
      */
     @Volatile
-    private var openAckLatch = CountDownLatch(1)
+    private var openAckSignal = CompletableDeferred<Boolean>()
 
     private val closed = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
 
     private var connection: Connection? = null
     private var consumerThread: Thread? = null
-    private var sessionThread: Thread? = null
+    /** 握手协程（收尾时 cancel；不再是一条裸线程）。 */
+    private var sessionJob: Job? = null
 
     @Volatile
     private var decoder: VideoDecoder? = null
@@ -353,15 +371,12 @@ class HostSession(
             isDaemon = true
             start()
         }
-        sessionThread = Thread({ sessionFlow() }, "uav-session").apply {
-            isDaemon = true
-            start()
-        }
+        sessionJob = scope.launch(Dispatchers.IO + CoroutineName("uav-session")) { sessionFlow() }
     }
 
     // ------------------------------------------------------------------ 握手
 
-    private fun sessionFlow() {
+    private suspend fun sessionFlow() {
         if (replay) {
             logger.i(TAG, "回放模式：跳过 CNXN/OPEN 握手，直接消费抓流数据")
             listener.onStatus("回放模式：跳过握手")
@@ -380,7 +395,7 @@ class HostSession(
             connection?.send(Command.CNXN, Protocol.VERSION, appVersion, payload)
             listener.onStatus("CNXN 已发送（本机 ${localWidth}x$localHeight），等待手机尺寸…")
 
-            if (!peerCnxnLatch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            if (withTimeoutOrNull(TIMEOUT_MS) { peerCnxnSignal.await() } == null) {
                 // ★ 对端在配件模式下"人不在"：CNXN 发出去 5 秒一个字节都没回。
                 //   正常情况配件端 App 收到会立刻应答，所以这不是链路问题。
                 peerSilent("等待手机 CNXN 超时（${TIMEOUT_MS}ms）：配件模式下对端没有任何应答")
@@ -410,7 +425,7 @@ class HostSession(
      *
      * @return true = 收到 OKAY；false = 超时（由调用方决定报错还是回退）
      */
-    private fun sendOpen(): Boolean {
+    private suspend fun sendOpen(): Boolean {
         // ★ max_size 由宿主计算后下发（计划 4.3）：CNXN 交换后两边尺寸都已知。
         //   10.15 起按**视频显示区**算（1:1 像素映射），并把显示区一并下发 ——
         //   这样手机端旋转时能自己重算（见 ParsedOpen.encodeMaxSize），不必重新协商。
@@ -456,8 +471,8 @@ class HostSession(
         }
 
         // ★ 换一只新闩再发：重协商时上一只可能已经被用掉/等待中
-        val latch = CountDownLatch(1)
-        openAckLatch = latch
+        val signal = CompletableDeferred<Boolean>()
+        openAckSignal = signal
         connection?.send(Command.OPEN, StreamId.CONTROL, 0, Options.buildPayload(options))
         val sizeSrc = when {
             availW > 0 && availH > 0 ->
@@ -477,7 +492,7 @@ class HostSession(
                 "bitrate=$bitrate(${bitrate / 1000}kbps, 基准 ${Options.DEFAULT_VIDEO_BIT_RATE / 1000}kbps 按面积缩)"
         )
 
-        if (!latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS)) return false
+        if (withTimeoutOrNull(TIMEOUT_MS) { signal.await() } != true) return false
         listener.onStatus("会话已建立，等待视频流…")
         return true
     }
@@ -498,7 +513,7 @@ class HostSession(
      *
      * @return true = 新参数已生效（收到 OKAY）；false = 不可用/超时，**调用方应回退到断开重连**
      */
-    fun renegotiate(): Boolean {
+    suspend fun renegotiate(): Boolean {
         if (replay) return false
         if (closed.get() || !running.get()) return false
         if (connection == null) return false
@@ -533,12 +548,12 @@ class HostSession(
                         logger.w(TAG, "CNXN payload 只有 ${message.payload.size} 字节，期望 8")
                     }
                     estimateClockOffset(recvNanos, message.payload)
-                    peerCnxnLatch.countDown()
+                    peerCnxnSignal.complete(Unit)
                 }
 
                 Command.OKAY -> {
                     logger.i(TAG, "OKAY received for stream ${StreamId.name(message.arg0)}")
-                    openAckLatch.countDown()
+                    openAckSignal.complete(true)
                 }
 
                 Command.OPEN -> {
@@ -1015,11 +1030,12 @@ class HostSession(
         // ★ 排在最关键的释放之前，保证它一定被执行
         consumerThread?.interrupt()
         audioThread?.interrupt()
-        sessionThread?.interrupt()
+        // ★ 握手协程靠 cancel 退出：它在 withTimeoutOrNull 里挂起，不占线程
+        sessionJob?.cancel()
+        sessionJob = null
         quiet("connection.close") { connection?.close() }
         consumerThread = null
         audioThread = null
-        sessionThread = null
         logger.i(TAG, "host session stopped")
     }
 
