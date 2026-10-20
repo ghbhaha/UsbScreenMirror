@@ -221,6 +221,24 @@ class HostSession(
     private val closed = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
 
+    /**
+     * 收尾（[stopInternal]）是否已经跑过。
+     *
+     * ★ 为什么不是复用 [closed]：两者的语义不同 —— [closed] 挡的是**回调**
+     *   （`fail` / `peerSilent` 开头就 `if (closed.get()) return`，避免对已经死掉的会话
+     *   再报一次错），而一次失败正常收尾时**不会**把它置上。于是 `fail()` 先
+     *   `stopInternal()`、上层紧接着又 `session.close()`（`close` 的 CAS 只挡自己），
+     *   收尾跑两遍、`host session stopped` 打两遍（2026-10-20 真机日志）。
+     *
+     * ⚠️ 守卫必须放在**释放方法内部**，不能写回 `close()`：内存里那条教训是
+     *   "幂等标志把入口锁死" —— 谁先置位、谁没做完清理，之后所有 `close()` 全部
+     *   直接 return，fd 永远释放不掉。放在这里则天然满足"任何路径都走同一处释放"。
+     *
+     * 之所以敢在这里 CAS：下面每一步都已经 `quiet()` 包住，本方法不会中途抛异常，
+     * 不存在"置了位却没释放完"的窗口。
+     */
+    private val stopped = AtomicBoolean(false)
+
     private var connection: Connection? = null
     private var consumerThread: Thread? = null
     /** 握手协程（收尾时 cancel；不再是一条裸线程）。 */
@@ -581,7 +599,8 @@ class HostSession(
         }
 
         override fun onClosed(reason: String) {
-            if (closed.get()) return
+            // 抢占终态：`CLSE` 之后紧接着的读写失败不该再变成一条"链路错误"
+            if (closed.getAndSet(true)) return
             listener.onClosed(reason)
             stopInternal()
         }
@@ -981,7 +1000,14 @@ class HostSession(
     }
 
     private fun fail(message: String, cause: Throwable? = null) {
-        if (closed.get()) return
+        // ★ 抢占终态，而不是"检查后再收尾"。
+        //
+        //   一条连接上**多个线程**都可能撞到同一个故障：读线程的 `readFully` 超时、
+        //   消费线程在等同一条流头、写线程的下一次 `bulkTransfer`。它们几乎同时调用
+        //   `fail()`，如果只写 `if (closed.get()) return`，两边都能通过检查，
+        //   于是同一个原因被上报两遍 —— 真机 6ms 内两条「链路错误」+ 两次自愈
+        //   （2026-10-20 13:48:27.456 / .462）。`getAndSet` 让只有第一个到这里的人继续。
+        if (closed.getAndSet(true)) return
         logger.e(TAG, message, cause)
         listener.onError(message, cause)
         stopInternal()
@@ -1002,7 +1028,8 @@ class HostSession(
      * 而不是"错误 + 等自动重连"——后者在缺 App 时永远不会成功。
      */
     private fun peerSilent(message: String) {
-        if (closed.get()) return
+        // 与 [fail] 同样的抢占：这条也是终态，后来的第二个"没人应答"不该再报一遍
+        if (closed.getAndSet(true)) return
         logger.e(TAG, message)
         listener.onPeerAppMissing()
         stopInternal()
@@ -1024,6 +1051,23 @@ class HostSession(
      * 现在每一步各自 `runCatching`，最后一步 `connection.close()` 无论如何都会跑到。
      */
     private fun stopInternal() {
+        // ★ 只跑一次：`fail()` / `peerSilent()` 已经收过尾之后，上层还会再 `close()` 一次，
+        //   重复释放不仅日志骗人（两行 host session stopped），`connection.close()` 也会被调两遍。
+        if (!stopped.compareAndSet(false, true)) {
+            logger.d(TAG, "收尾已执行过，跳过重复释放")
+            return
+        }
+        // ★ 收尾 = 会话终结 ⇒ 此后一律不再派发回调。
+        //
+        //   以前 [closed] 只在 `close()` 里置位，而 `fail()` / `Connection.onClosed` 收尾时不动它：
+        //   一条连接同时有读线程和写线程，读失败先 `fail()`，紧接着写线程也失败 ⇒
+        //   `onError` 再进来一次，同一个原因被上报两遍、上层打两条「链路错误」、
+        //   连自愈也跟着触发两次「快路径失败 → 强制完整握手」（2026-10-20 真机：.241 / .244）。
+        //
+        //   放在这里而不是 `fail()` 里：`fail` / `peerSilent` / `Connection.onClosed` / `close`
+        //   四条路径都会走到收尾，只在收尾处统一关门才不会漏。
+        //   ⚠️ 顺序仍然正确 —— 三个回调都是**先** `listener.onXxx()`、**后** `stopInternal()`。
+        closed.set(true)
         running.set(false)
         quiet("videoQueue.close") { videoQueue.close() }
         quiet("audioQueue.close") { audioQueue.close() }

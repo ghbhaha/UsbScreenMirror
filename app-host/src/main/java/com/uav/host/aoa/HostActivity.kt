@@ -366,6 +366,14 @@ class HostActivity : Activity() {
             render()
         }
 
+        override fun onLinkEstablished(text: String) {
+            // ★ 硬事实：重连成功要把上一次的「链路出错 / 无输出」拉回「连接中」。
+            //   以前这里只有一条 onProgress，而进度事件按规矩不动主行 ⇒ 自动重连
+            //   明明成功了（音频都恢复了），主行还挂着 ERROR（2026-10-20 真机）。
+            uiState.onLinkEstablished(text)
+            render()
+        }
+
         override fun onVideoSize(width: Int, height: Int) {
             // ★ 10.23：尺寸就绪只用来给"重协商中"收尾，**不能**提前宣告投屏中
             //   （还没出画面就报"投屏中"是同一类错误，只是方向相反）。

@@ -38,8 +38,10 @@ import com.uav.protocol.aoa.StreamHealth
  * [phase] 保持 [Phase.MIRRORING]。
  *
  * ⚠️ 另一个方向的降级是**允许**的且必需的：[onRenegotiate] 可以把 `MIRRORING`
- * 降成 `RENEGOTIATING`（用户主动操作，不是乱序事件），[onClosed] 可以降成 `CONNECTING`。
- * 换句话说：**只有显式的用户动作 / 断链能降级，随波逐流的进度事件不能。**
+ * 降成 `RENEGOTIATING`（用户主动操作，不是乱序事件），[onClosed] 可以降成 `CONNECTING`，
+ * [onLinkEstablished] 可以把 `ERROR` / `NO_SIGNAL` 拉回 `CONNECTING`（重连成功是**硬事实**，
+ * 旧结论必须让位）。换句话说：**只有显式的用户动作、断链、以及"链路已建立"这类硬事实
+ * 能改变阶段，随波逐流的进度事件不能。**
  */
 class HostUiState {
 
@@ -180,6 +182,32 @@ class HostUiState {
         phase = Phase.CONNECTING
         peerStopped = true
         detail = "手机端已停止投屏 —— 在手机上点「授予录屏权限」即可恢复"
+    }
+
+    /**
+     * 链路**已建立**（AOA 握手完成、会话对象已在跑，还没等 CNXN / 首帧）。
+     *
+     * ★ 这是**硬事实**，不是进度事件 —— 所以它有权把已经落到 [Phase.ERROR] /
+     *   [Phase.NO_SIGNAL] 的主状态行拉回 [Phase.CONNECTING]。
+     *
+     * 为什么必须单独开一个事件：以前这里只发一条 `onProgress("链路已建立…")`，
+     * 而 [onProgress] 按"进度事件不得降级"的规矩不动主行 ⇒ 自动重连明明成功了，
+     * 主行却永远钉在「链路出错」，副行却在刷"链路已建立"（2026-10-20 真机：
+     * 手机端息屏导致旧会话读超时 → 轮询 0.9 秒后重连成功、音频已恢复，
+     * 界面仍显示出错）。**结论（ERROR）对了，但它已经不是当前结论了。**
+     *
+     * 反方向的克制同样重要：这里**只**处理 ERROR / NO_SIGNAL，
+     * [Phase.MIRRORING] / [Phase.REPLAY] / [Phase.NO_ACCESSORY_APP] 一律不动 ——
+     * 它们要么比"连接中"更靠后，要么是必须粘住的结论（见 [onPeerAppMissing]）。
+     *
+     * @param text 副行文案；空串表示"别动副行"（[peerStopped] 置位时也不覆盖，
+     *   那条"手机端已停止投屏"要一直留到真的重新出画面）
+     */
+    fun onLinkEstablished(text: String = "") {
+        if (phase == Phase.ERROR || phase == Phase.NO_SIGNAL) {
+            phase = Phase.CONNECTING
+        }
+        if (text.isNotEmpty() && !peerStopped) detail = text
     }
 
     /** 链路断开（`onClosed`）⇒ 回到连接中（前台轮询会自动重试，不是终态）。 */

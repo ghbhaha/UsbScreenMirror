@@ -163,6 +163,58 @@ class HostUiStateTest {
         assertEquals(HostUiState.Phase.CONNECTING, s.phase)
     }
 
+    // ---------------------------------------------------------------- 链路已建立（硬事实）
+
+    @Test
+    fun `重连成功把出错拉回连接中`() {
+        // 2026-10-20 真机：手机息屏 ⇒ 读超时 ⇒ ERROR；0.9 秒后轮询重连成功，
+        // 音频已恢复，主行却永远钉在「链路出错」—— 因为旧代码只发了 onProgress。
+        val s = HostUiState()
+        s.onError("readFully timeout after 0/12 bytes")
+        s.onLinkEstablished("链路已建立，等待 CNXN / 首帧…")
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+        assertEquals("链路已建立，等待 CNXN / 首帧…", s.detail)
+    }
+
+    @Test
+    fun `无输出状态下重连成功也回到连接中`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onStreamHealth(StreamHealth.State.STOPPED, silentMs = 9_000)
+        assertEquals(HostUiState.Phase.NO_SIGNAL, s.phase)
+        s.onLinkEstablished("链路已建立，等待 CNXN / 首帧…")
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+    }
+
+    @Test
+    fun `投屏中的链路已建立不该被降级`() {
+        // 理论上重连前一定先 onClosed，但状态机不能靠"上游一定先发 A"来保证正确性。
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onLinkEstablished("链路已建立，等待 CNXN / 首帧…")
+        assertEquals(HostUiState.Phase.MIRRORING, s.phase)
+    }
+
+    @Test
+    fun `缺 App 的结论不被链路已建立冲掉`() {
+        // NO_ACCESSORY_APP 是"对端没软件接管"的结论，重连时必然又走一遍握手；
+        // 这时候把它刷成"连接中"，用户就再也看不到那句"去装配套 App"。
+        val s = HostUiState()
+        s.onPeerAppMissing()
+        s.onLinkEstablished("链路已建立，等待 CNXN / 首帧…")
+        assertEquals(HostUiState.Phase.NO_ACCESSORY_APP, s.phase)
+    }
+
+    @Test
+    fun `对端停止投屏的副行不被链路已建立刷掉`() {
+        val s = HostUiState()
+        s.onPeerStopped()
+        val pinned = s.detail
+        s.onLinkEstablished("链路已建立，等待 CNXN / 首帧…")
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+        assertEquals(pinned, s.detail)
+    }
+
     // ---------------------------------------------------------------- 流健康（10.30）
 
     @Test

@@ -70,6 +70,15 @@ class LinkCoordinator(
         /** 会话进度（对应 `HostSession.Listener.onStatus`）。 */
         fun onProgress(text: String) {}
 
+        /**
+         * 链路**已建立**（AOA 握手完成、`HostSession` 已在跑，还没等 CNXN / 首帧）。
+         *
+         * ★ 与 [onProgress] 分开：进度事件按规矩不许改动主状态行，而这条是**硬事实**
+         *   —— 它必须能把上一次的「链路出错」拉回「连接中」，否则自动重连成功了、
+         *   界面还停在错误上（2026-10-20 真机踩到）。
+         */
+        fun onLinkEstablished(text: String) {}
+
         /** 视频尺寸就绪（解码器 configure 成功）。 */
         fun onVideoSize(width: Int, height: Int) {}
 
@@ -561,7 +570,9 @@ class LinkCoordinator(
         session = opened.session
         opened.session.start()
         // 建链成功但还没画面 ⇒ "连接中"。⚠️ 不能在这里报"投屏中"（画面还没出来）。
-        listener.onProgress("链路已建立，等待 CNXN / 首帧…")
+        // ★ 走 onLinkEstablished 而不是 onProgress：后者不动主行，会把上一次的
+        //   「链路出错」永远留在屏幕上（重连成功也是白搭）。
+        listener.onLinkEstablished("链路已建立，等待 CNXN / 首帧…")
     }
 
     /**
