@@ -9,7 +9,6 @@ import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.WindowManager
@@ -22,24 +21,18 @@ import com.uav.host.common.AndroidLogger
 import com.uav.host.common.DebugTools
 import com.uav.host.common.DisplaySize
 import com.uav.host.aoa.debug.DebugIntents
-import com.uav.host.aoa.debug.FileByteChannel
 import com.uav.host.aoa.input.HidTouchController
 import com.uav.host.aoa.input.TouchForwarder
 import com.uav.host.aoa.link.LinkCoordinator
 import com.uav.host.aoa.run.AoaReplay
 import com.uav.host.aoa.session.HostSession
 import com.uav.host.aoa.ui.HostPanel
-import com.uav.host.aoa.usb.BulkPair
+import com.uav.host.aoa.ui.HostPresenter
 import com.uav.host.aoa.usb.UsbAttachRouter
 import com.uav.host.aoa.video.QualityController
 import com.uav.host.aoa.video.VideoDecoder
-import com.uav.protocol.aoa.CloseReason
 import com.uav.protocol.aoa.Protocol
-import com.uav.protocol.aoa.StreamHealth
-import com.uav.protocol.aoa.Transport
-import com.uav.protocol.e
 import com.uav.protocol.i
-import com.uav.protocol.ui.HostUiState
 import com.uav.protocol.w
 import java.io.File
 
@@ -60,7 +53,7 @@ import java.io.File
  * | 调试 | [DebugIntents] | adb extra → 动作（release 门控） | 一切实现细节 |
  *
  * 本类剩下的是**它们之间唯一的粘合剂**：生命周期回调、Surface 回调、
- * 状态机（[HostUiState]）的推进、以及"一次重协商"的编排。
+ * 以及"一次重协商"的编排。事件 → 状态机 → 面板的翻译在 [HostPresenter] 里。
  *
  * ## 不变的东西
  *
@@ -80,23 +73,46 @@ class HostActivity : Activity() {
     /** 触摸注入控制器。链接失败、Surface 销毁、Activity 结束都会用到它。 */
     private var hidTouch: HidTouchController? = null
 
+    private val logger = AndroidLogger
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     /**
-     * 面板状态机（10.23，纯逻辑在 `:protocol/HostUiState`，有 JVM 单测）。
+     * 事件 → 状态机 → 面板（见 [HostPresenter] 的类注释）。
      *
-     * ★ **以前状态行是被事件流无条件覆盖的**，而事件里混着"瞬时进度"与"持久状态"两种语义。
-     *   现在主状态行只由 [render] 按阶段渲染，进度文本降级为副行信息。
+     * 原来这里是三个匿名对象（`linkListener` / `qualityListener` / `statsTicker`）
+     * 加一个 `uiState` 字段，共 ~140 行 —— 它们一条都不碰生命周期，却和
+     * `onCreate` / `onDestroy` / 回放 / 调试入口挤在同一个文件里。
+     *
+     * ⚠️ 依赖用 getter 传入：`panel` / `link` / `quality` 都是 `lateinit`，
+     *   构造期取快照会拿到 null（与 [replay] 同一个理由）。
      */
-    private val uiState = HostUiState()
+    private val presenter = HostPresenter(
+        object : HostPresenter.Host {
+            override val panel get() = this@HostActivity.panel
+            override val link get() = this@HostActivity.link
+            override fun oneToOne() = quality.oneToOne
+            override fun peerAppMissingDetail() = getString(R.string.host_detail_peer_app_missing)
+
+            override fun onVideoGeometry(
+                peerWidth: Int,
+                peerHeight: Int,
+                width: Int,
+                height: Int,
+            ) {
+                touch.onGeometry(peerWidth, peerHeight, width, height)
+                hidTouch?.updateGeometry(peerWidth, peerHeight, width, height)
+            }
+        },
+        mainHandler,
+        logger,
+    )
 
     /** 是否向手机请求音频（10.13）。调试入口 `--ez no_audio true` 可关。 */
     private var audioEnabled = true
 
     /** 音频起播延迟（A/V 粗补偿），可由 `--ei audio_delay_ms N` 调整。 */
     private var audioDelayMs = HostSession.DEFAULT_AUDIO_DELAY_MS
-
-    private val logger = AndroidLogger
-
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
      * `.uav` 回放（调试通路，与 USB 会话互斥）。
@@ -120,54 +136,13 @@ class HostActivity : Activity() {
 
         override fun stopCurrentSession() = link.stopSession()
 
-        override fun onProgress(text: String) {
-            uiState.onProgress(text)
-            render()
-        }
+        override fun onProgress(text: String) = presenter.onProgress(text)
 
-        override fun onStarted(label: String) {
-            uiState.onReplay(label)
-            render()
-        }
+        override fun onStarted(label: String) = presenter.onReplayStarted(label)
 
         override fun onError(message: String, cause: Throwable?) =
-            linkListener.onError(message, cause)
+            presenter.onError(message, cause)
     })
-
-    private var tickCount = 0L
-
-    /**
-     * 流健康度判定（10.30）。纯逻辑在 `:protocol/StreamHealth`，有 JVM 单测。
-     *
-     * ⚠️ 它要解决的不是"链路断了"（那种有 onClosed/onError），而是**链路好着、对面不动了**：
-     *   手机端编码器静默卡死时，以前宿主状态行照旧写「投屏中」，用户只看到画面冻住。
-     */
-    private val streamHealth = StreamHealth()
-
-    /** 上一拍的健康度与"静默秒数"，用来避免每秒都重绘面板。 */
-    private var lastHealthState = StreamHealth.State.HEALTHY
-    private var lastSilentSec = -1L
-
-    /** 链路统计的周期刷新。UI 用紧凑形状，日志用完整形状（见 [HostSession.statsCompact]）。 */
-    private val statsTicker = object : Runnable {
-        override fun run() {
-            val s = link.session
-            val uiText = when {
-                s != null -> s.statsCompact()
-                else -> link.bulkStats() ?: "无活动会话"
-            }
-            panel.setStats(uiText)
-            // 每 5 秒把统计打进日志：5 分钟压测（计划 4.10）要靠它读首末对比，
-            // 也避免依赖 UI 取值（画面持续刷新时 uiautomator dump 会拿不到稳定帧）。
-            // release 下关掉：发布包每 5 秒刷一条 logcat 没有意义（计划 5.2）。
-            tickCount++
-            if (DebugTools.ENABLED && tickCount % STATS_LOG_EVERY_TICKS == 0L) {
-                logger.i(TAG, "STATS ${s?.stats() ?: uiText}")
-            }
-            checkStreamHealth(s)
-            mainHandler.postDelayed(this, STATS_INTERVAL_MS)
-        }
-    }
 
     private val detachReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
@@ -176,10 +151,7 @@ class HostActivity : Activity() {
             )
             logger.i(TAG, "detach broadcast: ${intent.action} device=${device?.deviceId}")
             link.onDeviceDetached(device)
-            uiState.onDetached("USB 已拔出，请重新插线或点 Scan/Retry")
-            render()
-            // 这条提示藏在收起的菜单里就等于没提示
-            panel.revealMenu()
+            presenter.onDetached()
         }
     }
 
@@ -264,7 +236,7 @@ class HostActivity : Activity() {
             oneToOne = { quality.oneToOne },
             audioEnabled = { audioEnabled },
             audioDelayMs = { audioDelayMs },
-            listener = linkListener,
+            listener = presenter,
         )
         link.isSurfaceReady = { panel.surfaceReady }
         link.onLinkLost = {
@@ -286,7 +258,7 @@ class HostActivity : Activity() {
             logger = logger,
             sessionProvider = { link.session },
             displayArea = { panel.displayArea() },
-            listener = qualityListener,
+            listener = presenter,
         )
 
         // ---- 调试入口层 ----
@@ -296,12 +268,12 @@ class HostActivity : Activity() {
         panel.surfaceView.holder.addCallback(surfaceCallback)
         panel.applyPixelModeUi(quality.oneToOne)
         panel.setReplayVisible(DebugTools.ENABLED)
-        render()
+        presenter.refresh()
 
         logger.i(TAG, "host screen ${DisplaySize.of(this).x}x${DisplaySize.of(this).y}, protocol v${Protocol.VERSION}")
         link.start()
         registerReceiver(detachReceiver, UsbAttachRouter.detachFilter())
-        mainHandler.post(statsTicker)
+        presenter.startStats()
 
         handleIntent(intent)
     }
@@ -346,109 +318,14 @@ class HostActivity : Activity() {
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(statsTicker)
         runCatching { unregisterReceiver(detachReceiver) }
+        // ★ 先把周期刷新拔掉：它会自递归 postDelayed，且握着本 Activity
+        presenter.stopStats()
         link.close()
         closeReplay()
         hidTouch?.close()
         hidTouch = null
         super.onDestroy()
-    }
-
-    // ------------------------------------------------------------------ 链路回调（只汇报，不决策）
-
-    private val linkListener = object : LinkCoordinator.Listener {
-        override fun onProgress(text: String) {
-            // ★ 10.23：进度文本**不再**直接写主状态行，只进副行 + 由状态机决定主行。
-            //   原地重协商时画面根本没断，但这里照样会发「会话已建立，等待视频流…」——
-            //   旧代码直接覆盖主行，而 onFirstFrame 不会再来，于是状态被永久钉死。
-            uiState.onProgress(text)
-            render()
-        }
-
-        override fun onLinkEstablished(text: String) {
-            // ★ 硬事实：重连成功要把上一次的「链路出错 / 无输出」拉回「连接中」。
-            //   以前这里只有一条 onProgress，而进度事件按规矩不动主行 ⇒ 自动重连
-            //   明明成功了（音频都恢复了），主行还挂着 ERROR（2026-10-20 真机）。
-            uiState.onLinkEstablished(text)
-            render()
-        }
-
-        override fun onVideoSize(width: Int, height: Int) {
-            // ★ 10.23：尺寸就绪只用来给"重协商中"收尾，**不能**提前宣告投屏中
-            //   （还没出画面就报"投屏中"是同一类错误，只是方向相反）。
-            //   同时把副行换成"新参数已生效"：否则重协商结束后副行会一直挂着
-            //   「会话已建立，等待视频流…」—— 那句话在画面正在播的时候读起来很别扭。
-            val wasRenegotiating = uiState.phase == HostUiState.Phase.RENEGOTIATING
-            uiState.onVideoSize()
-            if (wasRenegotiating) {
-                uiState.onProgress(
-                    "已生效：${width}x$height" + if (quality.oneToOne) "（1:1 像素）" else "（高清）"
-                )
-            }
-            render()
-            panel.setVideoSize(width, height)
-            // ★ 视频尺寸是**触摸坐标空间**的权威线索：手机屏幕的物理尺寸只在 CNXN 报一次，
-            //   旋转后不会重报，只能靠视频方向推出它当前的长宽（见 TouchMapper）。
-            //   空间变了控制器会自动重新注册 HID（描述符里的 Logical Max 就是空间尺寸）。
-            link.session?.let {
-                touch.onGeometry(it.peerWidth, it.peerHeight, width, height)
-                hidTouch?.updateGeometry(it.peerWidth, it.peerHeight, width, height)
-            }
-        }
-
-        override fun onFirstFrame() {
-            // ★ 10.23：这是**唯一**能宣告"投屏中"的事件（首帧真的输出了）。
-            uiState.onFirstFrame()
-            render()
-            // 画面出来了就把菜单收起来，让视频干净地占满整屏（只自动收一次）。
-            panel.autoCollapseOnFirstFrame()
-        }
-
-        override fun onClosed(reason: String) {
-            // 链路断开不是终态：前台轮询会自动重试，所以回"连接中"而非"空闲"。
-            //
-            // ★ 10.32：用户主动停止要和"意外断线"分开。前者要在界面上把原因**钉住**
-            //   （否则紧接着的自动重连会把"用户停止投屏"刷成"CNXN 已发送…"），
-            //   后者照旧随进度走。判据用协议层的同一个常量，两端不会失配。
-            if (reason.contains(CloseReason.USER_STOP)) {
-                uiState.onPeerStopped()
-            } else {
-                uiState.onClosed(reason)
-            }
-            render()
-            panel.revealMenu()
-        }
-
-        override fun onError(message: String, cause: Throwable?) {
-            // ★ 出错必须把菜单叫回来：面板收起时错误信息是看不见的，
-            //   用户只会看到"画面不动"，无从判断是拔线还是授权被拒。
-            uiState.onError(message)
-            render()
-            panel.revealMenu()
-            logger.e(TAG, message, cause)
-            // 链路层已负责 stopSession / 退避计数 / 自愈判定，这里只管"让用户可见"。
-        }
-
-        /**
-         * 对端在配件模式下没人应答（典型：手机端没装配套 App）。
-         *
-         * 走独立回调而不是 [onError]：这不是链路故障，等自动重连永远不会成功，
-         * 界面要给的是**可操作的去处**（下载按钮），而不是"错误"两个字。
-         */
-        override fun onPeerAppMissing() {
-            uiState.onPeerAppMissing(getString(R.string.host_detail_peer_app_missing))
-            render()
-            // 面板收起时这条引导是看不见的，必须主动叫回来
-            panel.revealMenu()
-        }
-
-        override fun onSelfHealRequest(device: UsbDevice) {
-            uiState.onProgress("快路径未验证通过，强制重握手（改写配件身份）…")
-            render()
-            link.stopSession()
-            link.onDeviceAttached(device)
-        }
     }
 
     // ------------------------------------------------------------------ 配套 App
@@ -483,30 +360,15 @@ class HostActivity : Activity() {
 
     // ------------------------------------------------------------------ 画质回调
 
-    private val qualityListener = object : QualityController.Listener {
-        override fun onQualityChange(oneToOne: Boolean, reason: String) {
-            uiState.onRenegotiate()
-            uiState.onProgress(reason)
-            render()
-            panel.applyPixelModeUi(oneToOne)
-            // ⚠️ 必须**先**打"预期内重开"标志，**再**发起重协商：
-            //   一旦 renegotiate() 已返回 false 并开始回退重连，那期间的失败就不再是"预期内"的。
-            link.beginExpectedRestart()
-            link.requestRenegotiate()
-        }
-    }
-
     // ------------------------------------------------------------------ 用户动作
 
     private fun userScan() {
-        uiState.onScanRequested()
-        render()
+        presenter.onScanRequested()
         link.scan()
     }
 
     private fun userForceRehandshake() {
-        uiState.onProgress("强制 AOA 重握手中…")
-        render()
+        presenter.onForceHandshakeHint()
         link.scan(forceHandshake = true)
     }
 
@@ -515,23 +377,15 @@ class HostActivity : Activity() {
     private val debugHandler = object : DebugIntents.Handler {
         override fun onReplay(path: String, file: File) {
             if (!file.exists()) {
-                linkListener.onError("回放文件不存在: $path（可先用 run-as 放进 filesDir）", null)
+                presenter.onError("回放文件不存在: $path（可先用 run-as 放进 filesDir）", null)
                 return
             }
             startReplay(file)
         }
 
-        override fun onScan() {
-            uiState.onScanRequested()
-            render()
-            link.scan()
-        }
+        override fun onScan() = userScan()
 
-        override fun onForceHandshake() {
-            uiState.onProgress("强制 AOA 重握手中…")
-            render()
-            link.scan(forceHandshake = true)
-        }
+        override fun onForceHandshake() = userForceRehandshake()
 
         override fun onHidProbe() {
             hidTouch?.forceReRegister()
@@ -600,7 +454,7 @@ class HostActivity : Activity() {
             }
             startReplay(dest)
         } catch (t: Throwable) {
-            linkListener.onError("读取抓流文件失败: ${t.message}", t)
+            presenter.onError("读取抓流文件失败: ${t.message}", t)
         }
     }
 
@@ -617,44 +471,8 @@ class HostActivity : Activity() {
         replay.close()
     }
 
-    // ------------------------------------------------------------------ 渲染
-
-    /** 把状态机画到面板上（唯一的主状态行渲染入口）。 */
-    private fun render() {
-        panel.render(uiState)
-    }
-
-    /**
-     * 每秒评估一次流健康度（10.30）。
-     *
-     * 只在**状态或秒数真的变了**才推进状态机并重绘 —— 否则每秒 render 一次，
-     * 面板会持续重排（10.26 那个"反复显示隐藏"的教训：UI 动作要由真实变化驱动）。
-     */
-    private fun checkStreamHealth(session: HostSession?) {
-        val now = SystemClock.elapsedRealtime()
-        val lastAt = session?.lastVideoFrameAtMs ?: 0L
-        val state = streamHealth.evaluate(now, lastAt)
-        val silentMs = streamHealth.silentMs(now, lastAt)
-        val silentSec = silentMs / 1000
-
-        val changed = state != lastHealthState ||
-            (state == StreamHealth.State.STALLED && silentSec != lastSilentSec) ||
-            (state == StreamHealth.State.STOPPED && silentSec != lastSilentSec)
-        if (!changed) return
-
-        lastHealthState = state
-        lastSilentSec = silentSec
-        uiState.onStreamHealth(state, silentMs)
-        render()
-        if (DebugTools.ENABLED) {
-            logger.w(TAG, "流健康：$state，已 ${silentSec}s 无新帧（判定阈值 stall=${StreamHealth.DEFAULT_STALL_MS}ms stop=${StreamHealth.DEFAULT_STOP_MS}ms）")
-        }
-    }
-
     companion object {
         const val TAG = "UAV-Host"
         const val REQ_PICK_UAV = 1001
-        const val STATS_INTERVAL_MS = 1_000L
-        const val STATS_LOG_EVERY_TICKS = 5L
     }
 }

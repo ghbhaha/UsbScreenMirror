@@ -126,6 +126,7 @@ P3 之后 + P4 之后各做一次真机回归（宿主 P40UCH / 配件 HONOR MAA
 | 2026-10-20 | 建文档；基线为 `develop@c83b6d1`（`:protocol:test` 469 项） |
 | 2026-10-20 | **P5（部分）落地**：抽出 `:protocol/aoa/LinkRetry`（运行权 + 失败计数 + 退避间隔），`LinkCoordinator` 的三个原子量换成它；新增 6 项单测（总 475 项）。`P1/P2/P3/P4` 未动 |
 | 2026-10-20 | **P6 收尾**：`.uav` 回放从 `HostActivity` 搬进 `aoa/run/AoaReplay`（依赖经 `Deps` 注入，`lateinit` 字段用 getter 取）。⚠️ **`HostActivity` 只从 656 降到 651 行** —— 拆出去 77 行、又写回 ~35 行 Deps，本步买到的是"调试通路可单独阅读"，不是瘦身 |
+| 2026-10-20 | **事件翻译出 Activity**：`linkListener` / `qualityListener` / `statsTicker` 三个匿名对象 + `uiState` 字段（~140 行）搬进 `aoa/ui/HostPresenter`（依赖经 `Host` 接口以 getter 注入）。`HostActivity` **659 → 477 行**，主状态行从此只有一个推进者；顺带补回被搬家带走的 `stopStats()`（`onDestroy` 里拔掉自递归的 `postDelayed`，否则它会握着已销毁的 Activity 继续每秒刷新） |
 | 2026-10-20 | **P3 + P4 剩余落地**：`AoaConnectFlow`（握手 → 等重枚举 → claim，权限经 `Permission` 回调注入）从 `UsbAttachRouter.runPipeline` 搬出；`AoaLinkRun`（串行队列 + 运行权 + 队列关闭时另起线程）从 `LinkCoordinator` 的内联 `ioExecutor` 搬出。真机：快路径首帧、`force_handshake`（aoaVersion=2）全流程、连点合并（router `busy` 挡下第二次）均正常 |
 | 2026-10-20 | **P1 轮询段真机验证通过**：拔线 → `detach broadcast` 后 31ms `host session stopped`；插回 → 设备在表里约 1.5s 后由 **`轮询发现设备 id=2030（第 1 次尝试）`** 接上（该路径以前只能靠 ATTACHED 广播），握手重枚举 `aoaVersion=2` → 首帧，**拔到画面恢复 6.9s**，全程零告警、HID 只重注册一次 |
 | 2026-10-20 | **P4（第一步）落地**：会话装配从 `LinkCoordinator.onReady()` 搬进 `aoa/flow/AoaStreamFlow`（连接 → 通道 → Transport → HostSession），回调经 `Bridge` 翻译回调度器；`LinkCoordinator` 保留"顺序 + 状态"（**行数基本不变** —— 桥从"方法内内联对象"变成"具名字段"，本步买的是**职责边界**不是行数）。真机：快路径与 `force_handshake` 两条装配路径都正常（第二次 610ms 出首帧） |
