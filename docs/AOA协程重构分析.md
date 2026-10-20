@@ -124,6 +124,7 @@ P3 之后 + P4 之后各做一次真机回归（宿主 P40UCH / 配件 HONOR MAA
 |---|---|
 | 2026-10-20 | 建文档；基线为 `develop@c83b6d1`（`:protocol:test` 469 项） |
 | 2026-10-20 | **P5（部分）落地**：抽出 `:protocol/aoa/LinkRetry`（运行权 + 失败计数 + 退避间隔），`LinkCoordinator` 的三个原子量换成它；新增 6 项单测（总 475 项）。`P1/P2/P3/P4` 未动 |
+| 2026-10-20 | **P2 真机验证通过**（P40UCH + HONOR MAA-AN10）：完整 AOA 重握手（`aoaVersion=2`）从 `link ready` 到首帧 **571ms**；原地重协商 `OPEN → OKAY` **6ms**，尺寸 `496x1080 → 872x1920`、码率回到 8000k 且帧继续；返回键收尾立即 `host session stopped`，**无「握手异常」**（取消不再被当成失败）。触摸/音频只验到「HID 已注册 id=1，5 点」「audio 无输入超时」，实际手感待人工确认 |
 | 2026-10-20 | **P2（握手段）落地**：`HostSession` 的两个 `CountDownLatch` → `CompletableDeferred` + `withTimeoutOrNull`；`sessionFlow` / `sendOpen` / `renegotiate` 变 `suspend`，握手从"占一条 `uav-session` 线程"变成"挂起";`LinkCoordinator` 持有 `scope`，重协商从裸线程改协程。读循环仍为线程（见 §六.1） |
 
 ### P2 的具体做法（为什么不是全量协程化）
