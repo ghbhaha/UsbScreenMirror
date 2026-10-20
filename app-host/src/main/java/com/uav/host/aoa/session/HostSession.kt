@@ -412,6 +412,10 @@ class HostSession(
                 peerSilent("等待 OPEN 应答超时（${TIMEOUT_MS}ms）：对端收了 OPEN 却没有 OKAY")
                 return
             }
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            // ★ 收尾取消不是错误：页面上看见的应该是"已断开"，不是"握手异常"。
+            //   （协程化之前这里永远走不到 —— 线程被 interrupt 时 await 抛的是 InterruptedException）
+            throw c
         } catch (t: Throwable) {
             fail("会话握手异常: ${t.message}", t)
         }

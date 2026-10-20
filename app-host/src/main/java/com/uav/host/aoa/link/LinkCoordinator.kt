@@ -312,6 +312,9 @@ class LinkCoordinator(
             var ok = false
             try {
                 ok = s.renegotiate()
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                // ★ 页面销毁 / 链路关闭导致的取消：不是"重协商失败"，更不能回退去重连
+                throw c
             } catch (t: Throwable) {
                 logger.w(TAG, "原地重协商异常: ${t.message}", t)
             } finally {
