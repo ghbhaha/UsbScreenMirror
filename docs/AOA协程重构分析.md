@@ -124,6 +124,7 @@ P3 之后 + P4 之后各做一次真机回归（宿主 P40UCH / 配件 HONOR MAA
 |---|---|
 | 2026-10-20 | 建文档；基线为 `develop@c83b6d1`（`:protocol:test` 469 项） |
 | 2026-10-20 | **P5（部分）落地**：抽出 `:protocol/aoa/LinkRetry`（运行权 + 失败计数 + 退避间隔），`LinkCoordinator` 的三个原子量换成它；新增 6 项单测（总 475 项）。`P1/P2/P3/P4` 未动 |
+| 2026-10-20 | **P1 轮询段真机验证通过**：拔线 → `detach broadcast` 后 31ms `host session stopped`；插回 → 设备在表里约 1.5s 后由 **`轮询发现设备 id=2030（第 1 次尝试）`** 接上（该路径以前只能靠 ATTACHED 广播），握手重枚举 `aoaVersion=2` → 首帧，**拔到画面恢复 6.9s**，全程零告警、HID 只重注册一次 |
 | 2026-10-20 | **P4（第一步）落地**：会话装配从 `LinkCoordinator.onReady()` 搬进 `aoa/flow/AoaStreamFlow`（连接 → 通道 → Transport → HostSession），回调经 `Bridge` 翻译回调度器；`LinkCoordinator` 保留"顺序 + 状态"（**行数基本不变** —— 桥从"方法内内联对象"变成"具名字段"，本步买的是**职责边界**不是行数）。真机：快路径与 `force_handshake` 两条装配路径都正常（第二次 610ms 出首帧） |
 | 2026-10-20 | **P1（轮询段）落地**：`usbPoller` 从 `Handler.postDelayed` 改协程循环（`uav-aoa-poll`，`Dispatchers.Main` + `delay`）；"预期内重开"标志的 45s 兜底从 `Runnable` 改 `Job`（`uav-expect-restart`）。`removeCallbacks` 全部退场，销毁只认 `scope.cancel()` |
 | 2026-10-20 | **P2 真机验证通过**（P40UCH + HONOR MAA-AN10）：完整 AOA 重握手（`aoaVersion=2`）从 `link ready` 到首帧 **571ms**；原地重协商 `OPEN → OKAY` **6ms**，尺寸 `496x1080 → 872x1920`、码率回到 8000k 且帧继续；返回键收尾立即 `host session stopped`，**无「握手异常」**（取消不再被当成失败）。触摸/音频只验到「HID 已注册 id=1，5 点」「audio 无输入超时」，实际手感待人工确认 |
