@@ -29,8 +29,8 @@ import com.uav.host.aoa.capture.session.HostSession
 import com.uav.host.aoa.ui.HostPanel
 import com.uav.host.aoa.ui.HostPresenter
 import com.uav.host.aoa.capture.usb.UsbAttachRouter
-import com.uav.host.aoa.capture.video.QualityController
-import com.uav.host.aoa.capture.video.VideoDecoder
+import com.uav.host.aoa.media.QualityController
+import com.uav.host.aoa.media.VideoDecoder
 import com.uav.protocol.aoa.Protocol
 import com.uav.protocol.i
 import com.uav.protocol.w

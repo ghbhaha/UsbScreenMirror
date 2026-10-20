@@ -23,7 +23,7 @@
     android:background="@color/host_bg">
 
     <!-- 尺寸策略：按视频宽高比自适应，由系统做最终缩放；不调 setFixedSize（计划 4.7） -->
-    <com.uav.host.aoa.capture.video.AspectRatioSurfaceView
+    <com.uav.host.aoa.ui.AspectRatioSurfaceView
         android:id="@+id/surface"
         android:layout_width="match_parent"
         android:layout_height="match_parent"

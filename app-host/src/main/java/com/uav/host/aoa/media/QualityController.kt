@@ -1,4 +1,4 @@
-package com.uav.host.aoa.capture.video
+package com.uav.host.aoa.media
 
 import android.content.Context
 import com.uav.host.common.HostPrefs

@@ -20,7 +20,7 @@
     android:layout_height="match_parent"
     android:background="@color/host_bg">
 
-    <com.uav.host.aoa.capture.video.AspectRatioSurfaceView
+    <com.uav.host.aoa.ui.AspectRatioSurfaceView
         android:id="@+id/surface"
         android:layout_width="match_parent"
         android:layout_height="match_parent"

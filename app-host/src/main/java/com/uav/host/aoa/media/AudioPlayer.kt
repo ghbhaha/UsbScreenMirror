@@ -1,4 +1,4 @@
-package com.uav.host.aoa.capture.audio
+package com.uav.host.aoa.media
 
 import android.media.AudioAttributes
 import android.media.AudioFormat

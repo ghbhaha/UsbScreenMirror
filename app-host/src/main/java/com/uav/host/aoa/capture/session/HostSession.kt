@@ -3,11 +3,11 @@ package com.uav.host.aoa.capture.session
 import android.os.SystemClock
 import android.view.Surface
 import com.uav.host.aoa.HostActivity
-import com.uav.host.aoa.capture.audio.AudioPlayer
+import com.uav.host.aoa.media.AudioPlayer
 import com.uav.host.common.AndroidLogger
 import com.uav.host.aoa.capture.debug.FileByteChannel
 import com.uav.host.aoa.capture.usb.UsbAttachRouter
-import com.uav.host.aoa.capture.video.VideoDecoder
+import com.uav.host.aoa.media.VideoDecoder
 import com.uav.protocol.Bytes
 import com.uav.protocol.Logger
 import com.uav.protocol.adb.AdbMessage
