@@ -18,6 +18,9 @@ import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.LinkRetry
 import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -160,8 +163,31 @@ class LinkCoordinator(
      */
     private val expectingRestart = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** 切换重开的兜底清理：即使一直没出画面，也不能让标志永久挂着掩盖真错误。 */
-    private val clearExpectingRestart = Runnable { expectingRestart.set(false) }
+    /** 切换重开的兜底清理 Job：即使一直没出画面，也不能让标志永久挂着掩盖真错误。 */
+    private var clearExpectingJob: Job? = null
+
+    /**
+     * 点亮"预期内重开"标志，并在 [timeoutMs] 后自动熄灭。
+     *
+     * ★ 用协程 `delay` 而不是 `Handler.postDelayed` + `removeCallbacks`：
+     *   后者要求每个置位点都记得配一次移除，漏一处就是"标志永久亮着、真错误被吞"。
+     *   这里"新的顶掉旧的"由 [Job.cancel] 保证，语义只有一处。
+     */
+    private fun armExpectingRestart(timeoutMs: Long = RESTART_FLAG_TIMEOUT_MS) {
+        expectingRestart.set(true)
+        clearExpectingJob?.cancel()
+        clearExpectingJob = scope.launch(CoroutineName("uav-expect-restart")) {
+            delay(timeoutMs)
+            expectingRestart.set(false)
+        }
+    }
+
+    /** 首帧到了 / 会话重开结束：立刻熄灯。 */
+    private fun clearExpectingRestart() {
+        expectingRestart.set(false)
+        clearExpectingJob?.cancel()
+        clearExpectingJob = null
+    }
 
     /** 同一时刻只允许一次"尺寸重协商"在飞（布局回调可能连发）。 */
     private val renegotiating = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -203,27 +229,32 @@ class LinkCoordinator(
      *   （会话会等不到 Surface 而失败），而且每次握手都会让手机**重新枚举**
      *   USB —— 切后台时反复重枚举纯属浪费，还会把自动重试配额耗掉。
      */
-    private val usbPoller = object : Runnable {
-        override fun run() {
-            if (session == null && !waitingForPeerApp && isSurfaceReady()) {
-                runCatching { router?.pollOnce() }
-                    .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
-            }
-            mainHandler.postDelayed(this, nextPollDelayMs())
-        }
-    }
+    /** 轮询循环的 Job（关页面时随 [close] 取消）。 */
+    private var pollJob: Job? = null
 
     /** Surface 是否就绪（由上层在建链前判断；这里只读，不持有 View）。 */
     var isSurfaceReady: () -> Boolean = { true }
 
     fun start() {
         router = UsbAttachRouter(context, logger, this).also { it.start() }
-        mainHandler.postDelayed(usbPoller, POLL_INTERVAL_MS)
+        // ★ 协程轮询而不是 Handler.postDelayed：销毁时随 scope 一起取消。
+        //   用 Handler 的写法要求"每个 postDelayed 都配一次 removeCallbacks"，
+        //   漏一处就是"页面已经走完了，回调还在跑"（本仓库踩过同类）。
+        pollJob = scope.launch(Dispatchers.Main + CoroutineName("uav-aoa-poll")) {
+            delay(POLL_INTERVAL_MS)          // 首次照旧等一个间隔，避免启动瞬间和 onCreate 抢
+            while (isActive) {
+                if (session == null && !waitingForPeerApp && isSurfaceReady()) {
+                    runCatching { router?.pollOnce() }
+                        .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
+                }
+                delay(nextPollDelayMs())
+            }
+        }
     }
 
     fun close() {
-        mainHandler.removeCallbacks(usbPoller)
-        mainHandler.removeCallbacks(clearExpectingRestart)
+        pollJob?.cancel()
+        clearExpectingJob?.cancel()
         router?.close()
         router = null
         stopSession()
@@ -302,9 +333,7 @@ class LinkCoordinator(
             return
         }
         // 标记"预期内重开"：期间瞬时失败不弹 ERROR（见 [onError]），45s 兜底清除
-        expectingRestart.set(true)
-        mainHandler.removeCallbacks(clearExpectingRestart)
-        mainHandler.postDelayed(clearExpectingRestart, RESTART_FLAG_TIMEOUT_MS)
+        armExpectingRestart()
 
         // ★ 协程而不是裸线程：`renegotiate()` 内部是可取消的挂起等待（`withTimeoutOrNull`），
         //   页面销毁时随 [scope] 一起取消，不必等满那 5 秒超时。
@@ -337,9 +366,7 @@ class LinkCoordinator(
      * 并开始回退重连，那期间的失败就不再是"预期内"的了。
      */
     fun beginExpectedRestart() {
-        expectingRestart.set(true)
-        mainHandler.removeCallbacks(clearExpectingRestart)
-        mainHandler.postDelayed(clearExpectingRestart, RESTART_FLAG_TIMEOUT_MS)
+        armExpectingRestart()
     }
 
     /**
@@ -524,15 +551,13 @@ class LinkCoordinator(
                 override fun onVideoSize(width: Int, height: Int) {
                     // 尺寸（重）配置成功 = 重协商已见效 → 立刻清掉"切换中"标志，
                     // 免得它一直挂到 45s 兜底、把这段窗口里的真错误也吞掉。
-                    expectingRestart.set(false)
-                    mainHandler.removeCallbacks(clearExpectingRestart)
+                    clearExpectingRestart()
                     listener.onVideoSize(width, height)
                 }
 
                 override fun onFirstFrame() {
-                    expectingRestart.set(false)
+                    clearExpectingRestart()
                     waitingForPeerApp = false
-                    mainHandler.removeCallbacks(clearExpectingRestart)
                     listener.onFirstFrame()
                 }
 
