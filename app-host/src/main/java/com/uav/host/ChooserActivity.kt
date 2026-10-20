@@ -13,6 +13,7 @@ import android.view.View
 import android.widget.TextView
 import androidx.core.content.IntentCompat
 import com.uav.host.common.DebugTools
+import com.uav.host.common.FocusMode
 import com.uav.host.common.FocusRing
 import com.uav.host.ios.IosActivity
 import com.uav.host.aoa.HostActivity
@@ -78,8 +79,11 @@ class ChooserActivity : Activity() {
         //   2) 初始焦点 —— 不给的话第一下方向键没有"起点"，看着像遥控器坏了。
         //      用 post{} 推到下一帧：onCreate 时 View 还没 attach，
         //      requestFocus() 会因 isShown==false **静默失败**。
+        //   ⚠️ 触摸设备（平板/一体机）两件事都不做：焦点环是噪音，自动聚焦还会抢走点击意图。
         FocusRing.install(findViewById(android.R.id.content))
-        cardAoa.post { if (!cardAoa.hasFocus()) cardAoa.requestFocus() }
+        if (FocusMode.wanted()) {
+            cardAoa.post { if (!cardAoa.hasFocus()) cardAoa.requestFocus() }
+        }
 
         // 基线 = 进本页时已经插着的东西，它们不参与"新插入"判定
         seenDeviceIds.addAll(usbDevices().map { it.deviceId })

@@ -357,6 +357,8 @@ class HostPanel(private val activity: Activity) {
 
     /** 把焦点放到当前可见的入口：面板展开 → 收起按钮；收起 → 常驻药丸。 */
     private fun syncFocusToMenu() {
+        // 触摸设备不需要焦点：没有遥控器就没有"移焦"，抢焦点只会让按钮莫名高亮
+        if (!com.uav.host.common.FocusMode.wanted()) return
         val target = if (menuShown) collapseView else chipView
         if (target.isShown && !target.hasFocus()) target.requestFocus()
     }

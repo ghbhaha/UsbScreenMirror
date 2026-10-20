@@ -18,10 +18,27 @@ import com.uav.host.R
  *
  * 用法：面板 `bind()` 末尾调 [install]（传根视图），内部递归给所有可聚焦控件挂钩。
  * 只对 `isFocusable` 的控件生效；不可聚焦的文本/容器不受影响。
+ *
+ * ⚠️ **触摸设备直接跳过**（见 [FocusMode]）：平板上一按按钮就多出一圈蓝边，
+ * 是噪音而不是提示。
  */
 internal object FocusRing {
 
+    /**
+     * 按本机能力二选一：
+     * - **遥控器/机顶盒** → [installRings]：挂焦点环；
+     * - **触摸设备** → [disarmTouchFocus]：把为遥控器加的 `focusableInTouchMode` 撤掉。
+     *
+     * 为什么触摸设备必须"反过来做"而不是"什么都不做"：布局里那批
+     * `focusableInTouchMode="true"` 一旦留着，在"窗口里还没有任何焦点"的时候
+     * **第一次触摸只用来拿焦点**，第二次才触发点击 —— 表现就是"要点两下"
+     * （2026-10-20 实机反馈）。以前焦点模式开着、启动就 requestFocus 了，这个坑被掩盖着。
+     */
     fun install(root: View) {
+        if (FocusMode.wanted()) installRings(root) else disarmTouchFocus(root)
+    }
+
+    private fun installRings(root: View) {
         val ring = runCatching { root.context.getDrawable(R.drawable.focus_ring) }.getOrNull()
             ?: return
         walk(root) { v ->
@@ -33,6 +50,23 @@ internal object FocusRing {
                 view.foreground = if (hasFocus) ring else null
             }
         }
+    }
+
+    /**
+     * 撤掉触摸焦点：只关 `focusableInTouchMode`，**不动 `clickable`/`focusable`**。
+     *
+     * 这样点击照常一次生效，而"点哪儿哪儿被选中"也不会再发生；
+     * 真接了鼠标键盘的设备仍可移焦（只是没有环，因为本来就不该给它画）。
+     */
+    private fun disarmTouchFocus(root: View) {
+        var n = 0
+        walk(root) { v ->
+            if (v.isFocusableInTouchMode) {
+                v.isFocusableInTouchMode = false
+                n++
+            }
+        }
+        android.util.Log.i("UAV-Focus", "触摸设备：已撤掉 $n 个控件的 focusableInTouchMode")
     }
 
     private fun walk(v: View, visit: (View) -> Unit) {

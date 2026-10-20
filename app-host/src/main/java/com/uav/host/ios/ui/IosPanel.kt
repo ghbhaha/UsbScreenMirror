@@ -338,6 +338,8 @@ class IosPanel(private val activity: Activity) {
      * （收起动画结束后就是这种情况），方向键就**完全无处可去**，用户以为遥控器坏了。
      */
     private fun syncFocusToMenu() {
+        // 触摸设备：没有遥控器就没有"无处可去"的问题，抢焦点反而让控件莫名高亮
+        if (!com.uav.host.common.FocusMode.wanted()) return
         val target = if (menuShown) btnCollapse else chipView
         if (target.isShown && !target.hasFocus() && !target.requestFocus()) {
             android.util.Log.w("UAV-IosQt", "焦点请求失败（${if (menuShown) "面板" else "药丸"}）")
