@@ -59,12 +59,18 @@ class ConnectionResourceTest {
         }
     }
 
-    private class Recorder : ConnectionListener {
+    private class Recorder(private val errorDelayMs: Long = 0) : ConnectionListener {
         val errored = CountDownLatch(1)
         val closed = CountDownLatch(1)
         override fun onMessage(message: AdbMessage) = Unit
         override fun onError(cause: Throwable) {
+            // 先放测试线程过去，再按需拖住 fail 线程的后续收尾。
+            //
+            // 这个 delay 不是"等待"而是**放大竞争窗口**：`fail()` 里 closing 早已置位，
+            // 而关通道在回调之后才做 —— 窗口只有几微秒，不放大就变成 flaky
+            // （同一份代码连跑十次十绿、偶尔一红）。拖住 300ms 后，旧实现必红、新实现必绿。
             errored.countDown()
+            if (errorDelayMs > 0) Thread.sleep(errorDelayMs)
         }
 
         override fun onClosed(reason: String) {
@@ -111,7 +117,9 @@ class ConnectionResourceTest {
     @Test
     fun `出错之后调用 close 也不会漏掉通道`() {
         val channel = FailingChannel()
-        val recorder = Recorder()
+        // 让 fail() 在通知完 onError 后停 300ms，测试线程正好赶在"fail 还没关通道"时调 close()
+        // —— 把几微秒的竞争窗口放大成确定性场景（不放大这个用例就是 flaky 的）。
+        val recorder = Recorder(errorDelayMs = 300)
         val conn = Connection(Transport(channel), listener = recorder)
         conn.start()
         recorder.errored.await(5, TimeUnit.SECONDS)

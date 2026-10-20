@@ -83,6 +83,10 @@ class Connection(
 
     private val closing = AtomicBoolean(false)
 
+    /** 底层通道是否已关（见 [closeTransportOnce]）。与 [closing] 是**两件事**，别合并。 */
+    private val transportLock = Any()
+    private var transportClosed = false
+
     @Volatile
     private var running = false
 
@@ -394,23 +398,36 @@ class Connection(
         running = false
         val l = listener
         closeSinks()
+        // ★ 与 [fail] 同理：会话已经结束，必须把底层通道关掉。
+        //   漏掉它就等于漏掉 Android 上的 `/dev/usb_accessory` fd，
+        //   会让手机端再也切不进配件模式（宿主侧无限「等待重枚举超时」）。
+        //   ★ 放在回调**之前**：让"资源已释放"成为回调方可见的事实（见 [closeTransportOnce]）。
+        closeTransportOnce()
         try {
             l?.onClosed(reason)
         } catch (t: Throwable) {
             logger.w(tag, "listener.onClosed threw: ${t.message}", t)
         }
-        // ★ 与 [fail] 同理：会话已经结束，必须把底层通道关掉。
-        //   漏掉它就等于漏掉 Android 上的 `/dev/usb_accessory` fd，
-        //   会让手机端再也切不进配件模式（宿主侧无限「等待重枚举超时」）。
-        closeTransportQuietly()
     }
 
-    /** 关闭底层通道；`transport.close()` 自身幂等，重复调用无害。 */
-    private fun closeTransportQuietly() {
-        try {
-            transport.close()
-        } catch (t: Throwable) {
-            logger.w(tag, "closing transport failed: ${t.message}", t)
+    /**
+     * 关闭底层通道 —— **独立幂等**，任何收尾路径（[fail] / [notifyClosed] / [close]）都必须走到，
+     * 不受 `closing` 早退的影响。
+     *
+     * 为什么用锁而不是 CAS：本方法的契约是「**返回时通道已经关掉**」。CAS 版本里后到的线程
+     * 会把失败当成功立刻返回，而先到的线程可能还卡在 `transport.close()` 里 ——
+     * 调用方（关会话后立刻重开 / 等重枚举）看到的就是「关完了但 fd 还在」。
+     * 用锁则让后到者阻塞到先到者真正关完，语义与契约一致。
+     */
+    private fun closeTransportOnce() {
+        synchronized(transportLock) {
+            if (transportClosed) return
+            transportClosed = true
+            try {
+                transport.close()
+            } catch (t: Throwable) {
+                logger.w(tag, "closing transport failed: ${t.message}", t)
+            }
         }
     }
 
@@ -419,11 +436,6 @@ class Connection(
         running = false
         val l = listener
         closeSinks()
-        try {
-            l?.onError(cause)
-        } catch (t: Throwable) {
-            logger.w(tag, "listener.onError threw: ${t.message}", t)
-        }
         // ★ 出错也必须把底层通道关掉，否则 **fd 泄漏**。
         //
         //   这里踩过一个很贵的坑：`closing` 在上面已经被置 true，于是之后即便有人
@@ -434,7 +446,12 @@ class Connection(
         //   让手机端**再也切不进配件模式**，宿主侧表现为无限「等待重枚举超时」，
         //   只能靠拔插或强杀 App 恢复（实测：停掉 App 释放 fd 后，下一次握手立刻成功）。
         //   而且此刻 transport 已不可用（读到 EIO 之类），继续持有也没有任何意义。
-        closeTransportQuietly()
+        closeTransportOnce()
+        try {
+            l?.onError(cause)
+        } catch (t: Throwable) {
+            logger.w(tag, "listener.onError threw: ${t.message}", t)
+        }
     }
 
     private fun closeSinks() {
@@ -451,17 +468,26 @@ class Connection(
     }
 
     override fun close() {
-        if (closing.getAndSet(true)) return
-        running = false
-        writeQueue.clear()
-        writeQueue.offer(SHUTDOWN)
-        closeSinks()
-        closeTransportQuietly()
-        readerThread?.interrupt()
-        writerThread?.interrupt()
-        readerThread = null
-        writerThread = null
-        logger.i(tag, "connection closed on ${transport.label}")
+        // ★ `closing` 可能已被 [fail] / [notifyClosed] 抢先置位，此时**不能整体 return**：
+        //   那样 close() 就成了"看着像关闭、实际空转"——`transport.close()` 一次都不执行，
+        //   而 fd 要等 fail 线程走到最后一行才放。真机上这段窗口里重开 `/dev/usb_accessory`
+        //   必然失败（独占打开），紧跟着的「重连 / 等重枚举」会白等一轮。
+        //   所以：收尾动作只跑一次，但"关通道"必须无条件兑现。
+        val first = !closing.getAndSet(true)
+        if (first) {
+            running = false
+            writeQueue.clear()
+            writeQueue.offer(SHUTDOWN)
+            closeSinks()
+        }
+        closeTransportOnce()
+        if (first) {
+            readerThread?.interrupt()
+            writerThread?.interrupt()
+            readerThread = null
+            writerThread = null
+            logger.i(tag, "connection closed on ${transport.label}")
+        }
     }
 
     private class Outbound(
