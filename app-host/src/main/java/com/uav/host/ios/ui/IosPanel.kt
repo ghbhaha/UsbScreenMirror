@@ -11,7 +11,7 @@ import android.widget.TextView
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.uav.host.aoa.ui.HostPanel
-import com.uav.host.aoa.video.AspectRatioSurfaceView
+import com.uav.host.aoa.ui.AspectRatioSurfaceView
 import com.uav.host.R
 
 /**

@@ -2,8 +2,8 @@ package com.uav.host.aoa.input
 
 import android.hardware.usb.UsbDeviceConnection
 import com.uav.host.common.AndroidLogger
-import com.uav.host.aoa.link.LinkCoordinator
-import com.uav.host.aoa.usb.HidInjector
+import com.uav.host.aoa.flow.LinkCoordinator
+import com.uav.host.aoa.capture.HidInjector
 import com.uav.protocol.Logger
 import com.uav.protocol.d
 import com.uav.protocol.e

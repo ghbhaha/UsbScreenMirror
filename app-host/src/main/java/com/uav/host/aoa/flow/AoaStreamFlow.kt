@@ -2,9 +2,9 @@ package com.uav.host.aoa.flow
 
 import android.hardware.usb.UsbDeviceConnection
 import android.view.Surface
-import com.uav.host.aoa.session.HostSession
-import com.uav.host.aoa.usb.BulkByteChannel
-import com.uav.host.aoa.usb.BulkPair
+import com.uav.host.aoa.capture.HostSession
+import com.uav.host.aoa.capture.BulkByteChannel
+import com.uav.host.aoa.capture.BulkPair
 import com.uav.protocol.BufferedByteChannel
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
@@ -20,7 +20,7 @@ import kotlinx.coroutines.CoroutineScope
  *
  * - **这里**只做"连接 → 通道 → Transport → HostSession"这条纯装配，以及回调**转发**；
  * - **怎么解释回调**（清哪个标志、要不要排队重连、要不要自愈）留在
- *   [com.uav.host.aoa.link.LinkCoordinator] —— 那是状态机的事。
+ *   [com.uav.host.aoa.flow.LinkCoordinator] —— 那是状态机的事。
  *
  * ## 两条顺序要求（迁移时逐字保留，别再动）
 

@@ -3,7 +3,7 @@ package com.uav.host.aoa.input
 import android.view.MotionEvent
 import com.uav.host.common.DebugTools
 import com.uav.host.aoa.input.HidTouchController
-import com.uav.host.aoa.video.AspectRatioSurfaceView
+import com.uav.host.aoa.ui.AspectRatioSurfaceView
 import com.uav.protocol.Logger
 import com.uav.protocol.i
 import com.uav.protocol.input.TouchMapper

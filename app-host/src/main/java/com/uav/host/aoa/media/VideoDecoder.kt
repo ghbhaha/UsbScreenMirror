@@ -1,4 +1,4 @@
-package com.uav.host.aoa.video
+package com.uav.host.aoa.media
 
 import android.media.MediaCodec
 import android.media.MediaFormat

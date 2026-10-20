@@ -1,13 +1,13 @@
-package com.uav.host.aoa.session
+package com.uav.host.aoa.capture
 
 import android.os.SystemClock
 import android.view.Surface
 import com.uav.host.aoa.HostActivity
-import com.uav.host.aoa.audio.AudioPlayer
+import com.uav.host.aoa.media.AudioPlayer
 import com.uav.host.common.AndroidLogger
 import com.uav.host.aoa.debug.FileByteChannel
-import com.uav.host.aoa.usb.UsbAttachRouter
-import com.uav.host.aoa.video.VideoDecoder
+import com.uav.host.aoa.capture.UsbAttachRouter
+import com.uav.host.aoa.media.VideoDecoder
 import com.uav.protocol.Bytes
 import com.uav.protocol.Logger
 import com.uav.protocol.adb.AdbMessage

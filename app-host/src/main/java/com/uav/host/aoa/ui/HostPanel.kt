@@ -13,9 +13,8 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.uav.host.R
 import com.uav.host.aoa.input.TouchForwarder
-import com.uav.host.aoa.link.LinkCoordinator
-import com.uav.host.aoa.session.HostSession
-import com.uav.host.aoa.video.AspectRatioSurfaceView
+import com.uav.host.aoa.flow.LinkCoordinator
+import com.uav.host.aoa.capture.HostSession
 import com.uav.protocol.ui.HostUiState
 
 /**

@@ -1,4 +1,4 @@
-package com.uav.host.aoa.video
+package com.uav.host.aoa.ui
 
 import android.content.Context
 import android.util.AttributeSet

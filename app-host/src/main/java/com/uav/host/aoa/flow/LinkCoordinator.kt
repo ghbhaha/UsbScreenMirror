@@ -1,4 +1,4 @@
-package com.uav.host.aoa.link
+package com.uav.host.aoa.flow
 
 import android.content.Context
 import android.hardware.usb.UsbDevice
@@ -11,10 +11,10 @@ import com.uav.host.common.DisplaySize
 import com.uav.host.aoa.flow.AoaStreamFlow
 import com.uav.host.aoa.run.AoaLinkRun
 import com.uav.host.aoa.input.HidTouchController
-import com.uav.host.aoa.session.HostSession
-import com.uav.host.aoa.usb.BulkByteChannel
-import com.uav.host.aoa.usb.BulkPair
-import com.uav.host.aoa.usb.UsbAttachRouter
+import com.uav.host.aoa.capture.HostSession
+import com.uav.host.aoa.capture.BulkByteChannel
+import com.uav.host.aoa.capture.BulkPair
+import com.uav.host.aoa.capture.UsbAttachRouter
 import com.uav.protocol.ByteChannel
 import com.uav.protocol.Logger
 import com.uav.protocol.aoa.LinkRetry

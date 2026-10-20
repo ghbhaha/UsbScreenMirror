@@ -1,4 +1,4 @@
-package com.uav.host.aoa.usb
+package com.uav.host.aoa.capture
 
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -13,7 +13,7 @@ import androidx.core.content.IntentCompat
 import com.uav.host.aoa.HostActivity
 import com.uav.host.common.AndroidLogger
 import com.uav.host.aoa.flow.AoaConnectFlow
-import com.uav.host.aoa.link.LinkCoordinator
+import com.uav.host.aoa.flow.LinkCoordinator
 import com.uav.protocol.Logger
 import com.uav.protocol.e
 import com.uav.protocol.i

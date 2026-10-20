@@ -2,7 +2,7 @@ package com.uav.host.aoa.debug
 
 import android.content.Intent
 import com.uav.host.common.DebugTools
-import com.uav.host.aoa.session.HostSession
+import com.uav.host.aoa.capture.HostSession
 import com.uav.protocol.Logger
 import com.uav.protocol.i
 import com.uav.protocol.w
