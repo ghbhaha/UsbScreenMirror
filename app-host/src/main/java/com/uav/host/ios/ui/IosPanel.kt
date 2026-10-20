@@ -1,11 +1,14 @@
 package com.uav.host.ios.ui
 
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.res.ColorStateList
 import android.os.Looper
+import android.util.Log
 import android.view.Surface
 import android.view.View
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.view.WindowInsetsCompat
@@ -107,16 +110,31 @@ class IosPanel(private val activity: Activity) {
 
         btnRearm.setOnClickListener { onRearm() }
         btnStop.setOnClickListener { onStop() }
-        btnCollapse.setOnClickListener { setMenuVisible(false) }
-        chipView.setOnClickListener { toggleMenu() }
+        btnCollapse.setOnClickListener {
+            Log.i(TAG, "点击来源=收起按钮")
+            setMenuVisible(false)
+        }
+        chipView.setOnClickListener {
+            Log.i(TAG, "点击来源=药丸")
+            toggleMenu()
+        }
 
         // 面板展开时才吃掉触摸（否则面板上的空白点击会被当成"点空白处收起面板"）。
-        // ★ 必须跟着 menuShown 走：收起动画期间若仍无条件返回 true，那 180ms 里它会挡住 chip。
-        overlayView.setOnTouchListener { _, _ -> menuShown }
+        // ★ 必须跟着 menuShown 走：收起动画期间若仍无条件返回 true，那 180ms 里它会挡住药丸。
+        // ★ 吃到触摸时顺手自愈：意图展开却不可见时，这一层会挡住所有触摸 —— 先把自己拉回可见。
+        overlayView.setOnTouchListener { _, _ ->
+            if (!menuShown) return@setOnTouchListener false
+            healIfInvisible()
+            true
+        }
 
-        // 点画面空白处切换面板（视频区在 root 之下，事件会先到 root 的 listener 吗？
-        // 不会 —— SurfaceView 不消费触摸，所以这里的 listener 能收到）
-        rootView.setOnClickListener { toggleMenu() }
+        // 点画面空白处：切换面板（展开 ⇄ 收起）。
+        // ★ 但意图是"展开"而实际看不见时，这一下应该是"叫出来"而不是"再收起一次" ——
+        //   否则药丸已藏、面板也看不见，用户就彻底没有入口了（实测连点 11~30 次全部空转）。
+        rootView.setOnClickListener {
+            Log.i(TAG, "点击来源=画面空白（menuShown=$menuShown）")
+            if (!healIfInvisible()) toggleMenu()
+        }
 
         setMenuVisible(true, animate = false)
         render(Stage.IDLE, null)
@@ -266,69 +284,172 @@ class IosPanel(private val activity: Activity) {
     fun toggleMenu() = setMenuVisible(!menuShown)
 
     /**
-     * 展开 / 收起面板。
+     * 展开 / 收起面板 —— **唯一入口**。
      *
-     * ## 这里曾经有个"隐藏后永远打不开"的真 bug
+     * ## 三条硬规则（2026-10-20 真机换来的，详见 `docs/排错手册.md` §3.16）
      *
-     * 旧实现只做 `animate().alpha(0).translationX(-w)`，靠 `withEndAction` 收尾设 `GONE`。
-     * 一旦动画被下一次 `cancel()` 打断（快速连点、或首帧自动收起撞上用户操作），
-     * `withEndAction` 就不执行 —— 面板变成**看得见 0、占位 450px、还吃掉所有触摸**的隐形墙，
-     * 左上角药丸永远点不到。
-     *
-     * 修法两条同时上：① 触摸拦截按 [menuShown] 判断；② 收起时把面板显式 `GONE`，
-     * 并把药丸露出来 —— 药丸是唯一的"叫回面板"入口，绝不能被挡住。
+     * 1. **显隐只认 `visibility`**。`alpha` / 位移只做装饰 —— 一旦用它们表达"显示"，
+     *    动画被 `cancel()` 时属性就停在中间值，面板成了一张看不见却照吃触摸的墙
+     *    （日志里 `vis=VISIBLE alpha=1.0 margin=0` 全对，屏幕上什么都没有）。
+     * 2. **滑动用 `leftMargin`，不用 `translationX`**。这台 MTK 设备上 View 离开可视区后
+     *    渲染节点会被合成器剔除，属性回位也不重绘（全宽位移 ⇒ 面板彻底消失）。
+     * 3. **收尾不靠动画回调**。`withEndAction` 在动画被 `cancel()` 时**永不执行**，
+     *    所以另挂 [snapToEnd] 守卫，到点无条件把终态钉死。
      */
     fun setMenuVisible(visible: Boolean, animate: Boolean = true) = onUi {
+        Log.i(
+            TAG,
+            "面板${if (visible) "展开" else "收起"}（animate=$animate） 前状态 " +
+                "vis=${overlayView.visibility} alpha=${overlayView.alpha} margin=${menuMargin()}"
+        )
         menuShown = visible
-        android.util.Log.i("UAV-IosQt", "面板 ${if (visible) "展开" else "收起"}（animate=$animate）")
-        val slide = overlayView.width.takeIf { it > 0 }
-            ?: (PANEL_DP * overlayView.resources.displayMetrics.density).toInt()
+        cancelAnimations()
 
-        overlayView.animate().cancel()
-        // 药丸与面板在左上角重叠：展开时藏药丸（不挡标题），收起时露药丸（当唯一入口）
-        chipView.visibility = if (visible) View.GONE else View.VISIBLE
-
-        if (!visible && !animate) {
-            overlayView.alpha = 0f
-            overlayView.translationX = -slide.toFloat()
-            overlayView.visibility = View.GONE
-            return@onUi
-        }
-        overlayView.visibility = View.VISIBLE
         if (visible) {
+            overlayView.visibility = View.VISIBLE
+            // SurfaceView 是独立图层，View 侧也显式提到最上（双保险）
+            overlayView.bringToFront()
+            chipView.visibility = View.GONE
             if (animate) {
                 overlayView.alpha = 0f
-                overlayView.translationX = -slide.toFloat()
-                overlayView.animate().alpha(1f).translationX(0f)
-                    .setDuration(ANIM_MS)
-                    .withEndAction { settleMenu() }
-                    .start()
+                slideMargin(from = -slidePx(), to = 0)
+                overlayView.animate().alpha(1f).setDuration(ANIM_MS).start()
             } else {
                 overlayView.alpha = 1f
-                overlayView.translationX = 0f
-                settleMenu()
+                setMenuMargin(0)
             }
         } else {
-            overlayView.animate().alpha(0f).translationX(-slide.toFloat())
-                .setDuration(ANIM_MS)
-                .withEndAction { settleMenu() }
-                .start()
-            // 动画可能被 cancel（withEndAction 就不会跑）—— 兜底再校一次
-            overlayView.postDelayed({ settleMenu() }, ANIM_MS + 80)
+            chipView.visibility = View.VISIBLE
+            if (animate) {
+                slideMargin(from = 0, to = -slidePx())
+                overlayView.animate().alpha(0f).setDuration(ANIM_MS).start()
+            }
+        }
+
+        // 守卫用 `ANIM_MS * 3` 而不是 `+ 80`：系统"动画时长缩放"可能 2~3x，
+        // 太短的守卫会把动画腰斩成"滑一半突然没了"。
+        overlayView.removeCallbacks(snapToEnd)
+        overlayView.postDelayed(snapToEnd, ANIM_MS * 3)
+        startWatchdog()
+        syncFocusToMenu()
+    }
+
+    /** 停掉一切会改 `alpha` / `leftMargin` 的动画。 */
+    private fun cancelAnimations() {
+        overlayView.animate().cancel()
+        slideAnimator?.cancel()
+        // 位移一律走 leftMargin（见 setMenuVisible 规则 2），这里顺手把残留归零
+        overlayView.translationX = 0f
+    }
+
+    // -- 布局位移（唯一被允许的滑动方式）-----------------------------------
+
+    /** 布局位移动画（见 [slideMargin]）。只动 `leftMargin`，不碰 `translationX`。 */
+    private var slideAnimator: ValueAnimator? = null
+
+    /** 滑动幅度（px）。必须远小于面板宽度，保证动画期间面板始终有一部分在屏幕内。 */
+    private fun slidePx(): Int =
+        (SLIDE_DP * overlayView.resources.displayMetrics.density).toInt()
+
+    /** 当前布局位移（`leftMargin`）。0 = 完全贴合左边、完整可见。 */
+    private fun menuMargin(): Int =
+        (overlayView.layoutParams as? FrameLayout.LayoutParams)?.leftMargin ?: 0
+
+    private fun setMenuMargin(px: Int) {
+        val lp = (overlayView.layoutParams as? FrameLayout.LayoutParams) ?: return
+        if (lp.leftMargin == px) return
+        lp.leftMargin = px
+        overlayView.layoutParams = lp
+    }
+
+    /** 逐帧改 `leftMargin` 做滑动：真实布局位移，走 measure/layout，不会触发渲染节点剔除。 */
+    private fun slideMargin(from: Int, to: Int) {
+        slideAnimator?.cancel()
+        setMenuMargin(from)
+        slideAnimator = ValueAnimator.ofInt(from, to).apply {
+            duration = ANIM_MS
+            addUpdateListener { setMenuMargin(it.animatedValue as Int) }
+            start()
         }
     }
 
-    /** 按 [menuShown] 把面板的可见性/可点击性对齐，幂等。 */
-    private fun settleMenu() {
-        if (menuShown) {
-            overlayView.visibility = View.VISIBLE
-            overlayView.alpha = 1f
-            overlayView.translationX = 0f
-        } else {
-            overlayView.visibility = View.GONE
-        }
+    // -- 落定 / 自愈 -----------------------------------------------------
+
+    /**
+     * 把面板钉到 [menuShown] 对应的终态。**幂等**。
+     *
+     * 顺序不能反：先停动画（它们每帧都在重写 `alpha` / `leftMargin`），再归零位移，
+     * 最后按意图设可见性。`alpha` 即使在 `GONE` 时也复位成 1 —— 否则下次展开从"全透明"
+     * 起步，动画一旦不跑就又是一张隐形墙。
+     */
+    private val snapToEnd = Runnable {
+        cancelAnimations()
+        setMenuMargin(0)
+        overlayView.alpha = 1f
+        overlayView.visibility = if (menuShown) View.VISIBLE else View.GONE
+        Log.i(
+            TAG,
+            "面板落定：menuShown=$menuShown vis=${overlayView.visibility} " +
+                "alpha=${overlayView.alpha} margin=${menuMargin()}"
+        )
+    }
+
+    /** 落定 + 同步药丸与焦点。任何路径都可调，幂等。 */
+    private fun snapMenu() {
+        snapToEnd.run()
+        if (menuShown) overlayView.bringToFront()
         chipView.visibility = if (menuShown) View.GONE else View.VISIBLE
         syncFocusToMenu()
+    }
+
+    /** 「逻辑上该显示」而且「真的看得见」。 */
+    private fun visuallyShown(): Boolean =
+        overlayView.visibility == View.VISIBLE &&
+            overlayView.alpha > 0.5f &&
+            menuMargin() == 0
+
+    /**
+     * 自愈：意图是展开、实际却看不见 ⇒ 立刻强制显示。
+     *
+     * 为什么必须有：`menuShown = true` 时药丸已经藏了，如果面板又不可见，用户就**没有任何入口**
+     * （点画面只会"再收起一次"）。实测连点 11~30 次全部空转，日志却一直显示"已展开"。
+     *
+     * @return 这次调用是否做了自愈
+     */
+    private fun healIfInvisible(): Boolean {
+        if (!menuShown || visuallyShown()) return false
+        Log.w(
+            TAG,
+            "面板自愈：意图展开但不可见（vis=${overlayView.visibility} " +
+                "alpha=${overlayView.alpha} margin=${menuMargin()}）⇒ 强制显示"
+        )
+        snapMenu()
+        return true
+    }
+
+    /**
+     * 显示后 [WATCH_MS] 校验一次"真的看得见"，不对就复位。
+     *
+     * 这个面板出现过两次"逻辑可见、肉眼不可见"（当时所有可查属性都正常），
+     * 留一条看门狗日志，是为了下次能直接看到"落定之后到底是不是真的可见"。
+     */
+    private val watchdog = Runnable {
+        if (!menuShown) return@Runnable
+        if (visuallyShown()) {
+            Log.i(TAG, "面板看门狗：可见")
+            return@Runnable
+        }
+        Log.w(
+            TAG,
+            "面板看门狗：不可见（vis=${overlayView.visibility} alpha=${overlayView.alpha} " +
+                "margin=${menuMargin()} isShown=${overlayView.isShown}）⇒ 复位"
+        )
+        snapMenu()
+    }
+
+    private fun startWatchdog() {
+        overlayView.removeCallbacks(watchdog)
+        overlayView.postDelayed(watchdog, WATCH_MS)
     }
 
     /**
@@ -342,7 +463,7 @@ class IosPanel(private val activity: Activity) {
         if (!com.uav.host.common.FocusMode.wanted()) return
         val target = if (menuShown) btnCollapse else chipView
         if (target.isShown && !target.hasFocus() && !target.requestFocus()) {
-            android.util.Log.w("UAV-IosQt", "焦点请求失败（${if (menuShown) "面板" else "药丸"}）")
+            Log.w(TAG, "焦点请求失败（${if (menuShown) "面板" else "药丸"}）")
         }
     }
 
@@ -364,7 +485,22 @@ class IosPanel(private val activity: Activity) {
     private inline fun <reified T : View> view(id: Int): T = activity.findViewById<T>(id)
 
     private companion object {
+        /** logcat tag（与解码器那条链路一致，排障时一条命令就能捞全）。 */
+        const val TAG = "UAV-IosQt"
+
+        /** 面板滑入/滑出时长。 */
         const val ANIM_MS = 180L
+
+        /** 显示后多久校验一次"真的看得见"（见 [watchdog]）。 */
+        const val WATCH_MS = 700L
+
+        /**
+         * 位移动画幅度。
+         *
+         * ★ 必须远小于面板宽度（layout 里 300dp）：整块移出可视区会让合成器剔除渲染节点，
+         *   之后属性回位也不重绘（见 [slideMargin]）。16dp 与 AOA 侧 `HostPanel` 一致。
+         */
+        const val SLIDE_DP = 16
 
         /**
          * 日志只保留最近这么多条。
@@ -376,8 +512,5 @@ class IosPanel(private val activity: Activity) {
 
         /** 日志刷新节流：多次 log 合并成一次 UI 刷新（最长延迟一帧多一点） */
         const val LOG_FLUSH_MS = 120L
-
-        /** 与 layout 里 overlay 的宽度一致（动画位移用它兜底，此时还没测量出 width） */
-        const val PANEL_DP = 300
     }
 }
