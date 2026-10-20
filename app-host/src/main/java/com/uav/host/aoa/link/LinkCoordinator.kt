@@ -9,6 +9,7 @@ import android.os.Looper
 import com.uav.host.common.AndroidLogger
 import com.uav.host.common.DisplaySize
 import com.uav.host.aoa.flow.AoaStreamFlow
+import com.uav.host.aoa.run.AoaLinkRun
 import com.uav.host.aoa.input.HidTouchController
 import com.uav.host.aoa.session.HostSession
 import com.uav.host.aoa.usb.BulkByteChannel
@@ -106,34 +107,6 @@ class LinkCoordinator(
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
-     * 链路收尾 / 重建的**串行后台队列**（10.33）。
-     *
-     * 为什么必须有它：关会话是阻塞操作 —— `MediaCodec.release()` + `Connection.close()`
-     * （后者会去拿 `BufferedByteChannel` 的锁，而读线程正卡在 `bulkTransfer` 里）。
-     * 实测主线程点一下"强制重握手"就被堵 5 秒、系统直接 ANR：
-     * ```
-     * "main" Blocked at BufferedByteChannel.close ← HostSession.close ← LinkCoordinator.scan
-     * ```
-     * 单线程 FIFO 同时保证"先关干净旧会话，再开新连接"——两者都碰 USB，并发会抢端点。
-     */
-    private val ioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "uav-link-io").apply { isDaemon = true }
-    }
-
-    /**
-     * 是否已有一次"重启链路"排在队里（10.33）。
-     *
-     * 串行只保证**顺序**，不保证**不重复**：用户连点三次「强制重握手」会排出三轮
-     * 完整 AOA 握手（每轮都发 `START_ACCESSORY`）。实测代价很重 —— 每发一次都会重置
-     * 配件配置、踢掉手机端刚打开的 fd，三轮连发直接把手机打进"配件功能被锁"的死状态
-     * （`svc usb getFunctions` 返回 `accessory`，此后软件手段全无效，**只能拔插线**）。
-     * 用这个标志把连点合并成一次。
-     *
-     * ★ 2026-10-20：与"连续失败计数 + 退避间隔"合并进 [LinkRetry]（`:protocol`，有单测）。
-     *   三者互相耦合（成功清零 / 失败计数 / 计数决定间隔），分散写最容易出的错是
-     *   "某条路径忘了复位 ⇒ 入口永久锁死"—— 见 [LinkRetry] 的类注释。
-     */
-    /**
      * 会话侧协程作用域。
      *
      * 只跑**可挂起**的部分（握手流程、原地重协商）；USB 读写与解码仍在各自的专用线程上
@@ -150,6 +123,15 @@ class LinkCoordinator(
         maxShift = MAX_POLL_BACKOFF_SHIFT,
         capDelayMs = MAX_POLL_INTERVAL_MS,
     )
+
+    /**
+     * 链路动作的**串行执行器 + 运行权**（关会话 / 重新握手都排在这一条队列上）。
+     *
+     * 为什么必须串行、为什么队列关了要另起线程而不是退回调用线程，
+     * 见 [AoaLinkRun] 的类注释 —— 那两条都是 10.33 用 ANR 换来的。
+     */
+    private val linkRun = AoaLinkRun(retry = retry, logger = logger, tag = TAG)
+
 
     /**
      * 「用户主动切换画质 / 正在重开会话」标志（10.17）。
@@ -339,9 +321,8 @@ class LinkCoordinator(
         stopSession()
         // ★ 会话先停、作用域后取消：反过来的话握手协程可能在收尾中间被掐断
         scope.cancel()
-        // 不 shutdownNow：正在跑的关闭任务被中断的话，fd 可能真的漏掉
-        // （`/dev/usb_accessory` 独占，漏一个就永久连不回来）。
-        ioExecutor.shutdown()
+        // 不中断正在跑的关闭任务：`/dev/usb_accessory` 独占，漏一个 fd 就永久连不回来
+        linkRun.shutdown()
     }
 
     /**
@@ -477,50 +458,23 @@ class LinkCoordinator(
         return old
     }
 
-    /** 把关闭动作丢进串行后台队列（队列已关时另起线程关，绝不退回调用线程）。 */
+    /** 把关闭动作丢进串行队列（队列已关时另起线程关，绝不退回调用线程）。 */
     private fun submitClose(s: HostSession) {
-        val job = Runnable {
-            runCatching { s.close() }
-                .onFailure { logger.w(TAG, "关闭旧会话失败: ${it.message}") }
-        }
-        try {
-            ioExecutor.execute(job)
-        } catch (re: java.util.concurrent.RejectedExecutionException) {
-            // 队列已 shutdown（Activity 正在销毁）⇒ 另起线程关。
-            // ★ 不能直接 job.run()：调用方可能是主线程，而 close() 是阻塞的。
-            Thread(job, "uav-link-close").apply { isDaemon = true }.start()
-        }
+        linkRun.closeLater { s.close() }
     }
 
     /**
      * 串行执行"关干净旧会话 → 再做 [then]"。
      *
      * ★ 必须串行：关会话和重新握手都要碰 USB，旧连接还没 close 就 claim 新接口会抢端点。
-     *   单线程 FIFO 天然保证顺序，而且整段都不在主线程。
      */
     private fun restartSerial(then: () -> Unit) {
-        // 连点合并：见 [retry] / [LinkRetry.tryBeginAttempt]
-        if (!retry.tryBeginAttempt()) {
-            logger.i(TAG, "已有一次链路重启在排队/执行中，忽略这次重复请求")
-            return
-        }
-        val job = Runnable {
-            try {
-                detachSession()?.let { old ->
-                    runCatching { old.close() }
-                        .onFailure { logger.w(TAG, "关闭旧会话失败: ${it.message}") }
-                }
-                then()
-            } finally {
-                // ★ 无条件交还：这里漏一次，之后所有扫描 / 插线都会被当成重复请求丢掉
-                retry.endAttempt()
+        linkRun.restart {
+            detachSession()?.let { old ->
+                runCatching { old.close() }
+                    .onFailure { logger.w(TAG, "关闭旧会话失败: ${it.message}") }
             }
-        }
-        try {
-            ioExecutor.execute(job)
-        } catch (re: java.util.concurrent.RejectedExecutionException) {
-            // 同上：不能退回调用线程（它可能是主线程，[then] 里的握手是阻塞的）
-            Thread(job, "uav-link-io-fallback").apply { isDaemon = true }.start()
+            then()
         }
     }
 

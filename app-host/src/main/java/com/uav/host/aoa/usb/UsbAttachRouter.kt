@@ -12,6 +12,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import com.uav.host.aoa.HostActivity
 import com.uav.host.common.AndroidLogger
+import com.uav.host.aoa.flow.AoaConnectFlow
 import com.uav.host.aoa.link.LinkCoordinator
 import com.uav.protocol.Logger
 import com.uav.protocol.e
@@ -62,6 +63,9 @@ class UsbAttachRouter(
         context.getSystemService(Context.USB_SERVICE) as UsbManager
 
     private val aoa = AoaHandshake(usbManager, logger)
+
+    /** 连接段的流程（握手 / 等重枚举 / claim），本类只负责权限与回调翻译。 */
+    private val connectFlow = AoaConnectFlow(usbManager, aoa, logger)
 
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "uav-usb-worker").apply { isDaemon = true }
@@ -199,6 +203,11 @@ class UsbAttachRouter(
             ?: withBulk.maxByOrNull { it.deviceId }
     }
 
+    /**
+     * 一次连接尝试：握手 / 等重枚举 / claim 全在 [AoaConnectFlow] 里。
+     *
+     * 这里只剩三件事：日志、权限（receiver 绑定在本类，搬不走）、把结果翻译成回调。
+     */
     private fun runPipeline(device: UsbDevice, forceHandshake: Boolean) {
         logger.i(
             TAG,
@@ -207,103 +216,33 @@ class UsbAttachRouter(
                 "forceHandshake=$forceHandshake"
         )
 
-        // 已经是配件设备（例如 App 重启后线还插着）-> 先试最快的直连路径。
-        // ⚠️ 这条路径**无法确认配件身份是不是我们的**，所以上层在 CNXN 超时后
-        //    会用 forceHandshake = true 再回来一次（自愈，见 HostActivity）。
-        if (Aoa.isAccessoryPid(device.productId) && !forceHandshake) {
-            callback.onStatus("检测到配件设备，直接建立通道…")
-            connectToAccessory(device, aoaVersion = 0)
-            return
-        }
+        when (val outcome = connectFlow.connect(
+            device = device,
+            forceHandshake = forceHandshake,
+            status = callback::onStatus,
+            permission = ::permissionOrError,
+        )) {
+            is AoaConnectFlow.Outcome.Linked ->
+                callback.onReady(outcome.connection, outcome.pair, outcome.aoaVersion, outcome.device)
 
-        if (Aoa.isAccessoryPid(device.productId)) {
-            callback.onStatus("强制重握手：把配件身份改写为 UAV/usbscreen…")
-        } else {
-            callback.onStatus("检测到设备，等待 USB 授权…")
+            is AoaConnectFlow.Outcome.Failed -> callback.onError(outcome.message)
         }
-        if (!ensurePermission(device)) {
-            callback.onError(
-                if (permissionUiMissing) {
-                    "本机没有「USB 授权」界面，拿不到 USB 权限 —— 这台设备无法投屏"
-                } else {
-                    "USB 授权被拒绝或超时（设备 ${device.deviceId}）"
-                }
-            )
-            return
-        }
-
-        callback.onStatus("握手中（AOA v2）…")
-        val connection = usbManager.openDevice(device)
-        if (connection == null) {
-            callback.onError("openDevice 返回 null —— 通常是没有 USB 权限")
-            return
-        }
-
-        val version: Int
-        try {
-            // ★ 直接发控制请求，不要先 claimInterface（计划 2.3 红线）
-            version = aoa.handshake(device, connection)
-            if (version < 2) {
-                callback.onError("设备不支持 AOAv2（version=$version）")
-                return
-            }
-        } finally {
-            // ★ 53 号发送后手机立即重枚举，旧句柄失效，必须马上关闭（计划 2.5）
-            runCatching { connection.close() }
-        }
-
-        callback.onStatus("等待手机切换为配件模式…")
-        // ⚠️ 两种情形必须区别对待（实测踩到）：
-        //
-        //  (a) 手机原本在**普通模式** → 53 号会触发真正的 USB 重枚举，
-        //      此时必须等到"新出现的那台"（deviceId 变化），否则会立刻拿到旧设备。
-        //  (b) 手机**本来就在配件模式**（强制重握手）→ 实测 53 号**不会重新枚举**，
-        //      只是按新字符串把 USB_ACCESSORY_ATTACHED 重新派发给匹配的 App
-        //      （USB 描述符不变，宿主侧 deviceId 保持不变）。
-        //      此时如果死等"新设备"必然超时 —— 于是退而接受同一台设备。
-        val alreadyAccessory = Aoa.isAccessoryPid(device.productId)
-        val accessory = aoa.awaitAccessoryDevice(
-            previousDeviceId = device.deviceId,
-            timeoutMs = if (alreadyAccessory) RENUM_TIMEOUT_ALREADY_ACCESSORY_MS else RENUM_TIMEOUT_MS,
-            allowSameDevice = alreadyAccessory,
-        )
-        if (accessory == null) {
-            callback.onError(
-                "等待重枚举超时。检查：① 手机是否弹出『打开该 App 处理 USB 配件』；" +
-                    "② OTG 线是否支持数据传输；" +
-                    "③ 若手机原本已被其它宿主 App 占用为配件，请拔线重插一次。" +
-                    "（会自动重试：手机端若持着一个收不到应答的配件 fd，会在约 12s 后自行释放，" +
-                    "届时下一次握手即可成功）"
-            )
-            return
-        }
-
-        connectToAccessory(accessory, version)
     }
 
-    private fun connectToAccessory(accessory: UsbDevice, aoaVersion: Int) {
-        // ★ 重枚举后是"新设备"，权限可能没继承过来，必须重新申请（计划 2.7）
-        callback.onStatus("等待配件授权…")
-        if (!ensurePermission(accessory)) {
-            callback.onError("配件设备授权被拒绝或超时（id=${accessory.deviceId}）")
-            return
+    /**
+     * 拿权限，失败时给一句**能照做**的话。
+     *
+     * 两种失败要分开说：没有授权界面（定制 ROM 裁了 SystemUI）与"弹了但被拒/超时"，
+     * 用户能做的事完全不同。
+     */
+    private fun permissionOrError(device: UsbDevice, isAccessory: Boolean): String? {
+        if (ensurePermission(device)) return null
+        return when {
+            permissionUiMissing ->
+                "本机没有「USB 授权」界面，拿不到 USB 权限 —— 这台设备无法投屏"
+            isAccessory -> "配件设备授权被拒绝或超时（id=${device.deviceId}）"
+            else -> "USB 授权被拒绝或超时（设备 ${device.deviceId}）"
         }
-
-        val connection = usbManager.openDevice(accessory)
-        if (connection == null) {
-            callback.onError("openDevice(accessory) 返回 null")
-            return
-        }
-
-        val pair = claimBulkPair(connection, accessory, logger)
-        if (pair == null) {
-            runCatching { connection.close() }
-            callback.onError("claimInterface 失败（接口被占用或无权限）")
-            return
-        }
-
-        callback.onStatus("已连接，开始协议会话")
-        callback.onReady(connection, pair, aoaVersion, accessory)
     }
 
     /**
@@ -404,15 +343,6 @@ class UsbAttachRouter(
 
     companion object {
         const val TAG = "UAV-Host"
-
-        /** 普通模式手机切换为配件时的重枚举等待（计划 2.6：200ms × 25 = 5s）。 */
-        const val RENUM_TIMEOUT_MS = 5_000L
-
-        /**
-         * 手机**本来就在配件模式**时的等待：预期它不会重新枚举，
-         * 所以只短暂确认一下"有没有新设备冒出来"，然后退回复用原设备。
-         */
-        const val RENUM_TIMEOUT_ALREADY_ACCESSORY_MS = 1_500L
 
         /** 轮询路径对同一台设备的最大重试次数。 */
         const val MAX_ATTEMPTS_PER_DEVICE = 3
