@@ -1,5 +1,6 @@
-package com.uav.host.ios
+package com.uav.host.ios.capture
 
+import android.app.Application
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
@@ -19,12 +20,21 @@ import android.hardware.usb.UsbManager
  *  - 不做 `setConfiguration(0) → setConfiguration(5)` 的双配置来回；
  *  - 不 `clearHalt`；
  *  - 不发明文控制 kick。
+ *
+ * ## Context 必须是 Application
+ *
+ * [appContext] 会被流程层当字段长期持有（`IosCaptureFlow.appContext`）——
+ * 传 Activity 进来就是一条隐性泄漏链。所以构造参数类型直接钉成 Application，
+ * 想传 Activity 都编译不过。
  */
 internal class QtTransport(
-    private val context: Context,
+    private val ctx: Application,
     private val usb: UsbManager,
     private val log: (String) -> Unit
 ) {
+
+    /** 采集流程要拿 `filesDir` / `getExternalFilesDir`，但不必自己再持一份 Context。 */
+    val appContext: Context get() = ctx
 
     companion object {
         const val APPLE_VID = 0x05AC
@@ -42,7 +52,7 @@ internal class QtTransport(
     fun requestPermission(dev: UsbDevice) {
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val pi = PendingIntent.getBroadcast(
-            context, 0, Intent(ACTION_USB_PERMISSION).setPackage(context.packageName), flags
+            ctx, 0, Intent(ACTION_USB_PERMISSION).setPackage(ctx.packageName), flags
         )
         log("请求 USB 权限：${dev.deviceName}")
         usb.requestPermission(dev, pi)
@@ -80,15 +90,6 @@ internal class QtTransport(
             for (j in 0 until cfg.interfaceCount) {
                 if (isCapture(cfg.getInterface(j))) return cfg
             }
-        }
-        return null
-    }
-
-    /** 找 QuickTime 采集接口：class 0xFF、subclass 0x2A。 */
-    fun findCaptureInterface(dev: UsbDevice): UsbInterface? {
-        for (i in 0 until dev.interfaceCount) {
-            val itf = dev.getInterface(i)
-            if (isCapture(itf)) return itf
         }
         return null
     }

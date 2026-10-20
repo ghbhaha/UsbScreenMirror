@@ -1,6 +1,7 @@
-package com.uav.host.ios
+package com.uav.host.ios.capture
 
 import android.hardware.usb.UsbDevice
+import kotlinx.coroutines.delay
 import android.hardware.usb.UsbInterface
 import com.uav.protocol.ios.CertKit
 import com.uav.protocol.ios.DeviceVersion
@@ -100,7 +101,7 @@ internal class Pairing(
      *
      * @return 成功时返回记录（**已写盘**）；失败返回 null 并把原因打到日志
      */
-    fun run(dev: UsbDevice): PairRecord? {
+    suspend fun run(dev: UsbDevice): PairRecord? {
         val cfg = muxConfiguration(dev)
         if (cfg == null) {
             log("✗ 没有任何配置含 usbmux 接口（0xFF/0xFE/02）")
@@ -229,7 +230,7 @@ internal class Pairing(
      * 设备在用户还没点时会回 `PairingDialogResponsePending`，这不是失败，
      * 按 PC 实现的做法每秒重发一次。
      */
-    private fun doPair(
+    private suspend fun doPair(
         link: MuxLink,
         material: CertKit.Material,
         wifiMac: String?,
@@ -286,7 +287,8 @@ internal class Pairing(
                     return null
                 }
             }
-            Thread.sleep(1000)
+            // ★ 挂起而不是 sleep：等用户点「信任」最长 60s，阻塞线程白占一条
+            delay(1000)
         }
         log("✗ ${USER_ACCEPT_TIMEOUT_MS / 1000}s 内没有点信任，放弃")
         return null

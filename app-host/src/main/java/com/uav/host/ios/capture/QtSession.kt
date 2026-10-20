@@ -1,4 +1,4 @@
-package com.uav.host.ios
+package com.uav.host.ios.capture
 
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
@@ -72,6 +72,14 @@ internal class QtSession(
      * 不给（null）时退化成只看 [stopRequested]，行为与从前一致。
      */
     private val stopSignal: (() -> Boolean)? = null,
+    /**
+     * 高频日志的去重器（`key` → 是否放行）。
+     *
+     * SKEW 应答、渲染计数每秒好几条，而面板只有 50 条缓冲 —— 以前是界面层按前缀
+     * **硬编码丢弃**（`IosDecoderHost.log` 里的 `startsWith("SKEW")`），等于让 UI 认识业务报文名。
+     * 现在由产生方声明"这条是高频道"，`null` = 不限流。logcat 那边一条不少。
+     */
+    private val logThrottle: ((key: String, msg: String) -> Unit)? = null,
 ) {
 
     private var tail = ByteArray(0)
@@ -140,7 +148,8 @@ internal class QtSession(
         maxSeconds: Int,
         maxFrames: Int = Int.MAX_VALUE,
         idleAbortSeconds: Int = 0
-    ): QtStats {        // ★ 读缓冲必须小：1 MiB 的 bulk IN 在 xHCI 上会排成一长串传输描述符，
+    ): QtStats {
+        // ★ 读缓冲必须小：1 MiB 的 bulk IN 在 xHCI 上会排成一长串传输描述符，
         //   而设备最先发的是 16B 的 PING（短包）——短包会让整串立即取消，
         //   取消 URB 正是会把设备端点弄坏的动作（本项目已踩过）。
         //   Windows 上 libusb0 没有这种语义，所以 1 MiB 在那边照样能跑。
@@ -253,7 +262,8 @@ internal class QtSession(
                 }
                 if (now - lastReport >= 3000) {
                     lastReport = now
-                    log("  …空闲 ${(now - start) / 1000}s：超时 $timeouts 次 / 错误 $totalErrors 次 / 已收 ${st.bytes} B")
+                    // 这行每 3 秒一条，且紧跟在错误风暴后面 —— 限流，否则面板会被"空闲"刷满
+                    logHot("idle", "  …空闲 ${(now - start) / 1000}s：超时 $timeouts 次 / 错误 $totalErrors 次 / 已收 ${st.bytes} B")
                 }
                 // 开头一直没有数据 ⇒ 设备侧没武装，别在这里空等
                 if (st.bytes == 0L && now >= idleDeadline) {
@@ -292,6 +302,17 @@ internal class QtSession(
      *
      * 调用点全在接收线程里（PING/CWPA/CVRP/FEED…），同步写会让读侧跟着停。
      */
+    /**
+     * 高频诊断日志：走 [logThrottle] 限流（没配就原样打）。
+     *
+     * 只用于"每秒好几次"的排障输出（SKEW 应答、渲染计数、空闲心跳）；
+     * 状态转折、错误、首帧一律走 [log]，**不能被这里挡掉**。
+     */
+    private fun logHot(key: String, msg: String) {
+        val f = logThrottle
+        if (f == null) log(msg) else f(key, msg)
+    }
+
     private fun write(data: ByteArray) {
         if (epOut == null) return
         writeLock.lock()

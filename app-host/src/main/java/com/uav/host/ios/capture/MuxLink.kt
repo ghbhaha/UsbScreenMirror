@@ -1,4 +1,4 @@
-package com.uav.host.ios
+package com.uav.host.ios.capture
 
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint

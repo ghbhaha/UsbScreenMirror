@@ -1,4 +1,4 @@
-package com.uav.host.ios
+package com.uav.host.ios.capture
 
 /**
  * iOS 采集的功能开关（产品级，不是调试入口）。
@@ -7,6 +7,21 @@ package com.uav.host.ios
  * 这边是"某个环节在这台设备上走不通、先用别的策略"的取舍开关。
  */
 internal object IosFeatures {
+
+    /**
+     * 采集态判据：设备描述符里的配置数从 4 涨到 **5**。
+     *
+     * ## 为什么只能是"配置数"而不是"有没有 0x2A 接口"
+     *
+     * `UsbDevice.interfaceCount/getInterface()` 是**所有配置的接口并集**，
+     * 永远能找到 0x2A ⇒ 用它判断会让 `activate` 从未被真正触发（踩过）。
+     *
+     * ⚠️ 这个常量以前在 `IosActivity` / `IosCaptureFlow` / `IosRearmer` / `IosPairingFlow`
+     *   各写了一份 `5`，注释里写着"必须保持一致"却没有任何东西保证它 ——
+     *   一处改了会出现「重新武装认为已就绪、采集流程认为还在普通态」的互相等待。
+     *   现在只有一个来源。
+     */
+    const val CAPTURE_CONFIG_COUNT = 5
 
     /**
      * lockdown 会话里**等 TLS 握手**的时长（毫秒），到点就带着"半开"的连接继续投屏。

@@ -124,4 +124,8 @@ kotlin {
 dependencies {
     implementation(project(":protocol"))
     implementation(libs.androidx.core.ktx)
+    // 协程重构（P0 地基）：lifecycleScope + Dispatchers + ComponentActivity
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.activity.ktx)
 }

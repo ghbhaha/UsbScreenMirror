@@ -1,8 +1,9 @@
-package com.uav.host.ios
+package com.uav.host.ios.media
 
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.view.Surface
+import com.uav.protocol.media.AnnexB
 import com.uav.protocol.ios.SpsInfo
 import java.nio.ByteBuffer
 
@@ -25,6 +26,12 @@ internal class H264Decoder(
     private var ptsUs = 0L
     private var frames = 0
 
+    /** 复用输出缓冲描述（每帧 `drain` 都跑，不该每次都 new 一个）。 */
+    private val outInfo = MediaCodec.BufferInfo()
+
+    /** 喂帧失败只在第一次打日志：`submit` 在热路径上，刷屏会把面板 50 条缓冲冲干净。 */
+    private var droppedOnce = false
+
     /**
      * SPS 解出的真实画面尺寸（**暂存**，不一定马上交给视图）。
      *
@@ -39,6 +46,12 @@ internal class H264Decoder(
 
     /**
      * 用 Annex-B 形式的 SPS+PPS 起解码器。
+     *
+     * ## csd 注入：先整体、失败再切分
+     *
+     * 整体塞进 `csd-0` 在绝大多数机型上可用；但部分 legacy OMX 组件会拒绝/忽略合并的
+     * `csd-0`（`configure` 失败，或能起但不吐帧），所以整体注入失败时按起始码切成
+     * `csd-0`/`csd-1` 再试一次 —— 与 `aoa/video/VideoDecoder.configure` 同一套策略。
      *
      * @param announceSizeNow 是否**立刻**把尺寸交给视图。
      *   - 首次启动：true —— 反正屏幕还是黑的，早点把信箱尺寸摆好；
@@ -64,19 +77,46 @@ internal class H264Decoder(
             } else {
                 sizePending = sps != null
             }
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
-                setByteBuffer("csd-0", ByteBuffer.wrap(csd))
-            }
-            val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            c.configure(fmt, surface, null, 0)
-            c.start()
+            val c = configureCodec(csd, w, h)
             codec = c
             log("解码器已启动（${w}x$h）")
             true
         }.getOrElse {
-            log("✗ 解码器启动失败：${it.message}")
+            log("✗ 解码器启动失败：${it.javaClass.simpleName}: ${it.message}")
             false
         }
+    }
+
+    /**
+     * 建一个可用的 codec：先整体注入 `csd-0`，不行再按起始码切成 `csd-0`/`csd-1`。
+     *
+     * ⚠️ 每一条失败路径都必须把建了一半的 codec `release` 掉：否则每次重试（新 CSD /
+     *   Surface 重建 / 重新武装）都漏一个到底层 codec 池，池子耗尽后整个机型的视频都起不来。
+     */
+    private fun configureCodec(csd: ByteArray, w: Int, h: Int): MediaCodec =
+        try {
+            tryConfigure(listOf(csd), w, h)
+        } catch (whole: Throwable) {
+            val nals = AnnexB.split(csd)
+            log("✗ 整体注入 csd-0 失败（${whole.message}），回退按起始码切分为 ${nals.size} 段")
+            if (nals.isEmpty()) throw whole
+            tryConfigure(nals.take(2), w, h)
+        }
+
+    private fun tryConfigure(units: List<ByteArray>, w: Int, h: Int): MediaCodec {
+        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+            units.forEachIndexed { i, u -> setByteBuffer("csd-$i", ByteBuffer.wrap(u)) }
+        }
+        val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        try {
+            c.configure(fmt, surface, null, 0)
+            c.start()
+        } catch (t: Throwable) {
+            runCatching { c.stop() }
+            runCatching { c.release() }
+            throw t
+        }
+        return c
     }
 
     /**
@@ -99,32 +139,44 @@ internal class H264Decoder(
         runCatching { codec?.release() }
         codec = null
         frames = 0
+        droppedOnce = false
         start(csd, announceSizeNow = false)
     }
 
-    /** 送一帧（Annex-B）。 */
+    /**
+     * 送一帧（Annex-B）。
+     *
+     * ★ 本方法跑在 `QtSession` 的**读循环**上（同一条线程还要读 USB、回 SKEW/时钟应答、喂音频），
+     *   所以**绝不能等**：输入缓冲拿不到就丢掉这一帧，与 `PcmAudioPlayer.feed` 的
+     *   `WRITE_NON_BLOCKING` 是同一个取舍。等 10ms 的话，一旦解码器停吐帧，60fps 下
+     *   一半以上的读循环时间会耗在等待上，连时钟应答都被拖慢。
+     */
     fun submit(annexB: ByteArray) {
         val c = codec ?: return
         runCatching {
-            val inIdx = c.dequeueInputBuffer(10_000)
-            if (inIdx >= 0) {
-                val buf = c.getInputBuffer(inIdx) ?: return
-                buf.clear()
-                if (buf.remaining() < annexB.size) {
-                    // 输入缓冲不够：这一帧丢掉（正常不会发生，单个 NAL 远小于 1MB）
-                    c.queueInputBuffer(inIdx, 0, 0, ptsUs, 0)
-                    return
-                }
-                buf.put(annexB)
-                ptsUs += 16_666
-                c.queueInputBuffer(inIdx, 0, annexB.size, ptsUs, 0)
+            val inIdx = c.dequeueInputBuffer(0)
+            if (inIdx < 0) return@runCatching
+            val buf = c.getInputBuffer(inIdx) ?: return@runCatching
+            buf.clear()
+            if (buf.remaining() < annexB.size) {
+                // 输入缓冲不够：这一帧丢掉（正常不会发生，单个 NAL 远小于 1MB）
+                c.queueInputBuffer(inIdx, 0, 0, ptsUs, 0)
+                return@runCatching
             }
+            buf.put(annexB)
+            ptsUs += 16_666
+            c.queueInputBuffer(inIdx, 0, annexB.size, ptsUs, 0)
             drain(c)
+        }.onFailure {
+            // 以前整条路静默吞掉：画面没了却和"没数据"长得一模一样。只打第一次，别刷屏。
+            if (droppedOnce) return@onFailure
+            droppedOnce = true
+            log("✗ 解码喂帧失败（后续同类错误不再重复打印）：${it.javaClass.simpleName}: ${it.message}")
         }
     }
 
     private fun drain(c: MediaCodec) {
-        val info = MediaCodec.BufferInfo()
+        val info = outInfo
         while (true) {
             val outIdx = c.dequeueOutputBuffer(info, 0)
             if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {

@@ -10,10 +10,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.uav.host.R
-import com.uav.host.ios.MuxLink
 import com.uav.host.aoa.ui.HostPanel
 import com.uav.host.aoa.video.AspectRatioSurfaceView
+import com.uav.host.R
 
 /**
  * iOS 采集端的**纯 View 层**（视觉与分层照 `app-host` 的 `HostPanel`）。
@@ -21,7 +20,7 @@ import com.uav.host.aoa.video.AspectRatioSurfaceView
  * ## 它只做一件事
  *
  * 把「当前处于哪个阶段」画出来 —— 状态药丸、主/副状态行、设备信息、日志、面板显隐。
- * **不做任何决策**：不认识 `MuxLink`、不碰 USB、不知道"配对"是什么流程。
+ * **不做任何决策**：不碰 USB、不知道"配对"是什么流程、不认识任何协议/传输类。
  *
  * ## 主行 / 副行分离（照抄 app-host 10.23 的教训）
  *
