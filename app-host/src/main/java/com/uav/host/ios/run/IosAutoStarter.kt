@@ -1,6 +1,7 @@
 package com.uav.host.ios.run
 
 import android.hardware.usb.UsbDevice
+import com.uav.protocol.ios.InsertionBaseline
 
 /**
  * 「插上就自动开跑」的前台轮询。
@@ -21,13 +22,12 @@ internal class IosAutoStarter(
 ) {
 
     /**
-     * 上一次见到的 Apple 设备 deviceId；-1 = 当前没有设备（拔掉即复位）。
+     * 「上一次见到的是哪台设备」。
      *
-     * ★ `@Volatile`：`tick()` 在主线程，而采集收尾会从 IO 协程里调 [resetBaseline]
-     *   让"拔了再插"能立刻重来。没有它，主线程可能一直读到旧值。
+     * 判定本身在 [InsertionBaseline]（`:protocol`，可单测）—— 这里的 bug 类型
+     * （忙的时候要不要对齐基线）用真机发现代价太高，见那个类的注释。
      */
-    @Volatile
-    private var lastSeenDeviceId = -1
+    private val baseline = InsertionBaseline()
 
     /**
      * 查一次设备表。
@@ -38,11 +38,13 @@ internal class IosAutoStarter(
         val dev = findDevice()
         if (dev == null) {
             // 设备消失 ⇒ 复位基线，这样再插回来一定会重新触发
-            lastSeenDeviceId = -1
+            baseline.onAbsent()
             return
         }
-        if (isBusy() || dev.deviceId == lastSeenDeviceId) return
-        lastSeenDeviceId = dev.deviceId
+        // 忙：只对齐基线，绝不触发（同一时刻只能有一个流程碰 USB）。
+        // ★ 对齐这一步不能省：采集启动时 `activate` 会把设备重枚举成新 deviceId，
+        //   不跟的话收尾后那个 id 会被当成"刚插入"⇒ 停止后 1 秒内自动重开。
+        if (!baseline.onObserved(dev.deviceId, busy = isBusy())) return
         log("检测到 iPad（deviceId=${dev.deviceId}）⇒ 自动开始")
         onDetected()
     }
@@ -50,13 +52,12 @@ internal class IosAutoStarter(
     /**
      * 复位基线，让"同一台设备"能被当成新插入再触发一次。
      *
-     * 只在一处调用：`IosCaptureFlow.capture()` 的 finally —— 采集因为**设备侧原因**
-     * 失败（一个字节都没收到 / 端点坏了）时，用户的心智是"拔插一下重来"。
-     * 若不复位，`lastSeenDeviceId` 还是老值，**拔了再插也不会自动开始**，
-     * 用户只能去点「重新唤醒」或者杀进程。
+     * ⚠️ **只该在设备真的不在了的时候调用**（拔线 / 重枚举中）。设备还在却复位，
+     * 下一轮 tick（1 秒后）就会立刻重开一轮 —— 失败 → 复位 → 重开，变成自动重试死循环。
+     * 调用点的判据见 `IosActivity.finishRun`。
      */
     fun resetBaseline() {
-        lastSeenDeviceId = -1
+        baseline.onAbsent()
     }
 
     companion object {

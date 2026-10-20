@@ -7,6 +7,7 @@ import com.uav.protocol.ios.DeviceVersion
 import com.uav.protocol.ios.Lockdown
 import com.uav.protocol.ios.PValue
 import com.uav.protocol.ios.PlistXml
+import com.uav.protocol.ios.ReadTimer
 
 /**
  * usbmux + lockdownd 会话（跑在接口 `0xFF/0xFE/02` 上），可选升级 TLS。
@@ -121,6 +122,18 @@ internal class MuxLink(
 
     @Volatile
     var failed: String? = null
+        private set
+
+    /**
+     * 上一轮 [pumpOnce] 是不是**读满了超时窗口**（= 设备安静），而不是端点出错。
+     *
+     * ★ 保活循环必须靠它把两种 `-1` 分开：mux 上本来就没多少流量，设备安静 200ms
+     *   是常态；把它当"快速失败"，`LinkLossGate` 数到 8 次（1.6 秒）就会误判
+     *   `ENDPOINT_DEAD` 并杀掉 lockdown 会话（2026-10-20 实测）。
+     *   判据本身在 [ReadTimer]（可单测）。
+     */
+    @Volatile
+    var lastPumpTimedOut = false
         private set
 
     // ---------- 字节工具（大端） ----------
@@ -366,12 +379,15 @@ internal class MuxLink(
             // ★ 端点失效时 bulkTransfer 会瞬间返回，绝不能直接 return ——
             //   必须把剩下的时间睡掉，否则调用方的 while 变成忙等死循环。
             val spent = android.os.SystemClock.elapsedRealtime() - t0
+            // ★ 先按"真实耗时"分类，再去睡：睡完再看就分不出来了
+            lastPumpTimedOut = ReadTimer.isTimeout(spent, timeoutMs)
             val left = timeoutMs - spent
             if (left > 0) {
                 runCatching { android.os.SystemClock.sleep(left) }
             }
             return n
         }
+        lastPumpTimedOut = false
         acc += readBuf.copyOfRange(0, n)
         var handled = 0
         while (true) {

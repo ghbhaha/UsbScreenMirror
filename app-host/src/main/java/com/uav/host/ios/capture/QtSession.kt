@@ -8,9 +8,18 @@ import com.uav.protocol.ios.LinkLossGate
 import com.uav.protocol.ios.QtPacket
 import com.uav.protocol.ios.QtProtocolCore
 import com.uav.protocol.ios.QtStats
+import com.uav.protocol.ios.ReadTimer
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+
+/**
+ * QT 通道 bulk IN 的单次超时（毫秒）。
+ *
+ * 这个值同时决定"多久算没数据"：判据在 [ReadTimer]，**读满窗口 = 超时**（链路还活着），
+ * 明显更短 = 端点出错。两者原始返回值都是 -1，只能靠耗时区分。
+ */
+private const val READ_TIMEOUT_MS = 500
 
 /**
  * QuickTime 会话状态机 + 收流。
@@ -214,13 +223,13 @@ internal class QtSession(
 
         while (!shouldStop() && System.currentTimeMillis() < deadline) {
             val t0 = System.currentTimeMillis()
-            val n = conn.bulkTransfer(epIn, readBuf, readBuf.size, 500)
+            val n = conn.bulkTransfer(epIn, readBuf, readBuf.size, READ_TIMEOUT_MS)
             val dt = System.currentTimeMillis() - t0
 
             if (n <= 0) {
                 // Android 的 bulkTransfer 对「超时」和「端点错误」都返回 -1，
-                // 只能用耗时区分：接近 timeout 的是超时，明显更短的是错误。
-                val isTimeout = dt >= 450
+                // 只能用耗时区分：读满窗口的是超时，明显更短的是错误。
+                val isTimeout = ReadTimer.isTimeout(dt, READ_TIMEOUT_MS)
                 val now = System.currentTimeMillis()
 
                 if (isTimeout) {

@@ -542,13 +542,17 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
 
         // ★ 因为**设备侧原因**失败（设备还在但没数据 / 端点坏了）⇒ 复位自动开始基线，
         //   用户的心智是"拔插一下重来"，而基线不复位的话拔了再插也不会自动开始。
-        if (aborted) autoStarter.resetBaseline()
+        //   ⚠️ 但**设备还插着**时绝不能复位：下一轮 tick（1 秒）会立刻重开，
+        //   失败 → 复位 → 重开 = 自动重试死循环（旧代码如此：端点坏掉后会一直重连）。
+        //   设备真不在了的话，`IosAutoStarter.tick` 的 `onAbsent()` 本来就会复位，
+        //   这里只是在"刚拔掉、设备表已空"的窗口里补一刀，避免漏掉。
+        val devicePresent = transport.findAppleDevice() != null
+        if (aborted && !devicePresent) autoStarter.resetBaseline()
 
         panel.setMirroring(false)
         panel.setBusy(false)
         refreshDeviceInfo(state = "空闲")
 
-        val devicePresent = transport.findAppleDevice() != null
         when {
             // 拔线是**用户的动作**，不是故障：回空闲态、自动展开面板把话说清楚。
             // 投屏期间面板是收起的，若不展开，用户只会看到画面冻住 + 没有任何入口，

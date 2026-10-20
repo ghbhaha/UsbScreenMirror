@@ -517,18 +517,28 @@ internal class IosCaptureFlow(
             try {
                 while (isActive && keepAlive.get() && link.failed == null) {
                     val n = runCatching { link.pumpOnce(200) }.getOrDefault(-1)
-                    if (n > 0) {
-                        gate.onData()
-                    } else {
-                        val cause = gate.onFastFailure(devicePresent = transport.findAppleDevice() != null)
-                        if (cause != null) {
-                            log("✗ lockdown 保活中止：$cause（保活循环退出）")
-                            break
+                    when {
+                        n > 0 -> gate.onData()
+                        // ★★ mux 上「没数据」是常态，不是故障。
+                        //   `pumpOnce` 已经保证每轮至少睡满 200ms，所以"读满窗口"= 设备安静；
+                        //   以前这里不分青红皂白记一次快速失败，8 轮（1.6 秒）后
+                        //   `LinkLossGate` 就判 ENDPOINT_DEAD 把会话杀掉 —— 2026-10-20 实测。
+                        link.lastPumpTimedOut -> gate.onTimeout()
+                        else -> {
+                            val cause = gate.onFastFailure(
+                                devicePresent = transport.findAppleDevice() != null
+                            )
+                            if (cause != null) {
+                                log("✗ lockdown 保活中止：$cause（保活循环退出）")
+                                break
+                            }
                         }
                     }
                     // 交还调度点：让 cancel() 有机会插进来
                     yield()
                 }
+                // 因为 link.failed 而退出时从来没说过话，排查时容易误判成"循环还在"
+                link.failed?.let { log("✗ lockdown 保活结束：$it") }
             } finally {
                 // ★ 取消 / 正常退出都要打断：否则线程还卡在 URB 上，USB 得不到释放
                 worker.interrupt()
