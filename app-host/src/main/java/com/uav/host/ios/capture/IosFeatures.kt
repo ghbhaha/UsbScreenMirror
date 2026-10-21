@@ -16,7 +16,7 @@ internal object IosFeatures {
      * `UsbDevice.interfaceCount/getInterface()` 是**所有配置的接口并集**，
      * 永远能找到 0x2A ⇒ 用它判断会让 `activate` 从未被真正触发（踩过）。
      *
-     * ⚠️ 这个常量以前在 `IosActivity` / `IosCaptureFlow` / `IosRearmer` / `IosPairingFlow`
+     * ⚠️ 这个常量以前在 `IosActivity` / `IosCaptureFlow` / `IosPairingFlow`
      *   各写了一份 `5`，注释里写着"必须保持一致"却没有任何东西保证它 ——
      *   一处改了会出现「重新武装认为已就绪、采集流程认为还在普通态」的互相等待。
      *   现在只有一个来源。

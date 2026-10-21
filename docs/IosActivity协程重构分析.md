@@ -3,6 +3,10 @@
 > 状态：**P0 + P1 + P2（拆分）+ 审查报告修复已落地**（分支 `refactor/ios-coroutines`，编译 / `:protocol:test` / `lintDebug` 三绿，`compileDebugKotlin --rerun-tasks` 零 `e:`/零 `w:`；真机回归待做）。
 > 本文基线为重构前工作树（`IosActivity.kt` 1123 行，`extends Activity()`；零协程依赖）。拆分结果见§六之二。
 > 版本信息见文末「版本记录」。
+>
+> ⚠️ **2026-10-21 补充：本文拆出去的 `run/IosRearmer`（「强制复位采集通道」）已整体删除** ——
+> 功能无效，待重新调研。本文保留它作为**重构历史记录**，读的时候别去代码里找这个文件；
+> 删除理由见 [`排错手册.md` §3.17](排错手册.md)。
 
 ## 一、目标
 

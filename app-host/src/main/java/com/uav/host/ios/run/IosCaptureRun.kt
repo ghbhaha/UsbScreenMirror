@@ -47,7 +47,7 @@ internal class IosCaptureRun(
     /**
      * 起一个后台流程：占用 [running]、跑 [block]、**无论怎么结束都复位**。
      *
-     * @param name 进 logcat 的线程名（`ios-auto` / `ios-rearm` / `replay`）
+     * @param name 进 logcat 的线程名（`ios-auto` / `replay`）
      */
     fun launch(name: String, block: suspend () -> Unit): Job {
         val job = scope.launch(Dispatchers.IO + CoroutineName(name)) {

@@ -31,7 +31,6 @@ import com.uav.host.ios.flow.IosCaptureListener
 import com.uav.host.ios.flow.IosPairingFlow
 import com.uav.host.ios.run.IosAutoStarter
 import com.uav.host.ios.run.IosCaptureRun
-import com.uav.host.ios.run.IosRearmer
 import com.uav.host.ios.run.IosReplay
 import com.uav.host.ios.ui.IosPanel
 import com.uav.host.R
@@ -44,7 +43,7 @@ import com.uav.protocol.ios.QtStats
  *
  * | 谁 | 管什么 |
  * |---|---|
- * | 本类 | 生命周期、广播、自动开始轮询、重新武装、回放、失败归因、界面复位 |
+ * | 本类 | 生命周期、广播、自动开始轮询、回放、失败归因、界面复位 |
  * | [IosAutoFlow] | 「配对（如需要）→ 投屏」这条串行流程 |
  * | [IosPairingFlow] | 配对 + 自证信任（挂起、无界面） |
  * | [IosCaptureFlow] | 激活 → claim → lockdown → 收流 → USB 收尾 |
@@ -74,7 +73,6 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
     private lateinit var pairingFlow: IosPairingFlow
     private lateinit var captureFlow: IosCaptureFlow
     private lateinit var autoFlow: IosAutoFlow
-    private lateinit var rearmer: IosRearmer
     private lateinit var replayFlow: IosReplay
     private lateinit var autoStarter: IosAutoStarter
 
@@ -157,7 +155,6 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
         panel = IosPanel(this)
         panel.bind(
             onSurface = { ready -> onSurfaceReady(ready) },
-            onRearm = { if (!run.isRunning()) rearm() },
             // ★ 停止后同一个按钮变成「开始投屏」，点了就走**正常的自动流程**
             //   （和"退出 App 再进 App"完全同一条路），不去做额外的复位/重新武装 ——
             //   收尾阶段发的 vendor 请求会让设备闪断重枚举，反而把热态搞成冷态。
@@ -228,13 +225,6 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
             captureFlow = captureFlow,
             deviceKey = ::currentDeviceKey,
             onStage = { stage -> onAutoStage(stage) },
-        )
-        rearmer = IosRearmer(
-            transport = transport,
-            log = { decoderHost.log(it) },
-            ensurePermission = ::ensurePermission,
-            restoreToNormal = ::restoreToNormal,
-            isStopRequested = { stopRequested },
         )
         // ★ 必须走 ContextCompat：三分量 registerReceiver 是 API 26+ 的，
         //   而本模块 minSdk = 23（合并进 app-host 时统一成 23）。ContextCompat 会在
@@ -488,24 +478,6 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
         decoderHost.log("用户请求停止投屏（已置停止信号，等待读循环退出并收尾）")
     }
 
-    /**
-     * 重新武装 QT 端点。流程本体在 [IosRearmer]，这里只做状态与界面。
-     */
-    private fun rearm() {
-        // ★ 必须复位 stopRequested ——
-        //   「停止投屏」把它置成 true 后，若不复位，本次 rearm 的等待循环
-        //   会在第一轮就退出（"收到停止信号，提前退出等待"），按钮等于白按。
-        //   autoRun() 也有同样一行，两条入口都要复位。
-        stopRequested = false
-        run.markRunning()
-        panel.setBusy(true)
-        panel.render(IosPanel.Stage.REARM, getString(R.string.ios_detail_rearm_hint))
-        run.launch("ios-rearm") {
-            runCatching { rearmer.run() }
-                .onFailure { decoderHost.log("重新武装异常：${it.message}") }
-        }
-    }
-
     // ───────────────────────────────────────────────────── 离线回放
 
     /** 离线回放 feed.bin：验证「解析 → 解码 → 上屏」整条链路。流程本体在 [IosReplay]。 */
@@ -600,9 +572,13 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
     // ───────────────────────────────────────────────────── USB 设备操作
 
     /**
-     * 把设备从采集配置切回普通配置（配对 / 重新武装 / 采集开始前都要用）。
+     * 把设备从采集配置切回普通配置（配对 / 采集开始前都要用）。
      *
-     * @return 切成功了没有 —— 调用方（尤其 [IosRearmer]）要靠它决定还要不要 activate。
+     * ⚠️ 只改**活动配置**：设备描述符里的配置集（`configurationCount`）进过 QT 之后就永远是 5，
+     *   这个调用不会让它缩回去。想让它真缩回 4 只有两条路 —— 设备自己重枚举（activate），
+     *   或者物理拔插 / 重启 iPad。
+     *
+     * @return 切成功了没有 —— 调用方要靠它决定还要不要 activate。
      */
     private fun restoreToNormal(dev: UsbDevice): Boolean {
         val conn = transport.open(dev)
@@ -627,7 +603,7 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
      * 确保拿到权限（**挂起**）。
      *
      * ★ 以前这里是 `runBlocking { permission.await(...) }`：为了保住三层调用方的同步形状，
-     *   硬占住一条 IO 线程最多 25 秒。现在 [IosPairingFlow] / [IosCaptureFlow] / [IosRearmer]
+     *   硬占住一条 IO 线程最多 25 秒。现在 [IosPairingFlow] / [IosCaptureFlow]
      *   整条链路都已经是挂起函数，`runBlocking` 这一层就多余了 —— 它本来只是为了
      *   "不想改调用方"，而调用方已经改完了。
      */

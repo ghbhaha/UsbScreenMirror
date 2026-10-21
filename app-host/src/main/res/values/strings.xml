@@ -86,16 +86,13 @@
     <string name="ios_btn_expand">展开面板</string>
 
     <string name="ios_chip_pairing">配对中</string>
-    <string name="ios_chip_rearm">唤醒中</string>
 
     <string name="ios_status_idle">空闲中 —— 把 iPad 用数据线插到本机</string>
     <string name="ios_status_unpaired">这台 iPad 还没被本机信任</string>
     <string name="ios_status_pairing">等待你在 iPad 上点「信任」…</string>
     <string name="ios_status_connecting">正在建立连接…</string>
-    <string name="ios_status_rearm">正在唤醒 iPad 的采集通道…</string>
     <string name="ios_status_replay">回放录制流</string>
 
-    <string name="ios_btn_rearm">强制复位采集通道</string>
     <string name="ios_btn_stop">停止投屏</string>
     <string name="ios_btn_start">开始投屏</string>
 
@@ -105,7 +102,6 @@
     <string name="ios_detail_no_device">未检测到 Apple 设备（VID 0x05AC）</string>
     <string name="ios_detail_link_lost">iPad 已断开 —— 把数据线插回去就能重新开始</string>
     <string name="ios_detail_pair_hint">配对成功后本机即成为受信任主机，以后不用再点</string>
-    <string name="ios_detail_rearm_hint">配对完成后第一次投屏、或长时间无数据时才需要</string>
 
     <string name="ios_hint">插上 iPad 自动配对并投屏，拔线即停 · 点画面空白处或左上角药丸可显示 / 隐藏此面板</string>
 

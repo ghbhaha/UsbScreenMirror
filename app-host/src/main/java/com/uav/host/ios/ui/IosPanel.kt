@@ -55,7 +55,6 @@ class IosPanel(private val activity: Activity) {
     private val chipText: TextView = view(R.id.chip_state)
     private val logView: TextView = view(R.id.log)
     private val logScroll: ScrollView = view(R.id.log_scroll)
-    private val btnRearm: Button = view(R.id.btn_rearm)
     private val btnStop: Button = view(R.id.btn_stop)
     private val btnCollapse: View = view(R.id.btn_collapse)
 
@@ -73,7 +72,6 @@ class IosPanel(private val activity: Activity) {
         PAIRING(R.string.ios_chip_pairing, R.color.host_warn, R.string.ios_status_pairing),
         CONNECTING(R.string.host_chip_connecting, R.color.host_warn, R.string.ios_status_connecting),
         MIRRORING(R.string.host_chip_mirroring, R.color.host_ok, R.string.host_status_mirroring),
-        REARM(R.string.ios_chip_rearm, R.color.host_warn, R.string.ios_status_rearm),
         REPLAY(R.string.host_chip_replay, R.color.host_accent, R.string.ios_status_replay),
         ERROR(R.string.host_chip_error, R.color.host_err, R.string.host_status_error),
     }
@@ -81,8 +79,8 @@ class IosPanel(private val activity: Activity) {
     /**
      * 装配（`setContentView` 之后调用一次）。
      *
-     * 界面已经没有「开始 / 配对」按钮了：插上就自动配对、自动投屏，拔掉就停。
-     * 人工只剩一个兜底入口 [onRearm]（设备侧没武装时用）。
+     * 界面已经没有独立的「开始 / 配对 / 重新唤醒」按钮了：插上就自动配对、自动投屏，拔掉就停。
+     * 人工只剩底部一个双态按钮（停止 ⇄ 开始），见 [Stage] 与 [setMirroring]。
      *
      * 录制 / 离线回放**不再有界面入口**，改由 adb 驱动（见 `DebugTools.IOS_EXTRA_*`）：
      * 它们本来只在排障时用，放在界面上反而容易被误触、也会持续写盘。
@@ -91,7 +89,6 @@ class IosPanel(private val activity: Activity) {
      */
     fun bind(
         onSurface: (Boolean) -> Unit,
-        onRearm: () -> Unit,
         onStop: () -> Unit,
         onStart: () -> Unit
     ) {
@@ -109,7 +106,6 @@ class IosPanel(private val activity: Activity) {
             }
         })
 
-        btnRearm.setOnClickListener { onRearm() }
         // ★ 这个按钮是**双态**的：
         //   投屏中 = 「停止投屏」→ [onStop]（只置停止信号，收尾在 capture 的 finally 里做）
         //   已停止 = 「开始投屏」→ [onStart]（重新走一遍自动流程，和"退出 App 再进"同一条路）
@@ -201,18 +197,14 @@ class IosPanel(private val activity: Activity) {
         deviceInfo.text = text
     }
 
-    /** 配对 / 唤醒进行中：唯一的兜底按钮也禁用（同一时刻只能有一个线程碰 USB）。 */
+    /** 配对 / 启动投屏进行中：底部按钮禁用（同一时刻只能有一个流程碰 USB）。 */
     fun setBusy(busy: Boolean) = onUi {
-        btnRearm.isEnabled = !busy && !displaying
-        btnRearm.alpha = if (busy || displaying) 0.5f else 1f
         btnStop.isEnabled = !busy
         btnStop.alpha = if (busy) 0.5f else 1f
     }
 
     /**
-     * 投屏进行中：**重新唤醒要禁用** —— 它会在收流中途动 USB 配置，直接把流打断。
-     *
-     * 注意界面已经没有「停止」按钮了：停止的方式是拔线（拔掉即停，见 QtSession 的断开判定）。
+     * 投屏进行中 ⇄ 已停止：决定底部那个按钮是「停止投屏」还是「开始投屏」。
      */
     fun setMirroring(value: Boolean) = onUi {
         displaying = value
@@ -235,9 +227,6 @@ class IosPanel(private val activity: Activity) {
             btnStop.setCompoundDrawablesRelativeWithIntrinsicBounds(
                 if (value) R.drawable.ic_close else R.drawable.ic_play, 0, 0, 0
             )
-            // 投屏中不能动 USB 配置：复位会在收流中途把接口拆掉
-            btnRearm.isEnabled = !value
-            btnRearm.alpha = if (value) 0.5f else 1f
         }
 
     // ---------------------------------------------------------------- 日志

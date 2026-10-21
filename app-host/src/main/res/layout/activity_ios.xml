@@ -178,21 +178,15 @@
         </LinearLayout>
 
         <!--
-          操作：只留一个「重新唤醒」。
+          操作：只有一个双态按钮（停止投屏 / 开始投屏）。
 
-          开始/停止与配对都已自动化（插上即配对、即投屏；拔线即停），
-          人工只需要一个兜底入口：设备侧 QT 没被武装、一个字节都不来时用它。
-          长按它可回放已录制的 feed.bin（离线验证"解析→解码→上屏"）。
+          开始与配对都已自动化（插上即配对、即投屏；拔线即停）；停止后同一个按钮
+          变成「开始投屏」，点了重跑一遍自动流程。
+
+          ⚠️ 原来还有一个「强制复位采集通道」（btn_rearm）：它只做「切回普通配置 + activate」，
+             而这两步 capture() 本来就自动做，且设备僵态下它救不回来 —— 2026-10-21 已删除，
+             待重新调研后再定是否以别的形态回归（见 docs/排错手册.md §3.17）。
         -->
-        <Button
-            android:id="@+id/btn_rearm"
-            style="@style/HostTileRow"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:drawableStart="@drawable/ic_refresh"
-            android:text="@string/ios_btn_rearm" />
-
         <!--
           停止投屏：以前只能靠"返回键或拔线"结束，而返回键那条路当时是断的
           （Activity 已销毁但读循环收不到停止信号 ⇒ 后台继续无限收流）。
@@ -205,7 +199,7 @@
             style="@style/HostTileRow"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="12dp"
             android:drawableStart="@drawable/ic_close"
             android:text="@string/ios_btn_stop" />
 

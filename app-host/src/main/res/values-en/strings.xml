@@ -67,16 +67,13 @@
     <string name="ios_btn_expand">Expand panel</string>
 
     <string name="ios_chip_pairing">Pairing</string>
-    <string name="ios_chip_rearm">Arming</string>
 
     <string name="ios_status_idle">Idle - connect the iPad with a USB data cable</string>
     <string name="ios_status_unpaired">This iPad does not trust this device yet</string>
     <string name="ios_status_pairing">Tap Trust on the iPad…</string>
     <string name="ios_status_connecting">Establishing connection…</string>
-    <string name="ios_status_rearm">Arming the iPad capture channel…</string>
     <string name="ios_status_replay">Replaying recorded stream</string>
 
-    <string name="ios_btn_rearm">Force-reset capture channel</string>
     <string name="ios_btn_stop">Stop mirroring</string>
     <string name="ios_btn_start">Start mirroring</string>
 
@@ -86,7 +83,6 @@
     <string name="ios_detail_no_device">No Apple device found (VID 0x05AC)</string>
     <string name="ios_detail_link_lost">iPad disconnected — plug the cable back in to start again</string>
     <string name="ios_detail_pair_hint">Once paired this device is a trusted host, no need to tap again</string>
-    <string name="ios_detail_rearm_hint">Only needed for the first session after pairing, or after a long silence</string>
 
     <string name="ios_hint">Plug in the iPad to pair and mirror automatically; unplug to stop - tap the empty area or the pill to toggle this panel</string>
 
