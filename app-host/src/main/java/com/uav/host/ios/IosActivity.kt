@@ -158,6 +158,10 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
         panel.bind(
             onSurface = { ready -> onSurfaceReady(ready) },
             onRearm = { if (!run.isRunning()) rearm() },
+            // ★ 停止后同一个按钮变成「开始投屏」，点了就走**正常的自动流程**
+            //   （和"退出 App 再进 App"完全同一条路），不去做额外的复位/重新武装 ——
+            //   收尾阶段发的 vendor 请求会让设备闪断重枚举，反而把热态搞成冷态。
+            onStart = { if (!run.isRunning()) autoRun() },
             // ★ 停止：只置停止信号，真正的收尾在 capture() 的 finally 里做。
             //   这里**不要**直接 close/杀线程 —— 那会跳过发 HPA0/HPD0 与还配置，
             //   下次 activate 就成了空操作（= 必须重启 iPad）。
@@ -557,6 +561,12 @@ class IosActivity : ComponentActivity(), IosCaptureHost {
             // 拔线是**用户的动作**，不是故障：回空闲态、自动展开面板把话说清楚。
             // 投屏期间面板是收起的，若不展开，用户只会看到画面冻住 + 没有任何入口，
             // 那才是真正的"看起来卡死"。
+            // ★ 用户主动点了「停止投屏」：这条 detach 是收尾配置切换造成的，设备其实还插着 ——
+            //   不能报"被拔掉"，也不该展开面板抢注意力。
+            stopRequested && devicePresent -> {
+                decoderHost.log("=== 已停止（用户操作）===")
+                panel.render(IosPanel.Stage.IDLE, null)
+            }
             detached || lostReason != null -> {
                 decoderHost.log("=== 已中断：${lostReason ?: "iPad 被拔掉"} ===")
                 panel.render(IosPanel.Stage.IDLE, getString(R.string.ios_detail_link_lost))

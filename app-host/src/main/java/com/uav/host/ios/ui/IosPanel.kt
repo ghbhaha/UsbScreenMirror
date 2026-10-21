@@ -92,7 +92,8 @@ class IosPanel(private val activity: Activity) {
     fun bind(
         onSurface: (Boolean) -> Unit,
         onRearm: () -> Unit,
-        onStop: () -> Unit
+        onStop: () -> Unit,
+        onStart: () -> Unit
     ) {
         surfaceView.holder.addCallback(object : android.view.SurfaceHolder.Callback {
             override fun surfaceCreated(holder: android.view.SurfaceHolder) {
@@ -109,7 +110,13 @@ class IosPanel(private val activity: Activity) {
         })
 
         btnRearm.setOnClickListener { onRearm() }
-        btnStop.setOnClickListener { onStop() }
+        // ★ 这个按钮是**双态**的：
+        //   投屏中 = 「停止投屏」→ [onStop]（只置停止信号，收尾在 capture 的 finally 里做）
+        //   已停止 = 「开始投屏」→ [onStart]（重新走一遍自动流程，和"退出 App 再进"同一条路）
+        //   状态由 [setMirroring] 维护，点击时按 [displaying] 分发 —— 两者都在 UI 线程，不存在竞态。
+        btnStop.setOnClickListener {
+            if (displaying) onStop() else onStart()
+        }
         btnCollapse.setOnClickListener {
             Log.i(TAG, "点击来源=收起按钮")
             setMenuVisible(false)
@@ -196,8 +203,10 @@ class IosPanel(private val activity: Activity) {
 
     /** 配对 / 唤醒进行中：唯一的兜底按钮也禁用（同一时刻只能有一个线程碰 USB）。 */
     fun setBusy(busy: Boolean) = onUi {
-        btnRearm.isEnabled = !busy
-        btnRearm.alpha = if (busy) 0.5f else 1f
+        btnRearm.isEnabled = !busy && !displaying
+        btnRearm.alpha = if (busy || displaying) 0.5f else 1f
+        btnStop.isEnabled = !busy
+        btnStop.alpha = if (busy) 0.5f else 1f
     }
 
     /**
@@ -205,10 +214,31 @@ class IosPanel(private val activity: Activity) {
      *
      * 注意界面已经没有「停止」按钮了：停止的方式是拔线（拔掉即停，见 QtSession 的断开判定）。
      */
-    fun setMirroring(mirroring: Boolean) = onUi {
-        btnRearm.isEnabled = !mirroring
-        btnRearm.alpha = if (mirroring) 0.5f else 1f
+    fun setMirroring(value: Boolean) = onUi {
+        displaying = value
+        btnStop.isEnabled = true
+        btnStop.alpha = 1f
     }
+
+    /**
+     * 是否正在投屏 —— 决定底部那个按钮是「停止投屏」还是「开始投屏」。
+     *
+     * ★ **只由 [setMirroring] 写**，且只在 UI 线程读写（点击回调也在 UI 线程）。
+     * ★ 字段名刻意不叫 `mirroring`：Kotlin 会为它生成 `setMirroring(Boolean)`，
+     *   与公开方法 [setMirroring] 的 JVM 签名撞车（Platform declaration clash）。
+     */
+    private var displaying = false
+        set(value) {
+            if (field == value) return
+            field = value
+            btnStop.setText(if (value) R.string.ios_btn_stop else R.string.ios_btn_start)
+            btnStop.setCompoundDrawablesRelativeWithIntrinsicBounds(
+                if (value) R.drawable.ic_close else R.drawable.ic_play, 0, 0, 0
+            )
+            // 投屏中不能动 USB 配置：复位会在收流中途把接口拆掉
+            btnRearm.isEnabled = !value
+            btnRearm.alpha = if (value) 0.5f else 1f
+        }
 
     // ---------------------------------------------------------------- 日志
 

@@ -95,8 +95,9 @@
     <string name="ios_status_rearm">正在唤醒 iPad 的采集通道…</string>
     <string name="ios_status_replay">回放录制流</string>
 
-    <string name="ios_btn_rearm">重新唤醒采集通道</string>
+    <string name="ios_btn_rearm">强制复位采集通道</string>
     <string name="ios_btn_stop">停止投屏</string>
+    <string name="ios_btn_start">开始投屏</string>
 
     <string name="ios_section_device">设备</string>
     <string name="ios_section_log">运行日志</string>
