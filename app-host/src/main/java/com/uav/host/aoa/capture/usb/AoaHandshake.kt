@@ -51,6 +51,22 @@ object Aoa {
     /** 配件 + ADB 模式（adb 已打开时会出现）。 */
     const val PID_ACCESSORY_ADB = 0x2D01
 
+    /**
+     * Apple 设备的 VID。
+     *
+     * ★ AOA 这条路**必须整个跳过它**：iPad/iPhone 走的是 QuickTime USB 采集
+     *   （首页「iOS 投屏」那条链路），对 AOA 请求一律不认。不跳过的话，
+     *   插着 iPad 时轮询会每 2 秒发一次 `GET_PROTOCOL_VERSION` 并失败
+     *   （日志刷 `设备不支持 AOAv2 (version=0)`），而且我们的 `openDevice` /
+     *   `controlTransfer` 会和 iOS 页抢同一台设备。
+     *
+     * ⚠️ 必须与 iOS 侧 `QtTransport.APPLE_VID` 同值（那边也用它认设备）。
+     */
+    const val VID_APPLE = 0x05AC
+
+    /** 这个设备是不是 Apple 的（是 ⇒ AOA 路径不碰它）。 */
+    fun isApple(dev: UsbDevice): Boolean = dev.vendorId == VID_APPLE
+
     fun isAccessoryPid(pid: Int): Boolean = pid == PID_ACCESSORY || pid == PID_ACCESSORY_ADB
 
     fun pidName(pid: Int): String = when (pid) {

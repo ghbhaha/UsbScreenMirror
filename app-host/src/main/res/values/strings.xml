@@ -35,6 +35,7 @@
     <string name="host_chip_no_signal">无输出</string>
     <string name="host_chip_error">出错</string>
     <string name="host_chip_peer_app_missing">缺App</string>
+    <string name="host_chip_stopped">已停止</string>
 
     <!--
       状态行。
@@ -50,10 +51,13 @@
     <string name="host_status_no_signal">手机无输出</string>
     <string name="host_status_error">链路出错</string>
     <string name="host_status_peer_app_missing">对方设备无应答</string>
+    <string name="host_status_stopped">已停止投屏</string>
     <!-- 副行说明：说清"为什么"和"去哪装"，不要只写"连接失败" -->
-    <string name="host_detail_peer_app_missing">已切进配件模式，但对端一直没有任何应答 —— 通常是没装配套 App（装过但被强制停止也会这样）。装好后点「扫描 / 重试」，或拔插一次即可。</string>
+    <string name="host_detail_peer_app_missing">已切进配件模式，但对端一直没有任何应答 —— 通常是没装配套 App（装过但被强制停止也会这样）。装好后拔插一次数据线，或点「开始投屏」。</string>
 
     <!-- 操作（磁贴：图标在上、文字在下，文案尽量短） -->
+    <string name="host_btn_stop">停止投屏</string>
+    <string name="host_btn_start">开始投屏</string>
     <string name="host_btn_scan">扫描 / 重试</string>
     <string name="host_btn_force">强制重握手</string>
     <string name="host_btn_replay">回放抓流</string>

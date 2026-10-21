@@ -116,6 +116,12 @@ class UsbAttachRouter(
      */
     fun onDeviceAttached(device: UsbDevice, forceHandshake: Boolean = false) {
         if (closed.get()) return
+        // ★ Apple 设备不归 AOA 管（它走首页「iOS 投屏」那条 QuickTime 链路）。
+        //   不挡的话每 2 秒一轮 GET_PROTOCOL_VERSION 必然失败，还会和 iOS 页抢设备。
+        if (Aoa.isApple(device)) {
+            logger.i(TAG, "跳过 Apple 设备 id=${device.deviceId}（iPad/iPhone 请走「iOS 投屏」页）")
+            return
+        }
         if (!busy.compareAndSet(false, true)) {
             logger.i(TAG, "已有握手在进行中，忽略重复 attach")
             return
@@ -152,10 +158,18 @@ class UsbAttachRouter(
         }
         val target = pickCandidate()
         if (target == null) {
+            // Apple 设备 + 内建 HID 触摸（面板自己那颗控制器）都可能挂着，
+            // 所以判据是"有 Apple、且没有任何非 Apple 的 bulk 设备"。
+            val apples = all.count { Aoa.isApple(it) }
+            val others = all.count { !Aoa.isApple(it) && BulkPair.hasBulkPair(it) }
             callback.onStatus(
-                "未找到可用的手机设备（当前 ${all.size} 个 USB 设备，均无 BULK 端点）"
+                when {
+                    apples > 0 && others == 0 ->
+                        "只发现 Apple 设备 —— 请回首页进「iOS 投屏」页"
+                    else -> "未找到可用的手机设备（当前 ${all.size} 个 USB 设备，均无 BULK 端点）"
+                }
             )
-            logger.w(TAG, "scan 后无候选：${aoa.describeDevices()}")
+            logger.w(TAG, "scan 后无候选（Apple 设备 $apples 个）：${aoa.describeDevices()}")
             return
         }
         logger.i(
@@ -196,8 +210,19 @@ class UsbAttachRouter(
         onDeviceAttached(target, forceHandshake = false)
     }
 
+    /**
+     * 当前设备表里有没有**归 AOA 管**的候选（false = 只有 Apple 设备 / 只有内建 HID）。
+     *
+     * 给 [LinkCoordinator.scan] 用：没有候选时不该发起扫描 —— 那会把主状态行刷成
+     * 「正在建立连接…」，而实际上一次握手都不会发。
+     */
+    fun hasTargetDevice(): Boolean = pickCandidate() != null
+
     private fun pickCandidate(): UsbDevice? {
-        val withBulk = usbManager.deviceList.values.filter { BulkPair.hasBulkPair(it) }
+        val withBulk = usbManager.deviceList.values
+            // ★ 先把 Apple 设备摘掉：它们有 BULK 端点、也会被挑成"最大 deviceId"，
+            //   但走的是 iOS 采集链路，AOA 握手对它们 100% 失败。
+            .filter { !Aoa.isApple(it) && BulkPair.hasBulkPair(it) }
         if (withBulk.isEmpty()) return null
         return withBulk.firstOrNull { Aoa.isAccessoryPid(it.productId) }
             ?: withBulk.maxByOrNull { it.deviceId }

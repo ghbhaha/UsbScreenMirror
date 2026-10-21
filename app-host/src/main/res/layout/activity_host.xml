@@ -174,7 +174,23 @@
                 android:textSize="11sp" />
         </LinearLayout>
 
-        <!-- 操作：竖排三行（图标在左、文字在右） -->
+        <!--
+          操作：**只留一个双态按钮**（投屏中=「停止投屏」/ 已停止=「开始投屏」）。
+
+          ★ 2026-10-21：另外三个入口（扫描/重试、强制重握手、回放抓流）先**隐藏**
+            （`visibility="gone"`，代码与监听都还在，取消这一行即可恢复）。
+            理由：它们做的都是"把链路重新拉起来"，而这个职责已经收进「开始投屏」，
+            留着只会让用户不知道该点哪个。回放仍有 adb 入口（见 DebugTools 的 extra）。
+        -->
+        <Button
+            android:id="@+id/btn_stop"
+            style="@style/HostTileRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:drawableStart="@drawable/ic_play"
+            android:text="@string/host_btn_start" />
+
         <Button
             android:id="@+id/btn_scan"
             style="@style/HostTileRow"
@@ -182,7 +198,8 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:drawableStart="@drawable/ic_refresh"
-            android:text="@string/host_btn_scan" />
+            android:text="@string/host_btn_scan"
+            android:visibility="gone" />
 
         <Button
             android:id="@+id/btn_force"
@@ -191,7 +208,8 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:drawableStart="@drawable/ic_sync"
-            android:text="@string/host_btn_force" />
+            android:text="@string/host_btn_force"
+            android:visibility="gone" />
 
         <Button
             android:id="@+id/btn_replay"
@@ -200,7 +218,8 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:drawableStart="@drawable/ic_play"
-            android:text="@string/host_btn_replay" />
+            android:text="@string/host_btn_replay"
+            android:visibility="gone" />
 
         <!--
           只在「对端没人应答」时出现（默认 gone）。

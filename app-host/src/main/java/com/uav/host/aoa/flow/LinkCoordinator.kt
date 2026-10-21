@@ -11,6 +11,7 @@ import com.uav.host.common.DisplaySize
 import com.uav.host.aoa.run.AoaLinkRun
 import com.uav.host.aoa.capture.input.HidTouchController
 import com.uav.host.aoa.capture.session.HostSession
+import com.uav.host.aoa.capture.usb.Aoa
 import com.uav.host.aoa.capture.usb.BulkByteChannel
 import com.uav.host.aoa.capture.usb.BulkPair
 import com.uav.host.aoa.capture.usb.UsbAttachRouter
@@ -100,6 +101,13 @@ class LinkCoordinator(
          * 上层要给的是可操作的去处（下载入口），不是一个"出错"标签。
          */
         fun onPeerAppMissing() {}
+
+        /**
+         * 设备表里**没有归本页管的候选**（典型：只插着 iPad / 只有内建 HID 触摸）。
+         *
+         * 与 [onProgress] 分开：进度事件会把主行推到「连接中」，而这里**一次握手都没发**。
+         */
+        fun onNoTarget(reason: String) {}
     }
 
     /** 当前活动会话；`null` = 没有链路。 */
@@ -211,6 +219,20 @@ class LinkCoordinator(
     private var peerAppMissingAt = 0L
 
     /**
+     * 用户按了面板上的「停止投屏」。
+     *
+     * ★ 置位期间**不做任何自动重连**：前台轮询与 attach 触发的重建都被挡住。
+     *   不加这个闸门的话，`stopSession()` 之后 2 秒轮询就会把链路重新拉起来，
+     *   界面上的「停止投屏」点下去等于没反应（这是 iOS 侧同类功能踩过的坑）。
+     *
+     * 解除只有一个入口：用户按「开始投屏」（[resumeByUser]），或任何一次显式
+     * [scan]（含 `--ez scan true` 调试入口）。拔插**不**解除 —— 用户明确说了停，
+     * 就别替他做主。
+     */
+    @Volatile
+    private var userStopped = false
+
+    /**
      * 前台轮询兜底：实测宿主设备（BOE P40UCH）在手机重枚举后**只发 DETACHED、不发 ATTACHED**，
      * 只靠 `USB_DEVICE_ATTACHED` 广播会让"插线即投"彻底失效。
      *
@@ -312,7 +334,7 @@ class LinkCoordinator(
         pollJob = scope.launch(Dispatchers.Main + CoroutineName("uav-aoa-poll")) {
             delay(POLL_INTERVAL_MS)          // 首次照旧等一个间隔，避免启动瞬间和 onCreate 抢
             while (isActive) {
-                if (session == null && !waitingForPeerApp && isSurfaceReady()) {
+                if (session == null && !waitingForPeerApp && !userStopped && isSurfaceReady()) {
                     runCatching { router?.pollOnce() }
                         .onFailure { logger.w(TAG, "pollOnce 异常: ${it.message}") }
                 }
@@ -346,8 +368,17 @@ class LinkCoordinator(
 
     /** Scan / Retry 按钮：普通扫描（已是配件则复用直连）。 */
     fun scan(forceHandshake: Boolean = false) {
+        // 任何显式扫描都代表"我要连" ⇒ 解除用户停止闸门
+        userStopped = false
         // 用户主动点扫描/强制重握手 = 他大概刚把 App 装上，解除"等 App"状态重试
         waitingForPeerApp = false
+        // ★ 没有候选就别扫：`scanAndAttach` 会把主行刷成「正在建立连接…」，
+        //   可实际上一次握手都不会发（最典型：插着 iPad 打开 AOA 页）。
+        if (router?.hasTargetDevice() == false) {
+            logger.i(TAG, "scan：当前没有归 AOA 管的设备，不发起握手")
+            listener.onNoTarget("未发现安卓手机 —— iPad / iPhone 请回首页进「iOS 投屏」")
+            return
+        }
         if (forceHandshake) forceRetried = true
         else forceRetried = false
         if (forceHandshake) fastPathUnverified = false
@@ -356,11 +387,24 @@ class LinkCoordinator(
 
     /** USB 设备刚插上。 */
     fun onDeviceAttached(device: UsbDevice) {
+        // ★ Apple 设备不归 AOA 管（iPad/iPhone 走首页「iOS 投屏」）。
+        //   这里是最外层漏斗：`--ez` 调试入口、广播、扫描都从这儿进。
+        if (Aoa.isApple(device)) {
+            logger.i(TAG, "忽略 Apple 设备 id=${device.deviceId}：AOA 页不处理，请走「iOS 投屏」")
+            return
+        }
+        // ★ 用户按过「停止投屏」⇒ 谁都别再自动拉起来。按钮就写着「开始投屏」，
+        //   让他自己点 —— 否则"停止"会被自己的插拔动作撤销，变成按了也没用。
+        if (userStopped) {
+            logger.i(TAG, "忽略本次 attach：用户已停止投屏（点「开始投屏」恢复）")
+            return
+        }
         // ⚠️ 我们自己的 AOA 握手会让手机**重新枚举** USB，于是又派发一次 attach ——
         //   如果把它当成"用户重插"，重试就会自我续命：每次超时 → 重新握手 → 又 attach
         //   → 又重试，形成 5s 一轮的空转（真机日志里数到 5 次）。
         //   所以这里加一道时间闸：判定缺 App 后的 15s 内忽略 attach 触发的重试。
-        //   用户真拔插一次通常远超 15s，不受影响；急着重试也有「扫描 / 重试」按钮。
+        //   用户真拔插一次通常远超 15s，不受影响；急着重试也有「开始投屏」按钮
+        //   （「扫描 / 重试」按钮 2026-10-21 起已隐藏，调试入口 --ez scan true 仍在）。
         val sinceMissing = SystemClock.elapsedRealtime() - peerAppMissingAt
         if (waitingForPeerApp && sinceMissing < PEER_APP_RETRY_GATE_MS) {
             logger.i(TAG, "忽略本次 attach：刚判定对端没人应答（${sinceMissing}ms < ${PEER_APP_RETRY_GATE_MS}ms）")
@@ -376,7 +420,7 @@ class LinkCoordinator(
         // ⚠️ 这里**不解除** waitingForPeerApp：我们自己的握手同样会让手机重新枚举、
         //   派发 DETACHED —— 那不是"用户拔线"。解除只发生在 attach（带 15s 闸）与用户动作。
         stopSession()
-        listener.onProgress("USB 已拔出，请重新插线或点 Scan/Retry")
+        listener.onProgress("USB 已拔出，请重新插线（或点「开始投屏」）")
         listener.onClosed("USB 已拔出")
     }
 
@@ -448,6 +492,28 @@ class LinkCoordinator(
     fun stopSession() {
         detachSession()?.let { submitClose(it) }
     }
+
+    /**
+     * 用户点「停止投屏」：停掉会话，并**关上自动重连的闸门**。
+     *
+     * ★ 只调 [stopSession] 是不够的：前台轮询每 2 秒发现"没有活动会话"就会重建链路，
+     *   用户会看到画面停一下又自己回来（等于停止无效）。闸门见 [userStopped]。
+     */
+    fun stopByUser() {
+        userStopped = true
+        logger.i(TAG, "用户停止投屏：已停会话，并关闭自动重连（等「开始投屏」）")
+        stopSession()
+    }
+
+    /** 用户点「开始投屏」：解除闸门并重新扫描。 */
+    fun resumeByUser() {
+        userStopped = false
+        logger.i(TAG, "用户开始投屏：解除停止闸门，重新扫描")
+        scan()
+    }
+
+    /** 是否被用户停在「已停止」（面板据此决定按钮是「停止投屏」还是「开始投屏」）。 */
+    fun isStoppedByUser(): Boolean = userStopped
 
     /**
      * 只解除引用 + 通知上层，**不关连接**。

@@ -357,4 +357,67 @@ class HostUiStateTest {
         s.onScanRequested()
         assertEquals(HostUiState.Phase.CONNECTING, s.phase)
     }
+
+    // ---------------------------------------------------------------- 本机用户停止
+
+    @Test
+    fun `本机停止会停在已停止阶段`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onUserStopped()
+        assertEquals(HostUiState.Phase.STOPPED, s.phase)
+        assertEquals("点「开始投屏」重新连接", s.detail)
+    }
+
+    @Test
+    fun `停止后的收尾断线不会把界面拉回连接中`() {
+        // 我们自己 stopSession() 关掉会话时，HostSession 会回一条 onClosed。
+        // 若照常处理，界面立刻显示"已断开：…"并回连接中 —— 用户会以为停止没生效。
+        val s = HostUiState()
+        s.onUserStopped()
+        s.onClosed("用户停止投屏")
+        assertEquals(HostUiState.Phase.STOPPED, s.phase)
+    }
+
+    @Test
+    fun `停止后的收尾错误不会变成 ERROR`() {
+        val s = HostUiState()
+        s.onUserStopped()
+        s.onError("bulkTransfer 已被取消")
+        assertEquals(HostUiState.Phase.STOPPED, s.phase)
+    }
+
+    @Test
+    fun `停止后进度事件不覆盖停止原因`() {
+        val s = HostUiState()
+        s.onUserStopped()
+        s.onProgress("CNXN 已发送（本机 1920x1080）…")
+        assertEquals(HostUiState.Phase.STOPPED, s.phase)
+        assertEquals("点「开始投屏」重新连接", s.detail)
+    }
+
+    @Test
+    fun `点开始投屏回到连接中且等首帧才宣告投屏中`() {
+        val s = HostUiState()
+        s.onFirstFrame()
+        s.onUserStopped()
+        s.onUserStarted()
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+        // 链路还没建，不能提前说"投屏中"
+        s.onProgress("CNXN 已发送…")
+        assertEquals(HostUiState.Phase.CONNECTING, s.phase)
+        s.onFirstFrame()
+        assertEquals(HostUiState.Phase.MIRRORING, s.phase)
+    }
+
+    // ---------------------------------------------------------------- 没有目标设备（只插着 iPad）
+
+    @Test
+    fun `没有归本页管的设备时停在空闲并说明原因`() {
+        // 插着 iPad 打开 AOA 页：一次握手都不会发，主行不能显示"正在建立连接…"
+        val s = HostUiState()
+        s.onNoTarget("未发现安卓手机 —— iPad / iPhone 请回首页进「iOS 投屏」")
+        assertEquals(HostUiState.Phase.IDLE, s.phase)
+        assertEquals("未发现安卓手机 —— iPad / iPhone 请回首页进「iOS 投屏」", s.detail)
+    }
 }

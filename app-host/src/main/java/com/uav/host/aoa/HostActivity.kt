@@ -28,6 +28,7 @@ import com.uav.host.aoa.run.AoaReplay
 import com.uav.host.aoa.capture.session.HostSession
 import com.uav.host.aoa.ui.HostPanel
 import com.uav.host.aoa.ui.HostPresenter
+import com.uav.host.aoa.capture.usb.Aoa
 import com.uav.host.aoa.capture.usb.UsbAttachRouter
 import com.uav.host.aoa.media.QualityController
 import com.uav.host.aoa.media.VideoDecoder
@@ -150,6 +151,12 @@ class HostActivity : Activity() {
                 intent, UsbManager.EXTRA_DEVICE, UsbDevice::class.java,
             )
             logger.i(TAG, "detach broadcast: ${intent.action} device=${device?.deviceId}")
+            // ★ Apple 设备（插着的 iPad/iPhone）不归 AOA 页管：它们的拔出由「iOS 投屏」页
+            //   自己收尾。在这里当成"手机拔了"会把界面刷成空闲/已断开，纯属误报。
+            if (device != null && Aoa.isApple(device)) {
+                logger.i(TAG, "忽略 Apple 设备 detach（走「iOS 投屏」页那条链路）")
+                return
+            }
             link.onDeviceDetached(device)
             presenter.onDetached()
         }
@@ -162,7 +169,9 @@ class HostActivity : Activity() {
             // 优先「原地重建解码器」：链路不动，只把解码器挂到新 Surface 上。
             link.session?.resumeRendering()
             // 会话已经没了（链路错误 / 首次启动）时，才重新建链。
-            if (link.session == null) {
+            // ★ 用户按过「停止投屏」就别在这里偷偷拉起来：Surface 重建（息屏/切后台回来）
+            //   会走到这里，无脑 scan() 等于把"停止"撤销掉。
+            if (link.session == null && !link.isStoppedByUser()) {
                 logger.i(TAG, "无活动会话，立即尝试建立链接")
                 link.scan()
             }
@@ -213,6 +222,8 @@ class HostActivity : Activity() {
         //   bind() 才去找面板里的控件，顺序反了会在 onCreate 里直接崩。
         panel.bind(
             onTogglePixelMode = { quality.setPixelMode(it) },
+            onStop = { userStopProjection() },
+            onStart = { userStartProjection() },
             onScan = { userScan() },
             onForceRehandshake = { userForceRehandshake() },
             onPickReplay = { pickReplayFile() },
@@ -267,7 +278,6 @@ class HostActivity : Activity() {
         panel.surfaceView.setOnTouchListener { _, event -> touch.onTouch(event) }
         panel.surfaceView.holder.addCallback(surfaceCallback)
         panel.applyPixelModeUi(quality.oneToOne)
-        panel.setReplayVisible(DebugTools.ENABLED)
         presenter.refresh()
 
         logger.i(TAG, "host screen ${DisplaySize.of(this).x}x${DisplaySize.of(this).y}, protocol v${Protocol.VERSION}")
@@ -361,6 +371,25 @@ class HostActivity : Activity() {
     // ------------------------------------------------------------------ 画质回调
 
     // ------------------------------------------------------------------ 用户动作
+
+    /**
+     * 「停止投屏」：停链路 + **关上自动重连的闸门**（否则 2 秒后轮询又拉起来）。
+     *
+     * ★ 顺序是"先钉界面状态、再停链路"：`stopSession()` 会回调 `onClosed`，
+     *   若界面那时还是「投屏中」，就会被刷成「已断开：…」并回到连接中 ——
+     *   用户会以为停止没生效。`HostUiState` 里 `STOPPED` 是粘性阶段，先把状态立住，
+     *   后面的收尾噪音就都被丢掉了。
+     */
+    private fun userStopProjection() {
+        presenter.onUserStopped()
+        link.stopByUser()
+    }
+
+    /** 「开始投屏」：解除闸门并重新扫描。界面先回到"连接中"，等首帧才宣告投屏中。 */
+    private fun userStartProjection() {
+        presenter.onUserStarted()
+        link.resumeByUser()
+    }
 
     private fun userScan() {
         presenter.onScanRequested()

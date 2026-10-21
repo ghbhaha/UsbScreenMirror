@@ -62,6 +62,16 @@ class HostUiState {
         REPLAY,
 
         /**
+         * **本机用户主动停止**（面板上的「停止投屏」）。
+         *
+         * 与 [IDLE] 的区别很关键：IDLE 是"还没开始/设备不在"，而这里是"我按了停止，
+         * 链路已停且**不再自动重连**，直到我按「开始投屏」"。所以它是**粘性结论** ——
+         * 会话关闭时那一串 `onClosed` / `onError` / 进度事件都不能把它冲掉
+         * （与 [peerStopped] 同一个道理，只是方向反过来：那边是对端停的，这边是本机停的）。
+         */
+        STOPPED,
+
+        /**
          * 对端没人应答：AOA 已切到配件模式，但对端在超时窗口内**一个字节都没回**。
          *
          * 与 [ERROR] 的区别很关键：USB 链路是通的、枚举也正常，只是**对端没有软件接管
@@ -121,6 +131,9 @@ class HostUiState {
         // 对端用户主动停止之后，原因要钉在副行上 —— 宿主紧接着就会自动重连，
         // 每秒一次的进度事件会把用户刚做的那个动作彻底刷掉（见 onPeerStopped）。
         if (peerStopped) return
+        // 本机用户点了「停止投屏」同理：链路已停，剩下的只是收尾残留的日志，
+        // 让它把「已停止」刷成「CNXN 已发送…」会让用户以为停止没生效（见 onUserStopped）。
+        if (phase == Phase.STOPPED) return
         // 同理："对端没人应答"也要钉住。它是**结论**，而重连时的进度事件只是过程；
         // 让它被"CNXN 已发送…"刷掉，用户就永远不知道要去装 App，只觉得界面在转圈。
         if (phase == Phase.NO_ACCESSORY_APP) return
@@ -185,6 +198,37 @@ class HostUiState {
     }
 
     /**
+     * **本机用户**点了「停止投屏」。
+     *
+     * 与 [onPeerStopped] 是一对镜像：
+     *
+     * | | 谁停的 | 之后会不会自动重连 | 主行 |
+     * |---|---|---|---|
+     * | [onPeerStopped] | 手机端 | **会**（要随时能接上） | 连接中 |
+     * | [onUserStopped] | 本机面板 | **不会**（链路层同时置停止闸门） | 已停止 |
+     *
+     * ★ 一旦进入 [Phase.STOPPED]，后续的 `onClosed` / `onError` / 进度事件一律丢弃 ——
+     *   它们都是**这次停止造成的收尾噪音**。解除只有一个入口：[onUserStarted]。
+     */
+    fun onUserStopped() {
+        peerStopped = false
+        phase = Phase.STOPPED
+        // 主行已经写着「已停止投屏」（`host_status_stopped`），副行只放"怎么恢复"。
+        detail = "点「开始投屏」重新连接"
+    }
+
+    /**
+     * 用户点了「开始投屏」：回到 [Phase.CONNECTING]，把连接交给扫描 / 前台轮询。
+     *
+     * ⚠️ 这里**不能**直接跳到 MIRRORING —— 链路还没建，得等首帧（与 [onScanRequested] 同理）。
+     */
+    fun onUserStarted() {
+        peerStopped = false
+        phase = Phase.CONNECTING
+        detail = "正在重新连接…"
+    }
+
+    /**
      * 链路**已建立**（AOA 握手完成、会话对象已在跑，还没等 CNXN / 首帧）。
      *
      * ★ 这是**硬事实**，不是进度事件 —— 所以它有权把已经落到 [Phase.ERROR] /
@@ -212,6 +256,10 @@ class HostUiState {
 
     /** 链路断开（`onClosed`）⇒ 回到连接中（前台轮询会自动重试，不是终态）。 */
     fun onClosed(reason: String) {
+        // ★ 用户刚按了「停止投屏」时，这条 onClosed 正是**我们主动停**造成的回执。
+        //   把它当断线处理会立刻显示「已断开：…」并把主行拉回「连接中」——
+        //   可链路其实已经按用户意愿停了，界面上就变成"按了停止还在转圈"。
+        if (phase == Phase.STOPPED) return
         peerStopped = false
         phase = Phase.CONNECTING
         // 剥掉 `Connection` 层的日志措辞前缀，否则用户看到的是
@@ -221,6 +269,8 @@ class HostUiState {
 
     /** 链路出错。终态：要么用户点重试，要么 `scanAndAttach` 把它带走。 */
     fun onError(message: String) {
+        // 停止过程中的收尾错误（fd 已关、URB 被取消）不是"故障"，别把用户的停止动作改成 ERROR。
+        if (phase == Phase.STOPPED) return
         peerStopped = false
         phase = Phase.ERROR
         detail = "ERROR: $message"
@@ -228,6 +278,18 @@ class HostUiState {
 
     /** USB 拔出 / 强制重握手前清场 ⇒ 空闲。 */
     fun onDetached(reason: String) {
+        peerStopped = false
+        phase = Phase.IDLE
+        detail = reason
+    }
+
+    /**
+     * 设备表里**没有归本页管的候选**（典型：只插着 iPad）。
+     *
+     * 与 [onProgress] 的区别：进度事件会把主行推到「连接中」，可我们**一次握手都不会发** ——
+     * 那就是让界面撒谎。这里回 [Phase.IDLE]（空闲），把"为什么没动静"落在副行。
+     */
+    fun onNoTarget(reason: String) {
         peerStopped = false
         phase = Phase.IDLE
         detail = reason
@@ -253,6 +315,8 @@ class HostUiState {
         detail: String = "对端在配件模式下没有任何应答 —— 通常是没装配套 App"
     ) {
         if (phase == Phase.MIRRORING || phase == Phase.RENEGOTIATING || phase == Phase.REPLAY) return
+        // 用户已明确停止 ⇒ 这条"去装 App"的引导只会误导（他不是连不上，是自己停的）。
+        if (phase == Phase.STOPPED) return
         peerStopped = false
         phase = Phase.NO_ACCESSORY_APP
         this.detail = detail

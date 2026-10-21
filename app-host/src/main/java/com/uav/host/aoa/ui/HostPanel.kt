@@ -74,6 +74,28 @@ class HostPanel(private val activity: Activity) {
     /** 「获取配套 App」—— 只在「对端没人应答」阶段露出（见 HostUiState.Phase.NO_ACCESSORY_APP）。 */
     private lateinit var btnGetApp: android.widget.Button
 
+    /** 底部双态按钮：「停止投屏」⇄「开始投屏」。 */
+    private lateinit var btnStop: android.widget.Button
+
+    /**
+     * 双态按钮当前含义：true=「停止投屏」，false=「开始投屏」。
+     *
+     * ★ 字段名**必须**避开 `linkActive`：Kotlin 会为属性生成 `setLinkActive(Boolean)`，
+     *   与公开方法 [setLinkActive] 撞 JVM 签名（Platform declaration clash，iOS 侧踩过同款）。
+     * ★ 只在这里 + [setLinkActive] 里写，且只在 UI 线程。
+     */
+    private var stopButtonActive = false
+        set(value) {
+            // ★ 刻意**不做** `if (field == value) return`：初始值 false 与 XML 默认文案不同步，
+            //   早退会让按钮一直停在 XML 那句「停止投屏」（明明还没连上）。
+            //   这个 setter 只由链路事件驱动（不是每帧），重复刷没有代价。
+            field = value
+            btnStop.setText(if (value) R.string.host_btn_stop else R.string.host_btn_start)
+            btnStop.setCompoundDrawablesRelativeWithIntrinsicBounds(
+                if (value) R.drawable.ic_close else R.drawable.ic_play, 0, 0, 0
+            )
+        }
+
     /**
      * Surface 当前是否可用。
      *
@@ -115,12 +137,17 @@ class HostPanel(private val activity: Activity) {
      * 绑定视图并接好面板自身的交互。
      *
      * @param onTogglePixelMode 用户点了画质分段控件（参数 = 要切到 1:1 吗）
-     * @param onScan / [onForceRehandshake] 面板上的操作按钮
-     * @param onPickReplay 回放按钮（release 下按钮已隐藏，这里也不会被点到）
+     * @param onStop 底部按钮在「投屏中/连接中」时的语义：停掉链路，且不再自动重连
+     * @param onStart 底部按钮在「已停止」时的语义：解除停止闸门、重新扫描
+     * @param onScan / [onForceRehandshake] 面板上的操作按钮（**2026-10-21 起已隐藏**，
+     *   监听保留着，取消 XML 里的 `visibility="gone"` 即可恢复）
+     * @param onPickReplay 回放按钮（同上，已隐藏；回放仍有 adb 入口）
      * @param onDisplayAreaChanged 显示区尺寸变了（1:1 像素映射需要重新协商）
      */
     fun bind(
         onTogglePixelMode: (oneToOne: Boolean) -> Unit,
+        onStop: () -> Unit,
+        onStart: () -> Unit,
         onScan: () -> Unit,
         onForceRehandshake: () -> Unit,
         onPickReplay: () -> Unit,
@@ -139,10 +166,14 @@ class HostPanel(private val activity: Activity) {
         segOneToOne = r.findViewById(R.id.btn_pixel_11)
         segHighQuality = r.findViewById(R.id.btn_pixel_hd)
         btnGetApp = r.findViewById(R.id.btn_get_app)
+        btnStop = r.findViewById(R.id.btn_stop)
         rootView = r.findViewById(R.id.root)
 
         setUpMenuToggle(onDisplayAreaChanged)
 
+        // ★ 双态：投屏中 → [onStop]；已停止 → [onStart]。状态由 [setLinkActive] 维护，
+        //   点击时按 [stopButtonActive] 分发 —— 两者都在 UI 线程，不存在竞态。
+        btnStop.setOnClickListener { if (stopButtonActive) onStop() else onStart() }
         findViewById<android.widget.Button>(R.id.btn_scan).setOnClickListener { onScan() }
         findViewById<android.widget.Button>(R.id.btn_force).setOnClickListener { onForceRehandshake() }
         findViewById<android.widget.Button>(R.id.btn_replay).setOnClickListener { onPickReplay() }
@@ -415,6 +446,7 @@ class HostPanel(private val activity: Activity) {
                 HostUiState.Phase.REPLAY -> R.string.host_status_replay
                 HostUiState.Phase.NO_SIGNAL -> R.string.host_status_no_signal
                 HostUiState.Phase.NO_ACCESSORY_APP -> R.string.host_status_peer_app_missing
+                HostUiState.Phase.STOPPED -> R.string.host_status_stopped
                 HostUiState.Phase.ERROR -> R.string.host_status_error
             }
         )
@@ -427,6 +459,8 @@ class HostPanel(private val activity: Activity) {
             when (phase) {
                 HostUiState.Phase.IDLE -> ChipState.IDLE
                 HostUiState.Phase.CONNECTING -> ChipState.CONNECTING
+                // 用户主动停止：链路确实没在跑，用灰（不是告警色 —— 这不是故障）
+                HostUiState.Phase.STOPPED -> ChipState.IDLE
                 // 重协商时点保持绿：画面确实还在播（原地重协商不中断渲染）
                 HostUiState.Phase.MIRRORING, HostUiState.Phase.RENEGOTIATING -> ChipState.ACTIVE
                 HostUiState.Phase.REPLAY -> ChipState.ACTIVE
@@ -445,6 +479,7 @@ class HostPanel(private val activity: Activity) {
                     HostUiState.Phase.REPLAY -> R.string.host_chip_replay
                     HostUiState.Phase.NO_SIGNAL -> R.string.host_chip_no_signal
                     HostUiState.Phase.NO_ACCESSORY_APP -> R.string.host_chip_peer_app_missing
+                    HostUiState.Phase.STOPPED -> R.string.host_chip_stopped
                     HostUiState.Phase.ERROR -> R.string.host_chip_error
                 }
             ),
@@ -504,10 +539,19 @@ class HostPanel(private val activity: Activity) {
         statsText.text = text
     }
 
-    /** 回放按钮是否应显示（release 下整块隐藏，见计划 5.2）。 */
-    fun setReplayVisible(visible: Boolean) {
-        findViewById<android.widget.Button>(R.id.btn_replay).visibility =
-            if (visible) View.VISIBLE else View.GONE
+    /**
+     * 底部双态按钮的含义：true=「停止投屏」，false=「开始投屏」。
+     *
+     * ⚠️ 必须**显式**由链路事实驱动，不能从 [HostUiState.Phase] 反推：
+     *   `ERROR` / `NO_ACCESSORY_APP` 这些阶段里链路其实还在自动重连，
+     *   按钮仍是「停止投屏」（用户随时可以叫停），从阶段推会推错。
+     */
+    fun setLinkActive(active: Boolean) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            activity.runOnUiThread { setLinkActive(active) }
+            return
+        }
+        stopButtonActive = active
     }
 
     /** 菜单动画时长。 */

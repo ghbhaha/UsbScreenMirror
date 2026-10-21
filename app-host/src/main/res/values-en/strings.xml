@@ -27,6 +27,7 @@
     <string name="host_chip_no_signal">No output</string>
     <string name="host_chip_error">Error</string>
     <string name="host_chip_peer_app_missing">No app</string>
+    <string name="host_chip_stopped">Stopped</string>
 
     <!-- Main status line only states the current phase (10.23); progress text goes to the subtitle. -->
     <string name="host_status_idle">Idle — plug in the accessory phone</string>
@@ -37,9 +38,12 @@
     <string name="host_status_no_signal">No output</string>
     <string name="host_status_error">Link error</string>
     <string name="host_status_peer_app_missing">No reply from device</string>
-    <string name="host_detail_peer_app_missing">Switched into accessory mode, but the other side never replied — usually the companion app is not installed (a force-stopped app behaves the same). After installing, tap Scan / Retry, or replug the cable.</string>
+    <string name="host_status_stopped">Mirroring stopped</string>
+    <string name="host_detail_peer_app_missing">Switched into accessory mode, but the other side never replied — usually the companion app is not installed (a force-stopped app behaves the same). After installing, replug the cable or tap Start mirroring.</string>
 
     <!-- Actions (tiles: icon on top, caption below — keep them short) -->
+    <string name="host_btn_stop">Stop mirroring</string>
+    <string name="host_btn_start">Start mirroring</string>
     <string name="host_btn_scan">Scan / Retry</string>
     <string name="host_btn_force">Rehandshake</string>
     <string name="host_btn_replay">Replay</string>

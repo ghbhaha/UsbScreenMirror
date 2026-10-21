@@ -112,16 +112,49 @@ internal class HostPresenter(
     fun stopStats() = mainHandler.removeCallbacks(statsTicker)
 
     /** USB 拔出：清场 + 把提示叫到眼前。 */
-    fun onDetached(reason: String = "USB 已拔出，请重新插线或点 Scan/Retry") {
+    fun onDetached(reason: String = "USB 已拔出，请重新插线（或点「开始投屏」）") {
         uiState.onDetached(reason)
         render()
+        // 设备不在了，"停止投屏"没有意义 —— 按钮回到「开始投屏」
+        host.panel.setLinkActive(false)
         // 这条提示藏在收起的菜单里就等于没提示
         host.panel.revealMenu()
     }
 
-    /** 用户点「扫描 / 重试」（也用于调试入口 `--ez scan true`）。 */
+    /**
+     * 用户点「停止投屏」。
+     *
+     * ★ 停止是**粘性结论**（见 [HostUiState.onUserStopped]）：之后链路收尾产生的
+     *   `onClosed` / `onError` / 进度事件都会被状态机丢掉，界面不会被刷成"已断开"。
+     */
+    fun onUserStopped() {
+        uiState.onUserStopped()
+        render()
+        // 画面马上会黑：把面板叫出来，否则用户只看到一块黑屏 + 一个药丸
+        host.panel.setLinkActive(false)
+        host.panel.revealMenu()
+    }
+
+    /** 用户点「开始投屏」：回到连接中，按钮变回「停止投屏」。 */
+    fun onUserStarted() {
+        uiState.onUserStarted()
+        render()
+        host.panel.setLinkActive(true)
+    }
+
+    /** 用户点「扫描 / 重试」（按钮已隐藏，现在只由调试入口 `--ez scan true` 触发）。 */
     fun onScanRequested() {
         uiState.onScanRequested()
+        render()
+    }
+
+    /**
+     * 设备表里没有归 AOA 页管的候选（只插着 iPad / 只有内建 HID）。
+     *
+     * 主行保持「空闲」—— 我们确实一次握手都没发，不能让界面显示「正在建立连接…」。
+     */
+    override fun onNoTarget(reason: String) {
+        uiState.onNoTarget(reason)
         render()
     }
 
@@ -135,6 +168,8 @@ internal class HostPresenter(
     fun onReplayStarted(label: String) {
         uiState.onReplay(label)
         render()
+        // 回放也是一个"正在跑"的会话，按钮保持可停
+        host.panel.setLinkActive(true)
     }
 
     // ------------------------------------------------------------------ 链路事件
@@ -153,6 +188,9 @@ internal class HostPresenter(
         //   明明成功了（音频都恢复了），主行还挂着 ERROR（2026-10-20 真机）。
         uiState.onLinkEstablished(text)
         render()
+        // 会话已经在跑（自动连接也会走到这里）⇒ 按钮该是「停止投屏」。
+        // 不能在 Activity 里只在"用户点开始"时置位：插线即投那条路没有用户动作。
+        host.panel.setLinkActive(true)
     }
 
     override fun onVideoSize(width: Int, height: Int) {
